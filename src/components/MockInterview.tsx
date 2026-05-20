@@ -121,8 +121,10 @@ export function MockInterview({ onSuccess }: { onSuccess?: () => void }) {
               key={t}
               type="button"
               onClick={() => setTopic(t)}
-              className={`rounded-lg border p-3 text-left text-sm ${
-                topic === t ? "border-[#E95420] text-[#E95420]" : "border-white/10 text-gray-400"
+              className={`rounded-lg border p-3 text-left text-sm cursor-pointer transition-all duration-300 ${
+                topic === t 
+                  ? "border-[#E95420] text-[#E95420] hover:scale-105" 
+                  : "border-white/10 text-gray-400 hover:border-orange-500 hover:shadow-lg hover:shadow-orange-500/20"
               }`}
             >
               {t}
@@ -136,8 +138,10 @@ export function MockInterview({ onSuccess }: { onSuccess?: () => void }) {
                 key={l}
                 type="button"
                 onClick={() => setDifficulty(l)}
-                className={`rounded-full px-3 py-1 text-sm ${
-                  difficulty === l ? "bg-[#E95420] text-white" : "border border-white/10"
+                className={`rounded-full px-3 py-1 text-sm transition-all duration-300 ${
+                  difficulty === l 
+                    ? "bg-[#E95420] text-white hover:scale-105" 
+                    : "border border-white/10 hover:border-orange-500 hover:text-orange-500"
                 }`}
               >
                 {l}
@@ -148,7 +152,7 @@ export function MockInterview({ onSuccess }: { onSuccess?: () => void }) {
             type="button"
             onClick={start}
             disabled={loading}
-            className="mt-4 w-full rounded-lg bg-[#E95420] py-3 text-white"
+            className="mt-4 w-full rounded-lg bg-[#E95420] py-3 text-white disabled:opacity-50 hover:scale-105 hover:brightness-110 transition-all duration-300"
           >
             Start Interview
           </button>
