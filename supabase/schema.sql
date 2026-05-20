@@ -144,3 +144,16 @@ create policy "Users insert own cheatsheets" on public.cheatsheets for insert wi
 
 -- Storage bucket for avatars (run separately if needed):
 -- insert into storage.buckets (id, name, public) values ('avatars', 'avatars', true);
+
+-- Linux Commands Reference
+create table if not exists public.linux_commands (
+  id uuid primary key default gen_random_uuid(),
+  command_name text not null unique,
+  description text not null,
+  category text not null,
+  example_usage text not null,
+  created_at timestamptz default now()
+);
+
+alter table public.linux_commands enable row level security;
+create policy "Anyone can read linux_commands" on public.linux_commands for select using (true);
