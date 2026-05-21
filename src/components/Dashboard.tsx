@@ -1,122 +1,141 @@
 "use client";
 
 import {
-  BarChart,
   Bar,
+  BarChart,
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
 } from "recharts";
-import { Zap, Flame, Trophy, Terminal, Code, Mic, FileText } from "lucide-react";
-import { GlassCard } from "./GlassCard";
-import { StatCard } from "./StatCard";
-import { TerminalPrompt } from "./TerminalPrompt";
-import { xpProgressInLevel } from "@/lib/xp";
-import type { CommandHistoryRow, DashboardStats, Profile, QuizResultRow } from "@/types";
+import { Flame, Terminal, Trophy, Zap } from "lucide-react";
+import { GlassCard } from "@/components/GlassCard";
+import { StatCard } from "@/components/StatCard";
+import { TerminalPrompt } from "@/components/TerminalPrompt";
+import { normalizeCommandBase, type QuizSummary, type SessionCommand, type XpDailyPoint } from "@/lib/session";
 
 interface DashboardProps {
-  profile: Profile | null;
-  stats: DashboardStats;
-  recentCommands: CommandHistoryRow[];
-  quizResults: QuizResultRow[];
+  username: string;
+  xp: number;
+  streak: number;
+  commands: SessionCommand[];
+  quizHistory: QuizSummary[];
+  xpTimeline: XpDailyPoint[];
 }
 
-export function Dashboard({ profile, stats, recentCommands, quizResults }: DashboardProps) {
-  const { percent } = xpProgressInLevel(stats.xp);
-  const chartData = quizResults.map((q) => ({
-    name: q.category.slice(0, 12),
-    score: Math.round((q.score / q.total) * 100),
+function averageQuizScore(quizHistory: QuizSummary[]) {
+  if (!quizHistory.length) return 0;
+  const total = quizHistory.reduce((sum, item) => sum + item.scorePercent, 0);
+  return Math.round(total / quizHistory.length);
+}
+
+function mostUsedCommands(commands: SessionCommand[]) {
+  const counts = new Map<string, number>();
+  commands.forEach((item) => {
+    const base = normalizeCommandBase(item.input);
+    counts.set(base, (counts.get(base) ?? 0) + 1);
+  });
+  return Array.from(counts.entries())
+    .map(([command, count]) => ({ command, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+}
+
+function heatLevel(value: number) {
+  if (value >= 80) return "bg-[#E95420]";
+  if (value >= 40) return "bg-[#E95420]/70";
+  if (value >= 15) return "bg-[#E95420]/45";
+  if (value > 0) return "bg-[#E95420]/25";
+  return "bg-white/5";
+}
+
+export function Dashboard({ username, xp, streak, commands, quizHistory, xpTimeline }: DashboardProps) {
+  const commandCount = commands.filter((item) => item.source === "ai-generated").length;
+  const quizScore = averageQuizScore(quizHistory);
+  const xpLast7Days = xpTimeline.slice(-7).map((point) => ({
+    day: point.date.slice(5),
+    xp: point.xp,
   }));
+  const topCommands = mostUsedCommands(commands);
+  const heatmapData = xpTimeline.slice(-30);
 
   return (
     <div className="space-y-6">
       <GlassCard>
         <TerminalPrompt>
           <span className="text-white">
-            Welcome back, <span className="text-[#E95420]">{profile?.username || "hacker"}</span>
-            ! Ready to level up your Linux skills?
+            Welcome back, <span className="text-[#E95420]">{username}</span>. Let&apos;s keep the streak alive.
           </span>
         </TerminalPrompt>
       </GlassCard>
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        <StatCard label="Total XP" value={stats.xp} icon={Zap} />
-        <StatCard label="Streak" value={`${stats.streak} days`} icon={Flame} delay={0.05} />
-        <StatCard label="Quizzes Done" value={stats.quizzesCompleted} icon={Trophy} delay={0.1} />
-        <StatCard label="Commands" value={stats.commandsGenerated} icon={Terminal} delay={0.15} />
-        <StatCard label="Scripts" value={stats.scriptsGenerated} icon={Code} delay={0.2} />
-        <StatCard label="Interviews" value={stats.interviewsCompleted} icon={Mic} delay={0.25} />
-        <StatCard label="Cheat Sheets" value={stats.cheatSheetsGenerated} icon={FileText} delay={0.3} />
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard label="Commands Generated" value={commandCount} icon={Terminal} />
+        <StatCard label="Quiz Score" value={`${quizScore}%`} icon={Trophy} delay={0.05} />
+        <StatCard label="Current Streak" value={`${streak} days`} icon={Flame} delay={0.1} />
+        <StatCard label="Total XP" value={xp} icon={Zap} delay={0.15} />
       </div>
-
-      <GlassCard>
-        <h3 className="mb-2 text-sm font-medium text-gray-400">Level Progress — {stats.level}</h3>
-        <div className="h-3 overflow-hidden rounded-full bg-white/10">
-          <div
-            className="h-full bg-gradient-to-r from-[#E95420] to-[#4CAF50] transition-all duration-700"
-            style={{ width: `${percent}%` }}
-          />
-        </div>
-        <p className="mt-2 text-xs text-gray-500">
-          Beginner (0) → Intermediate (500) → Advanced (1500) → Expert (3000+)
-        </p>
-      </GlassCard>
 
       <div className="grid gap-6 lg:grid-cols-2">
         <GlassCard>
-          <h3 className="mb-4 font-semibold text-white">Recent Commands</h3>
-          {recentCommands.length === 0 ? (
-            <p className="text-sm text-gray-500">No commands yet. Try the AI Command Generator!</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm">
-                <thead>
-                  <tr className="text-gray-500">
-                    <th className="pb-2">Query</th>
-                    <th className="pb-2">Risk</th>
-                    <th className="pb-2">Date</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recentCommands.map((c) => (
-                    <tr key={c.id} className="border-t border-white/5">
-                      <td className="py-2 font-mono text-[#4CAF50]">{c.command.slice(0, 40)}...</td>
-                      <td className="py-2">{c.risk_level}</td>
-                      <td className="py-2 text-gray-500">
-                        {new Date(c.created_at).toLocaleDateString()}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+          <h3 className="mb-3 text-sm font-semibold text-gray-300">XP Earned (Last 7 Days)</h3>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={xpLast7Days}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
+              <XAxis dataKey="day" stroke="#a3a3a3" fontSize={11} />
+              <YAxis stroke="#a3a3a3" fontSize={11} />
+              <Tooltip
+                contentStyle={{ background: "#1a0a2e", border: "1px solid #ffffff20" }}
+                labelStyle={{ color: "#f5f5f5" }}
+              />
+              <Line type="monotone" dataKey="xp" stroke="#E95420" strokeWidth={2.5} />
+            </LineChart>
+          </ResponsiveContainer>
         </GlassCard>
 
-        <GlassCard delay={0.1}>
-          <h3 className="mb-4 font-semibold text-white">Quiz Performance</h3>
-          {chartData.length === 0 ? (
-            <p className="text-sm text-gray-500">Complete a quiz to see your chart!</p>
+        <GlassCard>
+          <h3 className="mb-3 text-sm font-semibold text-gray-300">Most Used Commands</h3>
+          {topCommands.length === 0 ? (
+            <p className="text-sm text-gray-500">Run commands to populate usage data.</p>
           ) : (
             <ResponsiveContainer width="100%" height={220}>
-              <BarChart data={chartData}>
+              <BarChart data={topCommands}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
-                <XAxis dataKey="name" stroke="#888" fontSize={11} />
-                <YAxis stroke="#888" fontSize={11} domain={[0, 100]} />
+                <XAxis dataKey="command" stroke="#a3a3a3" fontSize={11} />
+                <YAxis stroke="#a3a3a3" fontSize={11} allowDecimals={false} />
                 <Tooltip
-                  contentStyle={{
-                    background: "#1a0a2e",
-                    border: "1px solid #ffffff20",
-                  }}
+                  contentStyle={{ background: "#1a0a2e", border: "1px solid #ffffff20" }}
+                  labelStyle={{ color: "#f5f5f5" }}
                 />
-                <Bar dataKey="score" fill="#E95420" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="count" fill="#F97316" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           )}
         </GlassCard>
       </div>
+
+      <GlassCard>
+        <h3 className="mb-3 text-sm font-semibold text-gray-300">Activity Heatmap (Last 30 Days)</h3>
+        <div className="overflow-x-auto pb-2">
+          <div
+            className="grid min-w-[720px] gap-2"
+            style={{ gridTemplateColumns: "repeat(30, minmax(0, 1fr))" }}
+          >
+            {heatmapData.map((point) => (
+              <div key={point.date} className="flex flex-col items-center gap-1">
+                <div
+                  title={`${point.date}: ${point.xp} XP`}
+                  className={`h-4 w-4 rounded-sm border border-white/5 ${heatLevel(point.xp)}`}
+                />
+                <span className="text-[10px] text-gray-500">{point.date.slice(8)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </GlassCard>
     </div>
   );
 }

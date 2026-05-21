@@ -1,177 +1,216 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { Trophy, Clock } from "lucide-react";
-import { GlassCard } from "./GlassCard";
-import type { QuizQuestion } from "@/types";
+import { useEffect, useMemo, useState } from "react";
+import { Clock, Trophy } from "lucide-react";
+import { GlassCard } from "@/components/GlassCard";
+import { QUIZ_CATEGORIES, QUIZ_DB, type QuizCategory, type QuizDBQuestion } from "@/lib/quizDB";
+import type { QuizSummary } from "@/lib/session";
 
-const CATEGORIES = [
-  "Linux Basics",
-  "Shell Commands",
-  "Git",
-  "Docker",
-  "Networking",
-  "File Permissions",
-  "DevOps Fundamentals",
-];
+interface QuizArenaProps {
+  onAwardXp: (amount: number, message: string) => void;
+  onComplete: (summary: QuizSummary) => void;
+}
 
-const DIFFICULTIES = ["Beginner", "Intermediate", "Advanced"];
+function shuffleQuestions(questions: QuizDBQuestion[]): QuizDBQuestion[] {
+  const list = [...questions];
+  for (let index = list.length - 1; index > 0; index -= 1) {
+    const j = Math.floor(Math.random() * (index + 1));
+    [list[index], list[j]] = [list[j], list[index]];
+  }
+  return list;
+}
 
-export function QuizArena({ onSuccess }: { onSuccess?: () => void }) {
-  const [category, setCategory] = useState(CATEGORIES[0]);
-  const [difficulty, setDifficulty] = useState("Beginner");
+export function QuizArena({ onAwardXp, onComplete }: QuizArenaProps) {
+  const [category, setCategory] = useState<QuizCategory>("File System");
   const [phase, setPhase] = useState<"select" | "quiz" | "done">("select");
-  const [questions, setQuestions] = useState<QuizQuestion[]>([]);
-  const [index, setIndex] = useState(0);
-  const [score, setScore] = useState(0);
+  const [questions, setQuestions] = useState<QuizDBQuestion[]>([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
   const [selected, setSelected] = useState<number | null>(null);
-  const [showExp, setShowExp] = useState(false);
+  const [showExplanation, setShowExplanation] = useState(false);
   const [timeLeft, setTimeLeft] = useState(30);
-  const [loading, setLoading] = useState(false);
+  const [correctCount, setCorrectCount] = useState(0);
+  const [wrongCount, setWrongCount] = useState(0);
   const [xpEarned, setXpEarned] = useState(0);
+  const [correctStreak, setCorrectStreak] = useState(0);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [timeTakenSec, setTimeTakenSec] = useState(0);
 
-  const start = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch("/api/quiz", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ category, difficulty }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      setQuestions(data.questions);
-      setPhase("quiz");
-      setIndex(0);
-      setScore(0);
-      setTimeLeft(30);
-    } catch (e) {
-      alert(e instanceof Error ? e.message : "Failed to load quiz");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const answer = useCallback(
-    (idx: number) => {
-      if (showExp || !questions[index]) return;
-      setSelected(idx);
-      setShowExp(true);
-      if (idx === questions[index].correct) setScore((s) => s + 1);
-    },
-    [showExp, questions, index]
-  );
+  const currentQuestion = questions[currentIndex];
 
   useEffect(() => {
-    if (phase !== "quiz" || showExp) return;
-    const t = setInterval(() => {
-      setTimeLeft((prev) => {
-        if (prev <= 1) {
-          answer(-1);
+    if (phase !== "quiz" || showExplanation) return;
+    const timer = setInterval(() => {
+      setTimeLeft((previous) => {
+        if (previous <= 1) {
+          handleAnswer(null);
           return 30;
         }
-        return prev - 1;
+        return previous - 1;
       });
     }, 1000);
-    return () => clearInterval(t);
-  }, [phase, showExp, index, answer]);
+    return () => clearInterval(timer);
+  });
 
-  const next = async () => {
-    if (index + 1 >= questions.length) {
-      const res = await fetch("/api/quiz", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          category,
-          difficulty,
-          score,
-          total: questions.length,
-        }),
+  const progressPercent = useMemo(
+    () => (questions.length ? ((currentIndex + 1) / questions.length) * 100 : 0),
+    [currentIndex, questions.length]
+  );
+
+  const timerPercent = useMemo(() => (timeLeft / 30) * 100, [timeLeft]);
+
+  function resetQuizState() {
+    setQuestions([]);
+    setCurrentIndex(0);
+    setSelected(null);
+    setShowExplanation(false);
+    setTimeLeft(30);
+    setCorrectCount(0);
+    setWrongCount(0);
+    setXpEarned(0);
+    setCorrectStreak(0);
+    setStartedAt(null);
+    setTimeTakenSec(0);
+  }
+
+  function startQuiz() {
+    const selectedSet = shuffleQuestions(QUIZ_DB[category]).slice(0, 10);
+    setQuestions(selectedSet);
+    setCurrentIndex(0);
+    setSelected(null);
+    setShowExplanation(false);
+    setTimeLeft(30);
+    setCorrectCount(0);
+    setWrongCount(0);
+    setXpEarned(0);
+    setCorrectStreak(0);
+    setPhase("quiz");
+    setStartedAt(Date.now());
+  }
+
+  function handleAnswer(index: number | null) {
+    if (showExplanation || !currentQuestion) return;
+    setSelected(index);
+    setShowExplanation(true);
+
+    if (index === currentQuestion.correct) {
+      setCorrectCount((previous) => previous + 1);
+      setXpEarned((previous) => previous + 20);
+      onAwardXp(20, "Correct! +20 XP");
+
+      setCorrectStreak((previous) => {
+        const next = previous + 1;
+        if (next % 3 === 0) {
+          setXpEarned((xp) => xp + 15);
+          onAwardXp(15, "3-answer streak! +15 XP");
+        }
+        return next;
       });
-      const data = await res.json();
-      setXpEarned(data.xpEarned ?? score * 20);
-      setPhase("done");
-      onSuccess?.();
       return;
     }
-    setIndex((i) => i + 1);
-    setSelected(null);
-    setShowExp(false);
-    setTimeLeft(30);
-  };
 
-  const q = questions[index];
+    setWrongCount((previous) => previous + 1);
+    setCorrectStreak(0);
+  }
+
+  function finishQuiz() {
+    const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+    setTimeTakenSec(elapsed);
+
+    const summary: QuizSummary = {
+      id: Math.random().toString(36).slice(2, 10),
+      category,
+      correct: correctCount,
+      wrong: wrongCount,
+      total: questions.length,
+      xpEarned,
+      timeTakenSec: elapsed,
+      scorePercent: questions.length ? Math.round((correctCount / questions.length) * 100) : 0,
+      createdAt: new Date().toISOString(),
+    };
+    onComplete(summary);
+    setPhase("done");
+  }
+
+  function nextQuestion() {
+    if (currentIndex + 1 >= questions.length) {
+      finishQuiz();
+      return;
+    }
+    setCurrentIndex((previous) => previous + 1);
+    setSelected(null);
+    setShowExplanation(false);
+    setTimeLeft(30);
+  }
 
   if (phase === "select") {
     return (
       <div className="space-y-6">
         <h2 className="text-2xl font-bold text-white">
-          <Trophy className="inline h-7 w-7 text-yellow-400" /> Quiz Arena
+          <Trophy className="mr-2 inline h-6 w-6 text-yellow-400" />
+          Quiz Arena
         </h2>
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {CATEGORIES.map((c) => (
+        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+          {QUIZ_CATEGORIES.map((item) => (
             <button
-              key={c}
+              key={item}
               type="button"
-              onClick={() => setCategory(c)}
-              className={`rounded-xl border p-4 text-left text-sm cursor-pointer transition-all duration-300 ${
-                category === c
-                  ? "border-[#E95420] bg-[#E95420]/10 text-[#E95420] hover:scale-105"
-                  : "border-white/10 text-gray-400 hover:border-orange-500 hover:shadow-lg hover:shadow-orange-500/20"
+              onClick={() => setCategory(item)}
+              className={`micro-button rounded-xl border p-4 text-left transition ${
+                category === item
+                  ? "border-[#E95420]/60 bg-[#E95420]/15 text-[#E95420]"
+                  : "border-white/10 bg-black/20 text-gray-300 hover:border-[#E95420]/35"
               }`}
             >
-              {c}
+              <p className="font-semibold">{item}</p>
+              <p className="mt-1 text-xs text-gray-400">10 questions • 30 sec each</p>
             </button>
           ))}
         </div>
-        <GlassCard>
-          <p className="mb-2 text-sm text-gray-400">Difficulty</p>
-          <div className="flex gap-2">
-            {DIFFICULTIES.map((d) => (
-              <button
-                key={d}
-                type="button"
-                onClick={() => setDifficulty(d)}
-                className={`rounded-full px-4 py-1 text-sm transition-all duration-300 ${
-                  difficulty === d 
-                    ? "bg-[#E95420] text-white hover:scale-105" 
-                    : "border border-white/10 hover:border-orange-500 hover:text-orange-500"
-                }`}
-              >
-                {d}
-              </button>
-            ))}
-          </div>
-          <button
-            type="button"
-            onClick={start}
-            disabled={loading}
-            className="mt-6 w-full rounded-lg bg-[#E95420] py-3 font-medium text-white disabled:opacity-50 hover:scale-105 hover:brightness-110 transition-all duration-300"
-          >
-            {loading ? "Loading..." : "Start Quiz"}
-          </button>
-        </GlassCard>
+        <button
+          type="button"
+          onClick={startQuiz}
+          className="micro-button rounded-lg bg-[#E95420] px-6 py-2.5 font-medium text-white transition hover:bg-[#ff6b36]"
+        >
+          Start Quiz
+        </button>
       </div>
     );
   }
 
   if (phase === "done") {
     return (
-      <GlassCard className="text-center">
-        <Trophy className="mx-auto h-16 w-16 text-yellow-400" />
-        <h3 className="mt-4 text-2xl font-bold text-white">
-          {score} / {questions.length}
-        </h3>
-        <p className="mt-2 text-[#4CAF50]">+{xpEarned} XP earned</p>
-        <p className="mt-2 text-gray-400">
-          {score >= 8 ? "Excellent!" : score >= 5 ? "Good job!" : "Keep practicing!"}
-        </p>
+      <GlassCard className="space-y-5">
+        <h3 className="text-2xl font-bold text-white">Quiz Summary</h3>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="rounded-lg border border-white/10 bg-black/30 p-4">
+            <p className="text-sm text-gray-400">Score</p>
+            <p className="text-2xl font-bold text-white">
+              {correctCount}/{questions.length}
+            </p>
+          </div>
+          <div className="rounded-lg border border-white/10 bg-black/30 p-4">
+            <p className="text-sm text-gray-400">XP Earned</p>
+            <p className="text-2xl font-bold text-emerald-300">+{xpEarned}</p>
+          </div>
+          <div className="rounded-lg border border-white/10 bg-black/30 p-4">
+            <p className="text-sm text-gray-400">Time Taken</p>
+            <p className="text-xl font-semibold text-white">{timeTakenSec}s</p>
+          </div>
+          <div className="rounded-lg border border-white/10 bg-black/30 p-4">
+            <p className="text-sm text-gray-400">Breakdown</p>
+            <p className="text-sm text-emerald-300">Correct: {correctCount}</p>
+            <p className="text-sm text-rose-300">Wrong: {wrongCount}</p>
+          </div>
+        </div>
         <button
           type="button"
-          onClick={() => setPhase("select")}
-          className="mt-6 rounded-lg bg-[#E95420] px-6 py-2 text-white"
+          onClick={() => {
+            resetQuizState();
+            setPhase("select");
+          }}
+          className="micro-button rounded-lg bg-[#E95420] px-5 py-2 text-white"
         >
-          Change Category
+          Start Another Category
         </button>
       </GlassCard>
     );
@@ -179,53 +218,68 @@ export function QuizArena({ onSuccess }: { onSuccess?: () => void }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex justify-between text-sm text-gray-400">
-        <span>
-          Question {index + 1}/{questions.length}
-        </span>
-        <span className="flex items-center gap-1 text-[#E95420]">
-          <Clock className="h-4 w-4" /> {timeLeft}s
-        </span>
-        <span>Score: {score}</span>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-gray-300">
+        <p>
+          {category} • Question {currentIndex + 1}/{questions.length}
+        </p>
+        <p className="flex items-center gap-1 text-orange-300">
+          <Clock className="h-4 w-4" />
+          {timeLeft}s
+        </p>
       </div>
-      <div className="h-2 rounded-full bg-white/10">
+
+      <div className="h-2 overflow-hidden rounded-full bg-white/10">
         <div
-          className="h-full rounded-full bg-[#E95420] transition-all"
-          style={{ width: `${((index + 1) / questions.length) * 100}%` }}
+          className="h-full rounded-full bg-[#E95420] transition-all duration-300"
+          style={{ width: `${timerPercent}%` }}
         />
       </div>
-      {q && (
-        <GlassCard>
-          <p className="text-lg text-white">{q.question}</p>
-          <ul className="mt-4 space-y-2">
-            {q.options.map((opt, i) => (
-              <li key={i}>
+
+      <div className="h-1 overflow-hidden rounded-full bg-white/10">
+        <div
+          className="h-full rounded-full bg-emerald-400/80 transition-all duration-300"
+          style={{ width: `${progressPercent}%` }}
+        />
+      </div>
+
+      {currentQuestion && (
+        <GlassCard className="space-y-4">
+          <p className="text-lg text-white">{currentQuestion.question}</p>
+
+          <div className="space-y-2">
+            {currentQuestion.options.map((option, index) => {
+              const isCorrect = showExplanation && index === currentQuestion.correct;
+              const isWrongSelection = showExplanation && selected === index && !isCorrect;
+              return (
                 <button
+                  key={`${option}-${index}`}
                   type="button"
-                  disabled={showExp}
-                  onClick={() => answer(i)}
-                  className={`w-full rounded-lg border px-4 py-3 text-left text-sm ${
-                    showExp && i === q.correct
-                      ? "border-[#4CAF50] bg-[#4CAF50]/10"
-                      : showExp && i === selected
-                        ? "border-red-500/50 bg-red-500/10"
-                        : "border-white/10"
+                  disabled={showExplanation}
+                  onClick={() => handleAnswer(index)}
+                  className={`micro-button w-full rounded-lg border px-4 py-3 text-left text-sm transition ${
+                    isCorrect
+                      ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-200"
+                      : isWrongSelection
+                        ? "border-rose-500/60 bg-rose-500/15 text-rose-100"
+                        : "border-white/10 bg-black/20 text-gray-200 hover:border-[#E95420]/35"
                   }`}
                 >
-                  {String.fromCharCode(65 + i)}. {opt}
+                  <span className="font-mono text-xs text-gray-500">{String.fromCharCode(65 + index)}.</span>{" "}
+                  {option}
                 </button>
-              </li>
-            ))}
-          </ul>
-          {showExp && (
-            <div className="mt-4 rounded-lg bg-[#4CAF50]/10 p-3 text-sm text-[#4CAF50]">
-              {q.explanation}
+              );
+            })}
+          </div>
+
+          {showExplanation && (
+            <div className="space-y-3 rounded-lg border border-white/10 bg-black/25 p-3 text-sm">
+              <p className="text-gray-300">{currentQuestion.explanation}</p>
               <button
                 type="button"
-                onClick={next}
-                className="mt-3 block rounded-lg bg-[#E95420] px-4 py-2 text-white"
+                onClick={nextQuestion}
+                className="micro-button rounded-md bg-[#E95420] px-4 py-2 text-white"
               >
-                {index + 1 >= questions.length ? "See Results" : "Next"}
+                {currentIndex + 1 >= questions.length ? "View Summary" : "Next Question"}
               </button>
             </div>
           )}

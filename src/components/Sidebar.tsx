@@ -3,9 +3,11 @@
 import {
   LayoutDashboard,
   Terminal,
+  Monitor,
   Code,
   MessageSquare,
   Trophy,
+  Star,
   Mic,
   AlertTriangle,
   FileText,
@@ -14,6 +16,7 @@ import {
   LogOut,
   Menu,
   X,
+  Flame,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { XPBar } from "./XPBar";
@@ -24,6 +27,7 @@ import type { ModuleId, Profile, Progress } from "@/types";
 const NAV: { id: ModuleId; label: string; icon: typeof Terminal }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "command", label: "AI Command Generator", icon: Terminal },
+  { id: "terminal", label: "Terminal Simulator", icon: Monitor },
   { id: "script", label: "Shell Script Generator", icon: Code },
   { id: "chat", label: "Linux Chatbot", icon: MessageSquare },
   { id: "quiz", label: "Quiz Arena", icon: Trophy },
@@ -31,6 +35,8 @@ const NAV: { id: ModuleId; label: string; icon: typeof Terminal }[] = [
   { id: "error", label: "Error Explainer", icon: AlertTriangle },
   { id: "cheatsheet", label: "Cheat Sheet Generator", icon: FileText },
   { id: "history", label: "Command History", icon: History },
+  { id: "leaderboard", label: "Leaderboard", icon: Trophy },
+  { id: "bookmarks", label: "Bookmarks", icon: Star },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -88,7 +94,7 @@ export function Sidebar({
               setMobileOpen(false);
             }}
             className={cn(
-              "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm transition",
+              "micro-button flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm transition",
               active === id
                 ? "border border-[#E95420]/30 bg-[#E95420]/15 text-[#E95420]"
                 : "text-gray-400 hover:bg-white/5 hover:text-white"
@@ -103,13 +109,17 @@ export function Sidebar({
       {progress && (
         <div className="mt-4 border-t border-white/10 pt-4">
           <XPBar xp={progress.xp} />
+          <div className="mt-3 flex items-center gap-2 rounded-md border border-orange-500/30 bg-orange-500/10 px-2.5 py-2 text-xs text-orange-200">
+            <Flame className="h-3.5 w-3.5" />
+            <span>Streak: {progress.streak} day{progress.streak === 1 ? "" : "s"}</span>
+          </div>
         </div>
       )}
 
       <button
         type="button"
         onClick={logout}
-        className="mt-4 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-gray-400 hover:bg-red-500/10 hover:text-red-400"
+        className="micro-button mt-4 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-gray-400 hover:bg-red-500/10 hover:text-red-400"
       >
         <LogOut className="h-4 w-4" />
         Logout
@@ -153,12 +163,15 @@ export function Sidebar({
       )}
 
       <nav className="fixed bottom-0 left-0 right-0 z-40 flex justify-around border-t border-white/10 bg-[#120a1c]/95 p-2 backdrop-blur lg:hidden">
-        {NAV.slice(0, 5).map(({ id, icon: Icon }) => (
+        {NAV.slice(0, 6).map(({ id, icon: Icon }) => (
           <button
             key={id}
             type="button"
             onClick={() => onNavigate(id)}
-            className={cn("p-2", active === id ? "text-[#E95420]" : "text-gray-500")}
+            className={cn(
+              "micro-button rounded-md p-2",
+              active === id ? "text-[#E95420]" : "text-gray-500"
+            )}
           >
             <Icon className="h-5 w-5" />
           </button>

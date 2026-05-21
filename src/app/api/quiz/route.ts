@@ -23,11 +23,50 @@ export async function POST(req: NextRequest) {
     const { category, difficulty, score, total } = await req.json();
 
     if (category && difficulty && score === undefined) {
-      const questions = await callLlamaJson<QuizQuestion[]>(
-        SYSTEM,
-        `Category: ${category}\nDifficulty: ${difficulty}`
-      );
-      return NextResponse.json({ questions: questions.slice(0, 10) });
+      // ── AI first ──
+      try {
+        const questions = await callLlamaJson<QuizQuestion[]>(
+          SYSTEM,
+          `Category: ${category}\nDifficulty: ${difficulty}`
+        );
+        return NextResponse.json({ questions: questions.slice(0, 10), source: "ai" });
+      } catch (aiErr) {
+        console.warn("AI quiz failed, falling back to DB:", aiErr);
+
+        // ── DB fallback: pick 10 random commands, build MCQ from them ──
+        const { data: commands, error: dbErr } = await auth.supabase
+          .from("linux_commands")
+          .select("command_name, description, example_usage, category")
+          .limit(40);
+
+        if (dbErr || !commands || commands.length < 4) {
+          throw new Error("AI unavailable and DB fallback also failed.");
+        }
+
+        // Shuffle and take 10
+        const shuffled = commands.sort(() => Math.random() - 0.5).slice(0, 10);
+
+        const questions: QuizQuestion[] = shuffled.map((cmd) => {
+          // Pick 3 wrong options from the remaining commands
+          const others = commands
+            .filter((c) => c.command_name !== cmd.command_name)
+            .sort(() => Math.random() - 0.5)
+            .slice(0, 3)
+            .map((c) => c.command_name);
+
+          const options = [cmd.command_name, ...others].sort(() => Math.random() - 0.5);
+          const correct = options.indexOf(cmd.command_name);
+
+          return {
+            question: `Which command: "${cmd.description}"?`,
+            options,
+            correct,
+            explanation: `The answer is \`${cmd.command_name}\`. Example: ${cmd.example_usage}`,
+          };
+        });
+
+        return NextResponse.json({ questions, source: "db" });
+      }
     }
 
     if (typeof score === "number" && typeof total === "number") {

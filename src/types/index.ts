@@ -4,6 +4,7 @@ export type Level = "Beginner" | "Intermediate" | "Advanced" | "Expert";
 
 export type ModuleId =
   | "dashboard"
+  | "terminal"
   | "command"
   | "script"
   | "chat"
@@ -12,6 +13,8 @@ export type ModuleId =
   | "error"
   | "cheatsheet"
   | "history"
+  | "leaderboard"
+  | "bookmarks"
   | "settings";
 
 export interface Profile {

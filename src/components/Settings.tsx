@@ -1,104 +1,164 @@
 "use client";
 
 import { useState } from "react";
-import { createClient } from "@/lib/supabase/client";
-import { GlassCard } from "./GlassCard";
-import type { Profile } from "@/types";
+import { GlassCard } from "@/components/GlassCard";
+import type { TerminalFontSize, TerminalPrefs, TerminalTheme } from "@/lib/session";
+
+interface SettingsProps {
+  username: string;
+  prefs: TerminalPrefs;
+  onUsernameChange: (value: string) => void;
+  onThemeChange: (theme: TerminalTheme) => void;
+  onFontSizeChange: (size: TerminalFontSize) => void;
+  onShowTagsToggle: (value: boolean) => void;
+  onResetXp: () => void;
+  onResetStreak: () => void;
+}
+
+const themes: TerminalTheme[] = ["green", "amber", "cyan", "white"];
+const fontSizes: TerminalFontSize[] = ["small", "medium", "large"];
 
 export function Settings({
-  profile,
-  onUpdate,
-}: {
-  profile: Profile | null;
-  onUpdate: () => void;
-}) {
-  const [username, setUsername] = useState(profile?.username || "");
-  const [password, setPassword] = useState("");
-  const [message, setMessage] = useState("");
-  const [showDelete, setShowDelete] = useState(false);
-
-  const saveUsername = async () => {
-    const supabase = createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
-    await supabase.from("profiles").update({ username }).eq("id", user.id);
-    setMessage("Username updated");
-    onUpdate();
-  };
-
-  const changePassword = async () => {
-    const supabase = createClient();
-    const { error } = await supabase.auth.updateUser({ password });
-    setMessage(error ? error.message : "Password updated");
-    setPassword("");
-  };
-
-  const deleteAccount = async () => {
-    setMessage("Contact support or delete via Supabase dashboard for full account removal.");
-    setShowDelete(false);
-  };
+  username,
+  prefs,
+  onUsernameChange,
+  onThemeChange,
+  onFontSizeChange,
+  onShowTagsToggle,
+  onResetXp,
+  onResetStreak,
+}: SettingsProps) {
+  const [draftName, setDraftName] = useState(username);
+  const [confirmResetXp, setConfirmResetXp] = useState(false);
 
   return (
-    <div className="mx-auto max-w-lg space-y-6">
+    <div className="mx-auto max-w-3xl space-y-6">
       <h2 className="text-2xl font-bold text-white">Settings</h2>
-      {message && <p className="text-[#4CAF50]">{message}</p>}
-      <GlassCard>
-        <label className="text-sm text-gray-400">Username</label>
+
+      <GlassCard className="space-y-3">
+        <p className="text-sm text-gray-400">Display username</p>
         <input
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white"
+          value={draftName}
+          onChange={(event) => setDraftName(event.target.value)}
+          className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white placeholder:text-gray-500 focus:border-[#E95420]/40 focus:outline-none"
+          placeholder="Enter display name"
         />
         <button
           type="button"
-          onClick={saveUsername}
-          className="mt-3 rounded-lg bg-[#E95420] px-4 py-2 text-sm text-white"
+          onClick={() => onUsernameChange(draftName.trim() || "User")}
+          className="micro-button rounded-lg bg-[#E95420] px-4 py-2 text-sm text-white"
         >
           Save Username
         </button>
       </GlassCard>
-      <GlassCard>
-        <label className="text-sm text-gray-400">New Password</label>
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white"
-        />
-        <button
-          type="button"
-          onClick={changePassword}
-          className="mt-3 rounded-lg border border-white/10 px-4 py-2 text-sm"
-        >
-          Change Password
-        </button>
+
+      <GlassCard className="space-y-3">
+        <p className="text-sm text-gray-400">Terminal color theme</p>
+        <div className="flex flex-wrap gap-2">
+          {themes.map((theme) => (
+            <button
+              key={theme}
+              type="button"
+              onClick={() => onThemeChange(theme)}
+              className={`micro-button rounded-full border px-4 py-1.5 text-sm capitalize ${
+                prefs.theme === theme
+                  ? "border-[#E95420]/60 bg-[#E95420]/15 text-[#E95420]"
+                  : "border-white/10 text-gray-300"
+              }`}
+            >
+              {theme}
+            </button>
+          ))}
+        </div>
       </GlassCard>
-      <GlassCard>
-        <button
-          type="button"
-          onClick={() => setShowDelete(true)}
-          className="text-sm text-red-400 hover:underline"
-        >
-          Delete Account
-        </button>
-        {showDelete && (
-          <div className="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 p-4">
-            <p className="text-sm text-gray-300">This cannot be undone.</p>
-            <div className="mt-3 flex gap-2">
+
+      <GlassCard className="space-y-3">
+        <p className="text-sm text-gray-400">Terminal font size</p>
+        <div className="flex flex-wrap gap-2">
+          {fontSizes.map((size) => (
+            <button
+              key={size}
+              type="button"
+              onClick={() => onFontSizeChange(size)}
+              className={`micro-button rounded-full border px-4 py-1.5 text-sm capitalize ${
+                prefs.fontSize === size
+                  ? "border-[#E95420]/60 bg-[#E95420]/15 text-[#E95420]"
+                  : "border-white/10 text-gray-300"
+              }`}
+            >
+              {size}
+            </button>
+          ))}
+        </div>
+      </GlassCard>
+
+      <GlassCard className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-sm text-gray-300">Show terminal source tags</p>
+            <p className="text-xs text-gray-500">Display [AI], [DB], and [local] next to output lines.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onShowTagsToggle(!prefs.showSourceTags)}
+            className={`micro-button rounded-full border px-3 py-1 text-xs ${
+              prefs.showSourceTags
+                ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
+                : "border-white/10 text-gray-300"
+            }`}
+          >
+            {prefs.showSourceTags ? "ON" : "OFF"}
+          </button>
+        </div>
+      </GlassCard>
+
+      <GlassCard className="space-y-3">
+        <p className="text-sm text-gray-400">Danger zone</p>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setConfirmResetXp(true)}
+            className="micro-button rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-2 text-sm text-rose-300"
+          >
+            Reset XP
+          </button>
+          <button
+            type="button"
+            onClick={onResetStreak}
+            className="micro-button rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-200"
+          >
+            Reset Streak
+          </button>
+        </div>
+      </GlassCard>
+
+      {confirmResetXp && (
+        <div className="fixed inset-0 z-[95] flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-md rounded-xl border border-white/15 bg-[#170a29] p-5 shadow-2xl">
+            <h3 className="text-lg font-semibold text-white">Reset XP?</h3>
+            <p className="mt-2 text-sm text-gray-400">This will reset XP back to 0 for this session.</p>
+            <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={deleteAccount}
-                className="rounded-lg bg-red-500 px-3 py-1 text-sm text-white"
+                onClick={() => setConfirmResetXp(false)}
+                className="micro-button rounded-lg border border-white/15 px-4 py-2 text-sm text-gray-300"
               >
-                Confirm Delete
-              </button>
-              <button type="button" onClick={() => setShowDelete(false)} className="text-sm">
                 Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onResetXp();
+                  setConfirmResetXp(false);
+                }}
+                className="micro-button rounded-lg bg-rose-500 px-4 py-2 text-sm text-white"
+              >
+                Confirm Reset
               </button>
             </div>
           </div>
-        )}
-      </GlassCard>
+        </div>
+      )}
     </div>
   );
 }

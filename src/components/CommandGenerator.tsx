@@ -1,18 +1,34 @@
 "use client";
 
 import { useState } from "react";
-import { Loader2, Sparkles, AlertTriangle } from "lucide-react";
+import { Loader2, Sparkles, AlertTriangle, Star } from "lucide-react";
 import { GlassCard } from "./GlassCard";
 import { CopyButton } from "./CopyButton";
 import { TerminalPrompt } from "./TerminalPrompt";
 import { riskBadgeClass } from "@/lib/utils";
+import type { SessionCommand } from "@/lib/session";
 import type { CommandResponse } from "@/types";
 
-export function CommandGenerator({ onSuccess }: { onSuccess?: () => void }) {
+interface CommandGeneratorProps {
+  onSuccess?: () => void;
+  onCommandGenerated: (command: SessionCommand) => void;
+  onCopy: () => void;
+  onToggleBookmark: (command: SessionCommand) => void;
+  isBookmarked: (commandId: string) => boolean;
+}
+
+export function CommandGenerator({
+  onSuccess,
+  onCommandGenerated,
+  onCopy,
+  onToggleBookmark,
+  isBookmarked,
+}: CommandGeneratorProps) {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<CommandResponse | null>(null);
+  const [latestCommand, setLatestCommand] = useState<SessionCommand | null>(null);
 
   const generate = async () => {
     if (!query.trim()) return;
@@ -28,6 +44,15 @@ export function CommandGenerator({ onSuccess }: { onSuccess?: () => void }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setResult(data);
+      const commandItem: SessionCommand = {
+        id: Math.random().toString(36).slice(2, 10),
+        input: data.command,
+        output: data.output || data.explanation || "",
+        source: "ai-generated",
+        createdAt: new Date().toISOString(),
+      };
+      setLatestCommand(commandItem);
+      onCommandGenerated(commandItem);
       onSuccess?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to generate");
@@ -70,7 +95,25 @@ export function CommandGenerator({ onSuccess }: { onSuccess?: () => void }) {
             <span className={`rounded-full border px-2 py-0.5 text-xs ${riskBadgeClass(result.risk)}`}>
               {result.risk} Risk
             </span>
-            <CopyButton text={result.command} />
+            <div className="flex items-center gap-2">
+              {latestCommand && (
+                <button
+                  type="button"
+                  onClick={() => onToggleBookmark(latestCommand)}
+                  className={`micro-button rounded-md border p-2 transition ${
+                    isBookmarked(latestCommand.id)
+                      ? "border-yellow-400/50 bg-yellow-400/10 text-yellow-300"
+                      : "border-white/10 bg-white/5 text-gray-300 hover:text-yellow-300"
+                  }`}
+                  title="Bookmark command"
+                >
+                  <Star
+                    className={`h-4 w-4 ${isBookmarked(latestCommand.id) ? "fill-yellow-300" : ""}`}
+                  />
+                </button>
+              )}
+              <CopyButton text={result.command} onCopied={onCopy} />
+            </div>
           </div>
           <pre className="rounded-lg border border-[#4CAF50]/30 bg-black/40 p-4 font-mono text-[#4CAF50]">
             $ {result.command}

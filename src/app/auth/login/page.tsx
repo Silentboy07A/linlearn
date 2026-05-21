@@ -19,8 +19,17 @@ export default function LoginPage() {
     setError("");
     const supabase = createClient();
     const { error: err } = await supabase.auth.signInWithPassword({ email, password });
-    if (err) setError(err.message);
-    else router.push("/dashboard");
+    
+    if (err) {
+      if (err.message === "Invalid login credentials") {
+        setError("Invalid email or password. Please check your details or sign up if you don't have an account.");
+      } else {
+        setError(err.message);
+      }
+    } else {
+      router.push("/dashboard");
+      router.refresh();
+    }
     setLoading(false);
   };
 
@@ -40,7 +49,11 @@ export default function LoginPage() {
           <span className="text-2xl font-bold text-[#E95420]">LinLearn</span>
         </div>
         <h1 className="mb-6 text-center text-xl font-semibold text-white">Sign in</h1>
-        {error && <p className="mb-4 text-center text-sm text-red-400">{error}</p>}
+        {error && (
+          <div className="mb-4 rounded-lg bg-red-950/50 p-3 text-center text-sm text-red-200 border border-red-500/20">
+            {error}
+          </div>
+        )}
         <form onSubmit={login} className="space-y-4">
           <input
             type="email"
@@ -48,7 +61,7 @@ export default function LoginPage() {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             placeholder="Email"
-            className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white"
+            className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#E95420]"
           />
           <input
             type="password"
@@ -56,26 +69,34 @@ export default function LoginPage() {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder="Password"
-            className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white"
+            className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#E95420]"
           />
           <button
             type="submit"
             disabled={loading}
-            className="w-full rounded-lg bg-[#E95420] py-3 font-medium text-white disabled:opacity-50"
+            className="w-full rounded-lg bg-[#E95420] py-3 font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
           >
             {loading ? "Signing in..." : "Sign In"}
           </button>
         </form>
+        <div className="relative my-6">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-white/10"></div>
+          </div>
+          <div className="relative flex justify-center text-xs uppercase">
+            <span className="bg-[#1a0a2e] px-2 text-gray-400">Or continue with</span>
+          </div>
+        </div>
         <button
           type="button"
           onClick={google}
-          className="mt-4 w-full rounded-lg border border-white/10 py-3 text-sm text-gray-300 hover:bg-white/5"
+          className="w-full rounded-lg border border-white/10 py-3 text-sm text-gray-300 transition-colors hover:bg-white/10"
         >
-          Continue with Google
+          Google
         </button>
         <p className="mt-6 text-center text-sm text-gray-400">
           No account?{" "}
-          <Link href="/auth/signup" className="text-[#E95420] hover:underline">
+          <Link href="/auth/signup" className="text-[#E95420] hover:underline font-medium">
             Sign up
           </Link>
         </p>

@@ -23,10 +23,63 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Topic required" }, { status: 400 });
     }
 
-    const result = await callLlamaJson<CheatSheetResponse>(
-      SYSTEM,
-      `Topic: ${topic}\nStyle: ${style || "Detailed"}`
-    );
+    let result: CheatSheetResponse;
+    let source = "ai";
+
+    // ── AI first ──
+    try {
+      result = await callLlamaJson<CheatSheetResponse>(
+        SYSTEM,
+        `Topic: ${topic}\nStyle: ${style || "Detailed"}`
+      );
+    } catch (aiErr) {
+      console.warn("AI cheatsheet failed, falling back to DB:", aiErr);
+      source = "db";
+
+      // ── DB fallback: query linux_commands table by topic keyword ──
+      const { data: commands, error: dbErr } = await auth.supabase
+        .from("linux_commands")
+        .select("command_name, description, example_usage, category")
+        .ilike("category", `%${topic}%`)
+        .limit(50);
+
+      // If category search returns too few results, broaden to keyword in description
+      const rows =
+        commands && commands.length >= 3
+          ? commands
+          : (
+              await auth.supabase
+                .from("linux_commands")
+                .select("command_name, description, example_usage, category")
+                .or(
+                  `description.ilike.%${topic}%,command_name.ilike.%${topic}%`
+                )
+                .limit(50)
+            ).data ?? [];
+
+      if (dbErr || rows.length === 0) {
+        throw new Error("AI unavailable and no matching commands in DB.");
+      }
+
+      // Group rows by their category into sections
+      const grouped: Record<string, typeof rows> = {};
+      for (const row of rows) {
+        const key = row.category || "General";
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(row);
+      }
+
+      result = {
+        title: `${topic} Cheat Sheet`,
+        sections: Object.entries(grouped).map(([heading, items]) => ({
+          heading,
+          items: items.map((r) => ({
+            command: r.command_name,
+            description: `${r.description} — e.g. ${r.example_usage}`,
+          })),
+        })),
+      };
+    }
 
     await auth.supabase.from("cheatsheets").insert({
       user_id: auth.user!.id,
@@ -36,7 +89,7 @@ export async function POST(req: NextRequest) {
 
     const progress = await addXp(auth.supabase, auth.user!.id, XP_REWARDS.cheatsheet);
 
-    return NextResponse.json({ ...result, progress });
+    return NextResponse.json({ ...result, progress, source });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Cheat sheet generation failed";
     return NextResponse.json({ error: message }, { status: 500 });

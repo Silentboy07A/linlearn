@@ -1,249 +1,182 @@
 "use client";
 
-import { useState } from "react";
-import { Mic, Loader2 } from "lucide-react";
-import { GlassCard } from "./GlassCard";
-import type { InterviewAnswerResponse, InterviewReportResponse } from "@/types";
+import { useMemo, useState } from "react";
+import { Loader2, Mic } from "lucide-react";
+import { GlassCard } from "@/components/GlassCard";
+import type { InterviewHistoryItem } from "@/lib/session";
 
-const TOPICS = [
-  "Linux SysAdmin",
-  "DevOps Engineer",
-  "Docker & Kubernetes",
-  "Shell Scripting",
-  "Git & Version Control",
-  "Networking",
+const QUESTION_BANK = [
+  "How does Linux file permission `750` work in a production web app folder?",
+  "Explain the difference between a process and a thread in Linux.",
+  "How would you troubleshoot high CPU usage on a Linux server?",
+  "What is the difference between `systemctl restart` and `systemctl reload`?",
+  "How do you roll back a bad deploy in a Git-based CI/CD pipeline?",
+  "Describe how DNS resolution works when calling an API from a container.",
+  "How do you secure SSH access on a production VM?",
+  "What are common reasons for Kubernetes pods entering CrashLoopBackOff?",
+  "How would you monitor and alert on disk usage before outages happen?",
+  "What is the purpose of infrastructure as code in DevOps teams?",
 ];
-const LEVELS = ["Junior", "Mid", "Senior"];
 
-interface AnswerRecord {
-  question: string;
-  answer: string;
+interface InterviewResponse {
   score: number;
+  good: string;
+  missing: string;
+  modelAnswer: string;
 }
 
-export function MockInterview({ onSuccess }: { onSuccess?: () => void }) {
-  const [topic, setTopic] = useState(TOPICS[0]);
-  const [difficulty, setDifficulty] = useState("Junior");
-  const [phase, setPhase] = useState<"select" | "interview" | "report">("select");
-  const [question, setQuestion] = useState("");
-  const [questionNum, setQuestionNum] = useState(1);
+interface MockInterviewProps {
+  onAwardXp: (amount: number, message: string) => void;
+  onHistoryAdd: (item: InterviewHistoryItem) => void;
+}
+
+export function MockInterview({ onAwardXp, onHistoryAdd }: MockInterviewProps) {
+  const [questionIndex, setQuestionIndex] = useState(0);
   const [answer, setAnswer] = useState("");
-  const [feedback, setFeedback] = useState<InterviewAnswerResponse | null>(null);
-  const [records, setRecords] = useState<AnswerRecord[]>([]);
-  const [report, setReport] = useState<InterviewReportResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<InterviewResponse | null>(null);
+  const [error, setError] = useState("");
+  const [localHistory, setLocalHistory] = useState<InterviewHistoryItem[]>([]);
 
-  const start = async () => {
+  const question = QUESTION_BANK[questionIndex];
+  const canSubmit = answer.trim().length > 0 && !loading;
+
+  const summaryText = useMemo(() => {
+    if (!result) return "";
+    if (result.score >= 8) return "Strong answer. Great structure and depth.";
+    if (result.score >= 5) return "Solid baseline. Add more implementation detail.";
+    return "Needs more precision. Focus on practical steps and tradeoffs.";
+  }, [result]);
+
+  async function submit() {
+    if (!canSubmit) return;
     setLoading(true);
+    setError("");
+    setResult(null);
+
     try {
-      const res = await fetch("/api/interview", {
+      const response = await fetch("/api/interview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "start", topic, difficulty }),
+        body: JSON.stringify({ question, answer: answer.trim() }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      setQuestion(data.question);
-      setQuestionNum(1);
-      setPhase("interview");
-      setRecords([]);
-      setFeedback(null);
-    } catch (e) {
-      alert(e instanceof Error ? e.message : "Failed");
+      const data = (await response.json()) as InterviewResponse & { error?: string };
+      if (!response.ok) {
+        throw new Error(data.error || "Interview scoring failed");
+      }
+
+      const score = Math.max(0, Math.min(10, Math.round(data.score)));
+      const xpAward = score * 5;
+      onAwardXp(xpAward, `Interview scored ${score}/10 • +${xpAward} XP`);
+
+      const entry: InterviewHistoryItem = {
+        id: Math.random().toString(36).slice(2, 10),
+        question,
+        answer: answer.trim(),
+        score,
+        good: data.good,
+        missing: data.missing,
+        modelAnswer: data.modelAnswer,
+        xpEarned: xpAward,
+        createdAt: new Date().toISOString(),
+      };
+      onHistoryAdd(entry);
+      setLocalHistory((previous) => [entry, ...previous].slice(0, 10));
+      setResult({ ...data, score });
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Interview scoring failed");
     } finally {
       setLoading(false);
     }
-  };
-
-  const submitAnswer = async () => {
-    if (!answer.trim()) return;
-    setLoading(true);
-    try {
-      const res = await fetch("/api/interview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "answer",
-          topic,
-          difficulty,
-          question,
-          answer,
-          questionNumber: questionNum,
-        }),
-      });
-      const data: InterviewAnswerResponse = await res.json();
-      if (!res.ok) throw new Error((data as { error?: string }).error);
-      setFeedback(data);
-      setRecords((r) => [...r, { question, answer, score: data.score }]);
-    } catch (e) {
-      alert(e instanceof Error ? e.message : "Failed");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const next = async () => {
-    if (!feedback) return;
-    const allRecords = [...records];
-    if (!feedback.nextQuestion || questionNum >= 5) {
-      setLoading(true);
-      const res = await fetch("/api/interview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "report",
-          topic,
-          answers: allRecords,
-        }),
-      });
-      const data = await res.json();
-      setReport(data);
-      setPhase("report");
-      onSuccess?.();
-      setLoading(false);
-      return;
-    }
-    setQuestion(feedback.nextQuestion);
-    setQuestionNum((n) => n + 1);
-    setAnswer("");
-    setFeedback(null);
-  };
-
-  if (phase === "select") {
-    return (
-      <div className="space-y-6">
-        <h2 className="text-2xl font-bold text-white">
-          <Mic className="inline h-7 w-7 text-[#E95420]" /> Mock Interview
-        </h2>
-        <div className="grid gap-2 sm:grid-cols-2">
-          {TOPICS.map((t) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => setTopic(t)}
-              className={`rounded-lg border p-3 text-left text-sm cursor-pointer transition-all duration-300 ${
-                topic === t 
-                  ? "border-[#E95420] text-[#E95420] hover:scale-105" 
-                  : "border-white/10 text-gray-400 hover:border-orange-500 hover:shadow-lg hover:shadow-orange-500/20"
-              }`}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
-        <GlassCard>
-          <div className="flex gap-2">
-            {LEVELS.map((l) => (
-              <button
-                key={l}
-                type="button"
-                onClick={() => setDifficulty(l)}
-                className={`rounded-full px-3 py-1 text-sm transition-all duration-300 ${
-                  difficulty === l 
-                    ? "bg-[#E95420] text-white hover:scale-105" 
-                    : "border border-white/10 hover:border-orange-500 hover:text-orange-500"
-                }`}
-              >
-                {l}
-              </button>
-            ))}
-          </div>
-          <button
-            type="button"
-            onClick={start}
-            disabled={loading}
-            className="mt-4 w-full rounded-lg bg-[#E95420] py-3 text-white disabled:opacity-50 hover:scale-105 hover:brightness-110 transition-all duration-300"
-          >
-            Start Interview
-          </button>
-        </GlassCard>
-      </div>
-    );
   }
 
-  if (phase === "report" && report) {
-    return (
-      <GlassCard className="space-y-4">
-        <h3 className="text-xl font-bold text-white">Final Report</h3>
-        <p className="text-3xl font-bold text-[#4CAF50]">{report.totalScore}/50</p>
-        <p className="text-[#E95420]">{report.performance}</p>
-        <div>
-          <h4 className="text-sm text-gray-400">Strengths</h4>
-          <ul className="list-disc pl-5 text-sm text-gray-300">
-            {report.strengths.map((s) => (
-              <li key={s}>{s}</li>
-            ))}
-          </ul>
-        </div>
-        <div>
-          <h4 className="text-sm text-gray-400">Improve</h4>
-          <ul className="list-disc pl-5 text-sm text-gray-300">
-            {report.improvements.map((s) => (
-              <li key={s}>{s}</li>
-            ))}
-          </ul>
-        </div>
-        <button
-          type="button"
-          onClick={() => setPhase("select")}
-          className="rounded-lg bg-[#E95420] px-4 py-2 text-white"
-        >
-          New Interview
-        </button>
-      </GlassCard>
-    );
+  function nextQuestion() {
+    setQuestionIndex((previous) => (previous + 1) % QUESTION_BANK.length);
+    setAnswer("");
+    setResult(null);
+    setError("");
   }
 
   return (
-    <div className="space-y-4">
-      <p className="text-sm text-gray-400">
-        Question {questionNum}/5 — {topic}
-      </p>
-      <GlassCard>
+    <div className="space-y-5">
+      <div>
+        <h2 className="text-2xl font-bold text-white">
+          <Mic className="mr-2 inline h-6 w-6 text-[#E95420]" />
+          Mock Interview
+        </h2>
+        <p className="mt-1 text-sm text-gray-400">
+          Answer one Linux/DevOps question at a time and get a model-scored review.
+        </p>
+      </div>
+
+      <GlassCard className="space-y-4">
         <p className="font-mono text-[#4CAF50]">interviewer@linlearn:~$ {question}</p>
-        {!feedback ? (
-          <>
-            <textarea
-              value={answer}
-              onChange={(e) => setAnswer(e.target.value)}
-              rows={6}
-              className="mt-4 w-full rounded-lg border border-white/10 bg-black/30 p-3 text-white"
-              placeholder="Type your answer..."
-            />
-            <button
-              type="button"
-              onClick={submitAnswer}
-              disabled={loading}
-              className="mt-3 flex items-center gap-2 rounded-lg bg-[#E95420] px-4 py-2 text-white"
-            >
-              {loading && <Loader2 className="h-4 w-4 animate-spin" />}
-              Submit Answer
-            </button>
-          </>
-        ) : (
-          <div className="mt-4 space-y-3 text-sm">
-            <p>
-              Score: <span className="text-[#4CAF50]">{feedback.score}/10</span>
-            </p>
-            <p className="text-gray-300">
-              <strong className="text-[#4CAF50]">Good:</strong> {feedback.good}
-            </p>
-            <p className="text-gray-300">
-              <strong className="text-yellow-400">Missing:</strong> {feedback.missing}
-            </p>
-            <p className="text-gray-400">
-              <strong>Model:</strong> {feedback.modelAnswer}
-            </p>
-            <button
-              type="button"
-              onClick={next}
-              className="rounded-lg bg-[#E95420] px-4 py-2 text-white"
-            >
-              {questionNum >= 5 ? "View Report" : "Next Question"}
-            </button>
-          </div>
-        )}
+        <textarea
+          value={answer}
+          onChange={(event) => setAnswer(event.target.value)}
+          rows={6}
+          placeholder="Type your answer with practical steps..."
+          className="w-full rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white placeholder:text-gray-500 focus:border-[#E95420]/40 focus:outline-none"
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={submit}
+            disabled={!canSubmit}
+            className="micro-button flex items-center gap-2 rounded-lg bg-[#E95420] px-4 py-2 text-white transition hover:bg-[#ff6b36] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+            Submit Answer
+          </button>
+          <button
+            type="button"
+            onClick={nextQuestion}
+            className="micro-button rounded-lg border border-white/15 px-4 py-2 text-sm text-gray-300"
+          >
+            Next Question
+          </button>
+        </div>
+        {error && <p className="text-sm text-rose-300">{error}</p>}
       </GlassCard>
+
+      {result && (
+        <GlassCard className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-lg font-semibold text-white">Interview Feedback</h3>
+            <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-sm text-emerald-300">
+              Score: {result.score}/10
+            </span>
+          </div>
+          <p className="text-sm text-gray-300">{summaryText}</p>
+          <div className="space-y-2 rounded-lg border border-white/10 bg-black/25 p-3 text-sm">
+            <p className="text-emerald-300">
+              <span className="font-semibold">What was good:</span> {result.good}
+            </p>
+            <p className="text-amber-200">
+              <span className="font-semibold">What was missing:</span> {result.missing}
+            </p>
+            <p className="text-gray-300">
+              <span className="font-semibold">Model answer:</span> {result.modelAnswer}
+            </p>
+          </div>
+        </GlassCard>
+      )}
+
+      {localHistory.length > 0 && (
+        <GlassCard>
+          <h3 className="text-sm font-semibold text-white">Session Interview History</h3>
+          <ul className="mt-3 space-y-2 text-sm">
+            {localHistory.map((item) => (
+              <li key={item.id} className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <p className="line-clamp-1 text-gray-300">{item.question}</p>
+                <p className="mt-1 text-xs text-emerald-300">
+                  Score {item.score}/10 • +{item.xpEarned} XP
+                </p>
+              </li>
+            ))}
+          </ul>
+        </GlassCard>
+      )}
     </div>
   );
 }
