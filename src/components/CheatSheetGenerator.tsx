@@ -6,6 +6,7 @@ import { jsPDF } from "jspdf";
 import { GlassCard } from "./GlassCard";
 import { CopyButton } from "./CopyButton";
 import type { CheatSheetResponse } from "@/types";
+import { getHfHeaders } from "@/lib/utils";
 
 const TOPICS = [
   "Git",
@@ -34,7 +35,10 @@ export function CheatSheetGenerator({ onSuccess }: { onSuccess?: () => void }) {
     try {
       const res = await fetch("/api/cheatsheet", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getHfHeaders(),
+        },
         body: JSON.stringify({ topic, style }),
       });
       const data = await res.json();

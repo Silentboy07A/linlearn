@@ -7,6 +7,8 @@ import { CopyButton } from "./CopyButton";
 import { TerminalPrompt } from "./TerminalPrompt";
 import type { ScriptResponse } from "@/types";
 
+import { getHfHeaders } from "@/lib/utils";
+
 const DIFFICULTIES = ["Simple", "Intermediate", "Advanced"] as const;
 
 export function ShellScriptGenerator({ onSuccess }: { onSuccess?: () => void }) {
@@ -23,7 +25,10 @@ export function ShellScriptGenerator({ onSuccess }: { onSuccess?: () => void }) 
     try {
       const res = await fetch("/api/script", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getHfHeaders(),
+        },
         body: JSON.stringify({ description, difficulty }),
       });
       const data = await res.json();

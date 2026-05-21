@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import type { CommandSource } from "@/lib/commandDB";
 import { sourceTag, type SessionCommand, type TerminalPrefs } from "@/lib/session";
+import { getHfHeaders } from "@/lib/utils";
 
 interface DirNode {
   type: "dir";
@@ -137,7 +138,7 @@ function getNode(root: DirNode, path: string): FsNode | null {
   let pointer: FsNode = root;
   for (const part of parts) {
     if (pointer.type !== "dir") return null;
-    const next = pointer.children[part];
+    const next: FsNode | undefined = pointer.children[part];
     if (!next) return null;
     pointer = next;
   }
@@ -174,7 +175,7 @@ function deleteNode(root: DirNode, path: string): DirNode {
   for (let i = 0; i < parts.length - 1; i += 1) {
     const segment = parts[i];
     if (pointer.type !== "dir") return draft;
-    const next = pointer.children[segment];
+    const next: FsNode | undefined = pointer.children[segment];
     if (!next) return draft;
     pointer = next;
   }
@@ -421,7 +422,10 @@ export function TerminalSimulator({
     try {
       const response = await fetch("/api/terminal", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getHfHeaders(),
+        },
         body: JSON.stringify({ command: commandLine, cwd, filesystem }),
       });
       const data = (await response.json()) as {

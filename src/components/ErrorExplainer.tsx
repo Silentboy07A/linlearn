@@ -5,6 +5,7 @@ import { AlertTriangle, Loader2 } from "lucide-react";
 import { GlassCard } from "./GlassCard";
 import { CopyButton } from "./CopyButton";
 import type { ErrorExplainResponse } from "@/types";
+import { getHfHeaders } from "@/lib/utils";
 
 export function ErrorExplainer({ onSuccess }: { onSuccess?: () => void }) {
   const [errorText, setErrorText] = useState("");
@@ -19,7 +20,10 @@ export function ErrorExplainer({ onSuccess }: { onSuccess?: () => void }) {
     try {
       const res = await fetch("/api/error-explain", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getHfHeaders(),
+        },
         body: JSON.stringify({ error: errorText }),
       });
       const data = await res.json();

@@ -11,12 +11,10 @@
  *   HF_API_URL   — override the full endpoint URL (optional)
  */
 
+import { headers } from "next/headers";
+
 const DEFAULT_MODEL =
   process.env.HF_MODEL ?? "silentone1234/linlearn-phi3-linux-assistant";
-
-const DEFAULT_URL =
-  process.env.HF_API_URL ??
-  `https://api-inference.huggingface.co/models/${DEFAULT_MODEL}/v1/chat/completions`;
 
 // ─── JSON helpers ─────────────────────────────────────────────────────────────
 
@@ -37,14 +35,29 @@ export async function callLlama(
   systemPrompt: string,
   userPrompt: string
 ): Promise<string> {
-  const apiKey = process.env.HF_API_KEY;
+  let apiKey = process.env.HF_API_KEY;
+  let model = process.env.HF_MODEL ?? DEFAULT_MODEL;
+
+  try {
+    const reqHeaders = headers();
+    const clientKey = reqHeaders.get("x-hf-api-key");
+    const clientModel = reqHeaders.get("x-hf-model");
+    if (clientKey) {
+      apiKey = clientKey;
+    }
+    if (clientModel) {
+      model = clientModel;
+    }
+  } catch {
+    // outside request context or during static generation/build
+  }
+
   if (!apiKey) {
     throw new Error(
-      "HF_API_KEY is not set. Add your Hugging Face token to .env.local"
+      "HF_API_KEY is not set. Add your Hugging Face token to .env.local or configure it in Settings."
     );
   }
 
-  const model = process.env.HF_MODEL ?? DEFAULT_MODEL;
   const url =
     process.env.HF_API_URL ??
     `https://api-inference.huggingface.co/models/${model}/v1/chat/completions`;

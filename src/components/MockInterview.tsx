@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { Loader2, Mic } from "lucide-react";
 import { GlassCard } from "@/components/GlassCard";
 import type { InterviewHistoryItem } from "@/lib/session";
+import { getHfHeaders } from "@/lib/utils";
 
 const QUESTION_BANK = [
   "How does Linux file permission `750` work in a production web app folder?",
@@ -57,8 +58,18 @@ export function MockInterview({ onAwardXp, onHistoryAdd }: MockInterviewProps) {
     try {
       const response = await fetch("/api/interview", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, answer: answer.trim() }),
+        headers: {
+          "Content-Type": "application/json",
+          ...getHfHeaders(),
+        },
+        body: JSON.stringify({
+          action: "answer",
+          topic: "Linux SysAdmin",
+          difficulty: "Mid",
+          question,
+          answer: answer.trim(),
+          questionNumber: questionIndex + 1,
+        }),
       });
       const data = (await response.json()) as InterviewResponse & { error?: string };
       if (!response.ok) {

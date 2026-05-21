@@ -5,7 +5,7 @@ import { Loader2, Sparkles, AlertTriangle, Star } from "lucide-react";
 import { GlassCard } from "./GlassCard";
 import { CopyButton } from "./CopyButton";
 import { TerminalPrompt } from "./TerminalPrompt";
-import { riskBadgeClass } from "@/lib/utils";
+import { riskBadgeClass, getHfHeaders } from "@/lib/utils";
 import type { SessionCommand } from "@/lib/session";
 import type { CommandResponse } from "@/types";
 
@@ -38,7 +38,10 @@ export function CommandGenerator({
     try {
       const res = await fetch("/api/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getHfHeaders(),
+        },
         body: JSON.stringify({ query: query.trim() }),
       });
       const data = await res.json();

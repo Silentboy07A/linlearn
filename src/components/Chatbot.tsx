@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Send,
@@ -26,6 +26,7 @@ import {
   ChevronDown,
 } from "lucide-react";
 import type { ChatMessage } from "@/types";
+import { getHfHeaders } from "@/lib/utils";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -444,7 +445,7 @@ export function Chatbot({ onSuccess }: { onSuccess?: () => void }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId)!;
-  const messages = activeSession?.messages ?? [WELCOME_MSG];
+  const messages = useMemo(() => activeSession?.messages ?? [WELCOME_MSG], [activeSession]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -477,7 +478,10 @@ export function Chatbot({ onSuccess }: { onSuccess?: () => void }) {
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...getHfHeaders(),
+        },
         body: JSON.stringify({ messages: nextMessages }),
       });
       const data = await res.json();

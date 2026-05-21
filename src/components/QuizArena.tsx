@@ -31,7 +31,7 @@ export function QuizArena({ onAwardXp, onComplete }: QuizArenaProps) {
   const [correctCount, setCorrectCount] = useState(0);
   const [wrongCount, setWrongCount] = useState(0);
   const [xpEarned, setXpEarned] = useState(0);
-  const [correctStreak, setCorrectStreak] = useState(0);
+  const [, setCorrectStreak] = useState(0);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [timeTakenSec, setTimeTakenSec] = useState(0);
 

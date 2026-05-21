@@ -54,7 +54,12 @@ export async function POST(req: NextRequest) {
             .slice(0, 3)
             .map((c) => c.command_name);
 
-          const options = [cmd.command_name, ...others].sort(() => Math.random() - 0.5);
+          const options = [cmd.command_name, ...others].sort(() => Math.random() - 0.5) as [
+            string,
+            string,
+            string,
+            string,
+          ];
           const correct = options.indexOf(cmd.command_name);
 
           return {
