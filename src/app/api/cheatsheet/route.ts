@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/api-auth";
 import { callLlamaJson } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
+import { rateLimit } from "@/lib/rate-limit";
 import type { CheatSheetResponse } from "@/types";
 
 const SYSTEM = `You are a Linux and DevOps expert. Generate a comprehensive cheat sheet.
@@ -17,11 +18,16 @@ export async function POST(req: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // Rate Limit: 5 requests per minute (very heavy operation)
+  const limitResponse = rateLimit(req, auth.user!.id, { limit: 5, windowMs: 60 * 1000 });
+  if (limitResponse) return limitResponse;
+
   try {
     const { topic, style } = await req.json();
     if (!topic) {
       return NextResponse.json({ error: "Topic required" }, { status: 400 });
     }
+
 
     let result: CheatSheetResponse;
     let source = "ai";

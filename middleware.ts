@@ -1,7 +1,30 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
+
+const ratelimit = process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN 
+  ? new Ratelimit({
+      redis: new Redis({
+        url: process.env.KV_REST_API_URL,
+        token: process.env.KV_REST_API_TOKEN,
+      }),
+      limiter: Ratelimit.slidingWindow(20, "10 s"),
+    })
+  : null;
 
 export async function middleware(request: NextRequest) {
+  if (ratelimit && request.nextUrl.pathname.startsWith("/api")) {
+    const ip = request.ip ?? request.headers.get("x-forwarded-for") ?? "127.0.0.1";
+    const { success, limit, reset, remaining } = await ratelimit.limit(ip);
+    if (!success) {
+      return NextResponse.json(
+        { error: "Too Many Requests" },
+        { status: 429, headers: { "X-RateLimit-Limit": limit.toString(), "X-RateLimit-Remaining": remaining.toString(), "X-RateLimit-Reset": reset.toString() } }
+      );
+    }
+  }
+
   let supabaseResponse = NextResponse.next({ request });
 
   const supabase = createServerClient(
@@ -53,5 +76,5 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/", "/dashboard/:path*", "/auth/:path*"],
+  matcher: ["/", "/dashboard/:path*", "/auth/:path*", "/api/:path*"],
 };

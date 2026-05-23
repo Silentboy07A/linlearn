@@ -32,12 +32,13 @@ export function ShellScriptGenerator({ onSuccess }: { onSuccess?: () => void }) 
         body: JSON.stringify({ description, difficulty }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      if (!res.ok) throw new Error(data.message || data.error || "Failed to generate script.");
       setResult(data);
       onSuccess?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed");
-    } finally {
+    }
+ finally {
       setLoading(false);
     }
   };

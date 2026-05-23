@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/api-auth";
 import { callLlamaJson } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
+import { rateLimit } from "@/lib/rate-limit";
 import type { QuizQuestion } from "@/types";
 
 const SYSTEM = `Generate exactly 10 multiple choice Linux/DevOps quiz questions.
@@ -19,10 +20,14 @@ export async function POST(req: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // Rate Limit: 15 requests per minute
+  const limitResponse = rateLimit(req, auth.user!.id, { limit: 15, windowMs: 60 * 1000 });
+  if (limitResponse) return limitResponse;
+
   try {
     const { category, difficulty, score, total } = await req.json();
-
     if (category && difficulty && score === undefined) {
+
       // ── AI first ──
       try {
         const questions = await callLlamaJson<QuizQuestion[]>(

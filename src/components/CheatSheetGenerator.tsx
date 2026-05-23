@@ -42,12 +42,13 @@ export function CheatSheetGenerator({ onSuccess }: { onSuccess?: () => void }) {
         body: JSON.stringify({ topic, style }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      if (!res.ok) throw new Error(data.message || data.error || "Failed to generate cheat sheet.");
       setResult(data);
       onSuccess?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed");
-    } finally {
+    }
+ finally {
       setLoading(false);
     }
   };

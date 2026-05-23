@@ -71,10 +71,11 @@ export function MockInterview({ onAwardXp, onHistoryAdd }: MockInterviewProps) {
           questionNumber: questionIndex + 1,
         }),
       });
-      const data = (await response.json()) as InterviewResponse & { error?: string };
+      const data = (await response.json()) as InterviewResponse & { error?: string; message?: string };
       if (!response.ok) {
-        throw new Error(data.error || "Interview scoring failed");
+        throw new Error(data.message || data.error || "Interview scoring failed");
       }
+
 
       const score = Math.max(0, Math.min(10, Math.round(data.score)));
       const xpAward = score * 5;

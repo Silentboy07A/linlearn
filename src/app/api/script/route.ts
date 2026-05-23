@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/api-auth";
 import { callLlamaJson } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
+import { rateLimit } from "@/lib/rate-limit";
 import type { ScriptResponse } from "@/types";
 import { checkDangerousCommand } from "@/lib/safety";
 
@@ -24,11 +25,16 @@ export async function POST(req: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // Rate Limit: 5 requests per minute (very heavy operation)
+  const limitResponse = rateLimit(req, auth.user!.id, { limit: 5, windowMs: 60 * 1000 });
+  if (limitResponse) return limitResponse;
+
   try {
     const { description, difficulty } = await req.json();
     if (!description) {
       return NextResponse.json({ error: "Description is required" }, { status: 400 });
     }
+
 
     // Validate safety of the input description
     const danger = checkDangerousCommand(description);

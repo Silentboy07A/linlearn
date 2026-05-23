@@ -3,7 +3,33 @@ import { requireUser } from "@/lib/api-auth";
 import { callLlama } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
+import { rateLimit } from "@/lib/rate-limit";
 import type { ChatMessage } from "@/types";
+import { Redis } from "@upstash/redis";
+
+const DAILY_LIMIT = 50;
+
+async function checkDailyQuota(userId: string): Promise<boolean> {
+  if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) return true;
+  
+  const redis = new Redis({
+    url: process.env.KV_REST_API_URL,
+    token: process.env.KV_REST_API_TOKEN,
+  });
+  const key = `quota:chat:${userId}:${new Date().toISOString().split('T')[0]}`;
+  const current = await redis.get<number>(key) || 0;
+  
+  if (current >= DAILY_LIMIT) {
+    return false;
+  }
+  
+  await redis.incr(key);
+  // Set expiry to 24 hours (86400 seconds) if it's a new key
+  if (current === 0) {
+    await redis.expire(key, 86400);
+  }
+  return true;
+}
 
 const SYSTEM = `You are a professional Linux security audit agent and virtual training sandbox auditor.
 Your job is to parse incoming CLI queries, script constructs, or questions and output a flat, structured technical specification report.
@@ -119,14 +145,28 @@ export async function POST(req: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // Rate Limit: 15 requests per minute
+  const limitResponse = rateLimit(req, auth.user!.id, { limit: 15, windowMs: 60 * 1000 });
+  if (limitResponse) return limitResponse;
+
   try {
     const { messages } = await req.json() as { messages: ChatMessage[] };
     if (!messages?.length) {
       return NextResponse.json({ error: "Messages required" }, { status: 400 });
     }
 
+    // AI Quota Check
+    const hasQuota = await checkDailyQuota(auth.user!.id);
+    if (!hasQuota) {
+      return NextResponse.json({ error: "Daily AI Chat Quota Exceeded (50 requests/day)" }, { status: 429 });
+    }
+
     const conversation = messages
-      .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
+      .map((m) => {
+        // Prompt sanitization: strip simple HTML tags and limit length
+        const safeContent = m.content.replace(/<[^>]*>?/gm, '').slice(0, 1000);
+        return `${m.role === "user" ? "User" : "Assistant"}: ${safeContent}`;
+      })
       .join("\n\n");
 
     const reply = await callLlama(SYSTEM, conversation);
@@ -138,3 +178,4 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+

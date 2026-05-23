@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/api-auth";
 import { callLlamaJson } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
+import { rateLimit } from "@/lib/rate-limit";
 import type { ErrorExplainResponse } from "@/types";
 
 const SYSTEM = `You are a Linux troubleshooting expert.
@@ -23,11 +24,16 @@ export async function POST(req: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // Rate Limit: 15 requests per minute
+  const limitResponse = rateLimit(req, auth.user!.id, { limit: 15, windowMs: 60 * 1000 });
+  if (limitResponse) return limitResponse;
+
   try {
     const { error } = await req.json();
     if (!error) {
       return NextResponse.json({ error: "Error text required" }, { status: 400 });
     }
+
 
     const result = await callLlamaJson<ErrorExplainResponse>(SYSTEM, error);
     const progress = await addXp(auth.supabase, auth.user!.id, XP_REWARDS.errorExplain);

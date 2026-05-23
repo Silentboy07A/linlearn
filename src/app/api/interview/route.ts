@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/api-auth";
 import { callLlamaJson } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
+import { rateLimit } from "@/lib/rate-limit";
 import type {
   InterviewAnswerResponse,
   InterviewReportResponse,
@@ -13,9 +14,14 @@ export async function POST(req: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  // Rate Limit: 20 requests per minute
+  const limitResponse = rateLimit(req, auth.user!.id, { limit: 20, windowMs: 60 * 1000 });
+  if (limitResponse) return limitResponse;
+
   try {
     const body = await req.json();
     const { action, topic, difficulty } = body;
+
 
     if (action === "start") {
       const result = await callLlamaJson<InterviewStartResponse>(

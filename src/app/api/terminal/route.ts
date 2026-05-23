@@ -2,9 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCommandDBOutput } from "@/lib/commandDB";
 import { callLlama } from "@/lib/llama";
 import { validateTerminalCommand } from "@/lib/safety";
+import { rateLimit } from "@/lib/rate-limit";
 
 export async function POST(req: NextRequest) {
+  // Rate Limit: 30 requests per minute by IP address (allows fast terminal typing but prevents API hammering/denial)
+  const limitResponse = rateLimit(req, null, { limit: 30, windowMs: 60 * 1000 });
+  if (limitResponse) return limitResponse;
+
   const { command, cwd, filesystem } = await req.json();
+
 
   // Validate safety
   const validation = validateTerminalCommand(command);

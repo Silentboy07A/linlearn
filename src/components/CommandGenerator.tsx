@@ -45,7 +45,7 @@ export function CommandGenerator({
         body: JSON.stringify({ query: query.trim() }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      if (!res.ok) throw new Error(data.message || data.error || "Failed to generate command.");
       setResult(data);
       const commandItem: SessionCommand = {
         id: Math.random().toString(36).slice(2, 10),
@@ -59,7 +59,8 @@ export function CommandGenerator({
       onSuccess?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to generate");
-    } finally {
+    }
+ finally {
       setLoading(false);
     }
   };

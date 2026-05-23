@@ -26,34 +26,45 @@ export default function SignupPage() {
     e.preventDefault();
     setLoading(true);
     setError("");
-    const supabase = createClient();
-    const { data, error: err } = await supabase.auth.signUp({
-      email,
-      password,
-      options: { data: { username } },
-    });
-    if (err) {
-      setError(err.message);
-    } else if (data.user) {
-      // If email confirmation is required, Supabase returns a user but no session
-      if (data.session) {
-        await supabase.from("profiles").update({ username }).eq("id", data.user.id);
-        router.push("/dashboard");
-      } else {
-        // Email confirmation enabled — tell user to check inbox
-        setSuccess(true);
+    try {
+      const supabase = createClient();
+      const { data, error: err } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { username } },
+      });
+      if (err) {
+        setError(err.message);
+      } else if (data.user) {
+        // If email confirmation is required, Supabase returns a user but no session
+        if (data.session) {
+          await supabase.from("profiles").update({ username }).eq("id", data.user.id);
+          router.push("/dashboard");
+        } else {
+          // Email confirmation enabled — tell user to check inbox
+          setSuccess(true);
+        }
       }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "An unexpected error occurred during signup.");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const google = async () => {
-    const supabase = createClient();
-    await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: `${window.location.origin}/auth/callback` },
-    });
+    setError("");
+    try {
+      const supabase = createClient();
+      await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: `${window.location.origin}/auth/callback` },
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "An unexpected error occurred with Google Sign In.");
+    }
   };
+
 
   const isAlreadyExists =
     error.toLowerCase().includes("already registered") ||
@@ -98,11 +109,14 @@ export default function SignupPage() {
           <>
             <form onSubmit={signup} className="space-y-4">
               <input
+                type="text"
+                required
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 placeholder="Username"
                 className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white placeholder-gray-500 outline-none transition focus:border-[#E95420]/60 focus:ring-1 focus:ring-[#E95420]/30"
               />
+
               <input
                 type="email"
                 required
