@@ -4,6 +4,7 @@ import { callLlamaJson } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
 import type { CommandResponse } from "@/types";
+import { checkDangerousCommand } from "@/lib/safety";
 
 const SYSTEM = `You are a Linux command expert.
 CRITICAL SAFETY & SCOPE RULES:
@@ -27,6 +28,18 @@ export async function POST(req: NextRequest) {
     const { query } = await req.json();
     if (!query || typeof query !== "string") {
       return NextResponse.json({ error: "Query is required" }, { status: 400 });
+    }
+
+    // Validate safety of the input query
+    const danger = checkDangerousCommand(query);
+    if (danger) {
+      return NextResponse.json({
+        command: "Blocked",
+        explanation: `The request contains a dangerous command: ${danger.name}`,
+        risk: "High",
+        output: "",
+        warning: `WARNING: The command "${danger.name}" is dangerous because: ${danger.risk} Generation has been blocked for safety.`,
+      });
     }
 
     const supabase = auth.supabase;
@@ -71,6 +84,18 @@ export async function POST(req: NextRequest) {
     // Fallback to LLM if not in DB
     if (!result) {
       result = await callLlamaJson<CommandResponse>(SYSTEM, query);
+    }
+
+    // Double check generated command safety
+    const genDanger = checkDangerousCommand(result.command);
+    if (genDanger) {
+      result = {
+        command: "Blocked",
+        explanation: `The generated command is dangerous: ${genDanger.name}`,
+        risk: "High",
+        output: "",
+        warning: `WARNING: The command "${genDanger.name}" is dangerous because: ${genDanger.risk} Generation has been blocked for safety.`,
+      };
     }
 
     await auth.supabase.from("command_history").insert({

@@ -4,6 +4,7 @@ import { callLlamaJson } from "@/lib/llama";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
 import type { ScriptResponse } from "@/types";
+import { checkDangerousCommand } from "@/lib/safety";
 
 const SYSTEM = `You are a bash scripting expert. The user will describe a task in plain English.
 CRITICAL SAFETY & SCOPE RULES:
@@ -29,10 +30,32 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Description is required" }, { status: 400 });
     }
 
+    // Validate safety of the input description
+    const danger = checkDangerousCommand(description);
+    if (danger) {
+      return NextResponse.json({
+        script: "echo 'Script generation blocked for safety.'",
+        breakdown: [`The script request contains a dangerous operation: ${danger.name}`],
+        warning: `WARNING: The command "${danger.name}" is dangerous because: ${danger.risk} Generation has been blocked for safety.`,
+        difficulty: "N/A",
+      });
+    }
+
     const result = await callLlamaJson<ScriptResponse>(
       SYSTEM,
       `Difficulty: ${difficulty || "Intermediate"}\nTask: ${description}`
     );
+
+    // Double check generated script safety
+    const genDanger = checkDangerousCommand(result.script);
+    if (genDanger) {
+      return NextResponse.json({
+        script: "echo 'Script execution blocked for safety.'",
+        breakdown: [`The generated script contains a dangerous operation: ${genDanger.name}`],
+        warning: `WARNING: The script contains "${genDanger.name}" which is dangerous because: ${genDanger.risk} Execution has been blocked for safety.`,
+        difficulty: "N/A",
+      });
+    }
 
     await auth.supabase.from("scripts").insert({
       user_id: auth.user!.id,

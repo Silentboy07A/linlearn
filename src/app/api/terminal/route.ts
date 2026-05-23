@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCommandDBOutput } from "@/lib/commandDB";
 import { callLlama } from "@/lib/llama";
+import { checkDangerousCommand } from "@/lib/safety";
 
 export async function POST(req: NextRequest) {
   const { command, cwd, filesystem } = await req.json();
+
+  // Validate safety
+  const danger = checkDangerousCommand(command);
+  if (danger) {
+    return NextResponse.json({
+      output: `Error: Dangerous command "${danger.name}" blocked.\nWarning: ${danger.risk}\nLinLearn terminal simulator does not execute or simulate destructive operations.`,
+      fsUpdate: null,
+    });
+  }
 
   const systemPrompt = `You are a simulated Linux terminal on Ubuntu 22.04.
 CRITICAL SAFETY & SCOPE RULES:
