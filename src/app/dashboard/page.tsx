@@ -12,7 +12,7 @@ import { ErrorExplainer } from "@/components/ErrorExplainer";
 import { CheatSheetGenerator } from "@/components/CheatSheetGenerator";
 import { CommandHistory } from "@/components/CommandHistory";
 import { Settings } from "@/components/Settings";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
+import { DashboardSkeleton } from "@/components/DashboardSkeleton";
 import { TerminalSimulator } from "@/components/TerminalSimulator";
 import { BookmarksPage } from "@/components/BookmarksPage";
 import { Leaderboard } from "@/components/Leaderboard";
@@ -296,7 +296,7 @@ export default function DashboardPage() {
   }, [recentCommands, quizResults]);
 
   const renderModule = () => {
-    if (loading && active === "dashboard") return <LoadingSpinner />;
+    if (loading && active === "dashboard") return <DashboardSkeleton />;
     switch (active) {
       case "dashboard":
         return stats ? (
@@ -309,7 +309,7 @@ export default function DashboardPage() {
             xpTimeline={xpTimeline}
           />
         ) : (
-          <LoadingSpinner />
+          <DashboardSkeleton />
         );
       case "command":
         return (

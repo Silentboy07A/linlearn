@@ -24,7 +24,7 @@ interface V86StarterInstance {
 }
 
 interface WindowWithV86 extends Window {
-  V86Starter: new (config: {
+  V86: new (config: {
     wasm_path: string;
     bios: { url: string };
     vga_bios: { url: string };
@@ -764,12 +764,12 @@ export function TerminalSimulator({
         // Load the libv86 script from CDN if not already loaded
         const loadV86Script = () => {
           return new Promise<void>((resolve, reject) => {
-            if ((window as unknown as WindowWithV86).V86Starter) {
+            if ((window as unknown as WindowWithV86).V86) {
               resolve();
               return;
             }
             const script = document.createElement("script");
-            script.src = "/v86/libv86.js";
+            script.src = window.location.origin + "/v86/libv86.js";
             script.async = true;
             script.onload = () => resolve();
             script.onerror = (err) => reject(err);
@@ -792,6 +792,7 @@ export function TerminalSimulator({
             console.error("Failed to load saved state:", e);
           }
 
+          const origin = window.location.origin;
           const v86Config: {
             wasm_path: string;
             bios: { url: string };
@@ -801,15 +802,15 @@ export function TerminalSimulator({
             autostart: boolean;
             initial_state?: { buffer: ArrayBuffer };
           } = {
-            wasm_path: "/v86/v86.wasm",
+            wasm_path: `${origin}/v86/v86.wasm`,
             bios: {
-              url: "/v86/bios/seabios.bin",
+              url: `${origin}/v86/bios/seabios.bin`,
             },
             vga_bios: {
-              url: "/v86/bios/vgabios.bin",
+              url: `${origin}/v86/bios/vgabios.bin`,
             },
             bzimage: {
-              url: "/v86/images/bzImage",
+              url: `${origin}/v86/images/bzImage`,
               async: false,
             },
             cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
@@ -820,8 +821,8 @@ export function TerminalSimulator({
             v86Config.initial_state = { buffer: savedState };
           }
 
-          // Instantiate V86Starter
-          const emulator = new (window as unknown as WindowWithV86).V86Starter(v86Config);
+          // Instantiate V86
+          const emulator = new (window as unknown as WindowWithV86).V86(v86Config);
 
           v86EmulatorRef.current = emulator;
 
@@ -878,7 +879,9 @@ export function TerminalSimulator({
 
         } catch (err) {
           console.error("Failed to load v86 VM:", err);
+          const errorMsg = err instanceof Error ? err.message : (err instanceof Event ? "Script load failed" : String(err));
           term.write("\r\n\x1b[1;31mError: Failed to fetch WebAssembly virtual machine libraries.\x1b[0m\r\n");
+          term.write(`\x1b[1;30m[Debug Info] ${errorMsg}\x1b[0m\r\n`);
           term.write("Verify your internet connection and CORS configurations.\r\n");
           setV86Booting(false);
         }

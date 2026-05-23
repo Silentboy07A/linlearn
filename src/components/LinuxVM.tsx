@@ -21,7 +21,7 @@ interface V86StarterInstance {
 }
 
 interface WindowWithV86 extends Window {
-  V86Starter: new (config: V86StarterConfig) => V86StarterInstance;
+  V86: new (config: V86StarterConfig) => V86StarterInstance;
 }
 
 interface CustomTerminal extends Terminal {
@@ -72,9 +72,9 @@ export function LinuxVM() {
       const loadV86Script = () => {
         return new Promise<void>((resolve, reject) => {
           const win = window as unknown as WindowWithV86;
-          if (win.V86Starter) return resolve();
+          if (win.V86) return resolve();
           const script = document.createElement("script");
-          script.src = "/v86/libv86.js";
+          script.src = window.location.origin + "/v86/libv86.js";
           script.async = true;
           script.onload = () => resolve();
           script.onerror = (e) => reject(e);
@@ -89,12 +89,13 @@ export function LinuxVM() {
         const win = window as unknown as WindowWithV86;
         
         // 4. Configuration referencing only local absolute paths under /v86/
+        const origin = window.location.origin;
         const config: V86StarterConfig = {
-          wasm_path: "/v86/v86.wasm",
-          bios: { url: "/v86/bios/seabios.bin" },
-          vga_bios: { url: "/v86/bios/vgabios.bin" },
+          wasm_path: `${origin}/v86/v86.wasm`,
+          bios: { url: `${origin}/v86/bios/seabios.bin` },
+          vga_bios: { url: `${origin}/v86/bios/vgabios.bin` },
           bzimage: {
-            url: "/v86/images/bzImage",
+            url: `${origin}/v86/images/bzImage`,
             async: false,
           },
           cmdline: "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
@@ -102,7 +103,7 @@ export function LinuxVM() {
         };
 
         // 5. Instantiate V86 CPU emulator
-        const emulator = new win.V86Starter(config);
+        const emulator = new win.V86(config);
         v86ContainerRef.current = emulator;
 
         let isFirstChar = true;

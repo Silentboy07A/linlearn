@@ -127,7 +127,7 @@ The application is optimized for deployment on Vercel.
 ## Roadmap & Future Improvements
 
 - [ ] **Expanded Course Material:** Add structured interactive Linux modules.
-- [ ] **Advanced Sandbox:** Provide web-based terminal emulators for safe, sandboxed command execution.
+- [x] **Advanced Sandbox:** Provide web-based terminal emulators for safe, sandboxed command execution.
 - [ ] **Social Features:** Allow users to share generated scripts and cheat sheets.
 - [ ] **Analytics Dashboard:** Visualize learning progress and weak points.
 - [ ] **Automated CI/CD:** Add GitHub Actions for automated linting, testing, and deployment previews.
