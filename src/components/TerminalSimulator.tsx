@@ -15,6 +15,30 @@ import {
 import { saveV86State, loadV86State, clearV86State } from "@/lib/v86db";
 import { updateMastery, DEFAULT_BKT_PARAMS, type LinuxTopic } from "@/lib/bkt";
 
+interface V86StarterInstance {
+  save_state: (cb: (err: unknown, state: ArrayBuffer) => void) => void;
+  destroy: () => void;
+  serial0_send: (data: string) => void;
+  add_listener: (event: string, cb: (char: string) => void) => void;
+  remove_listener: (event: string, cb: (char: string) => void) => void;
+}
+
+interface WindowWithV86 extends Window {
+  V86Starter: new (config: {
+    wasm_path: string;
+    bios: { url: string };
+    vga_bios: { url: string };
+    cdrom: { url: string };
+    autostart: boolean;
+    initial_state?: { buffer: ArrayBuffer };
+  }) => V86StarterInstance;
+}
+
+interface CustomTerminal extends Terminal {
+  _simDisposable?: { dispose: () => void };
+  _v86Disposable?: { dispose: () => void };
+}
+
 interface TerminalSimulatorProps {
   prefs: TerminalPrefs;
   clearSignal: number;
@@ -309,7 +333,7 @@ export function TerminalSimulator({
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
-  const v86EmulatorRef = useRef<any>(null);
+  const v86EmulatorRef = useRef<V86StarterInstance | null>(null);
   
   const [completedVasmMissions, setCompletedVasmMissions] = useState<Record<string, boolean>>({});
   const [validatingMissions, setValidatingMissions] = useState<Record<string, boolean>>({});
@@ -336,7 +360,7 @@ export function TerminalSimulator({
     if (!emulator) return;
     
     setIsSavingV86(true);
-    emulator.save_state((error: any, state: ArrayBuffer) => {
+    emulator.save_state((error: unknown, state: ArrayBuffer) => {
       if (error) {
         console.error("Failed to save VM state:", error);
         alert("Failed to save VM state.");
@@ -422,7 +446,7 @@ export function TerminalSimulator({
     const interval = setInterval(() => {
       const emulator = v86EmulatorRef.current;
       if (emulator && !isCapturingValidationRef.current) {
-        emulator.save_state((error: any, state: ArrayBuffer) => {
+        emulator.save_state((error: unknown, state: ArrayBuffer) => {
           if (!error && state) {
             saveV86State(state).catch(err => console.error("Auto-save failed:", err));
           }
@@ -738,7 +762,7 @@ export function TerminalSimulator({
         // Load the libv86 script from CDN if not already loaded
         const loadV86Script = () => {
           return new Promise<void>((resolve, reject) => {
-            if ((window as any).V86Starter) {
+            if ((window as unknown as WindowWithV86).V86Starter) {
               resolve();
               return;
             }
@@ -766,7 +790,14 @@ export function TerminalSimulator({
             console.error("Failed to load saved state:", e);
           }
 
-          const v86Config: any = {
+          const v86Config: {
+            wasm_path: string;
+            bios: { url: string };
+            vga_bios: { url: string };
+            cdrom: { url: string };
+            autostart: boolean;
+            initial_state?: { buffer: ArrayBuffer };
+          } = {
             wasm_path: "https://copy.sh/v86/build/v86.wasm",
             bios: {
               url: "https://copy.sh/v86/bios/seabios.bin",
@@ -785,7 +816,7 @@ export function TerminalSimulator({
           }
 
           // Instantiate V86Starter
-          const emulator = new (window as any).V86Starter(v86Config);
+          const emulator = new (window as unknown as WindowWithV86).V86Starter(v86Config);
 
           v86EmulatorRef.current = emulator;
 
@@ -810,7 +841,8 @@ export function TerminalSimulator({
           });
 
           // Save references to cleanly dispose
-          (term as any)._v86Disposable = dataDisposable;
+          const customTerm = term as unknown as CustomTerminal;
+          customTerm._v86Disposable = dataDisposable;
 
         } catch (err) {
           console.error("Failed to load v86 VM:", err);
@@ -1061,7 +1093,8 @@ export function TerminalSimulator({
           }
         });
 
-        (term as any)._simDisposable = keyDisposable;
+        const customTerm = term as unknown as CustomTerminal;
+        customTerm._simDisposable = keyDisposable;
       }
     };
 
@@ -1083,11 +1116,12 @@ export function TerminalSimulator({
       isMounted = false;
       resizeObserver.disconnect();
       if (term) {
-        if ((term as any)._simDisposable) {
-          (term as any)._simDisposable.dispose();
+        const customTerm = term as unknown as CustomTerminal;
+        if (customTerm._simDisposable) {
+          customTerm._simDisposable.dispose();
         }
-        if ((term as any)._v86Disposable) {
-          (term as any)._v86Disposable.dispose();
+        if (customTerm._v86Disposable) {
+          customTerm._v86Disposable.dispose();
         }
         term.dispose();
       }
