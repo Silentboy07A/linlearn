@@ -11,11 +11,11 @@ export function riskBadgeClass(risk: string): string {
 
 export function getHfHeaders(): Record<string, string> {
   if (typeof window === "undefined") return {};
-  const key = localStorage.getItem("hfApiKey") || "";
-  const model = localStorage.getItem("hfModel") || "";
+  const key = localStorage.getItem("groqApiKey") || "";
+  const model = localStorage.getItem("groqModel") || "";
   const headers: Record<string, string> = {};
-  if (key) headers["x-hf-api-key"] = key;
-  if (model) headers["x-hf-model"] = model;
+  if (key) headers["x-groq-api-key"] = key;
+  if (model) headers["x-groq-model"] = model;
   return headers;
 }
 

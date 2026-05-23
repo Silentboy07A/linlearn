@@ -5,12 +5,25 @@ import { callLlama } from "@/lib/llama";
 export async function POST(req: NextRequest) {
   const { command, cwd, filesystem } = await req.json();
 
-  const systemPrompt = `You are a Linux terminal on Ubuntu 22.04.
+  const systemPrompt = `You are a simulated Linux terminal on Ubuntu 22.04.
+CRITICAL SAFETY & SCOPE RULES:
+1. ONLY execute and respond to Linux commands.
+2. DANGEROUS COMMAND PROTECTION: If the user inputs a dangerous or destructive command (e.g. rm -rf /, dd, fork bombs, wiping drives, etc.), you MUST NOT execute or simulate it. Instead, output a clear warning: "Error: Dangerous command blocked. LinLearn does not support or generate destructive operations." and do not modify the filesystem.
 Current directory: ${cwd}
 Filesystem: ${JSON.stringify(filesystem)}
 Respond with ONLY raw terminal output, no markdown, no explanation.
 If the command modifies the filesystem append updated state in <fs>...</fs> tags.`;
 
+  // Check DB first
+  const dbOutput = getCommandDBOutput(command);
+  if (dbOutput !== null) {
+    return NextResponse.json({
+      output: dbOutput,
+      fsUpdate: null,
+    });
+  }
+
+  // Fallback to LLM if not in DB
   let aiOutput = "";
   let aiFailed = false;
 
@@ -21,9 +34,16 @@ If the command modifies the filesystem append updated state in <fs>...</fs> tags
     aiFailed = true;
   }
 
+  if (aiFailed) {
+    return NextResponse.json({
+      output: `bash: ${command}: command not found`,
+      fsUpdate: null,
+    });
+  }
+
   // Parse <fs>...</fs> for updated filesystem
   let fsUpdate = null;
-  if (!aiFailed && aiOutput.includes("<fs>")) {
+  if (aiOutput.includes("<fs>")) {
     const match = aiOutput.match(/<fs>([\s\S]*?)<\/fs>/);
     if (match) {
       try {
@@ -31,15 +51,6 @@ If the command modifies the filesystem append updated state in <fs>...</fs> tags
         aiOutput = aiOutput.replace(match[0], "").trim();
       } catch {}
     }
-  }
-
-  // Fallback to DB if AI failed
-  if (aiFailed) {
-    const dbOutput = getCommandDBOutput(command);
-    return NextResponse.json({
-      output: dbOutput ?? `bash: ${command}: command not found`,
-      fsUpdate: null,
-    });
   }
 
   return NextResponse.json({ output: aiOutput, fsUpdate });

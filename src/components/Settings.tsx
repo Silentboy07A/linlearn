@@ -31,16 +31,16 @@ export function Settings({
   const [draftName, setDraftName] = useState(username);
   const [confirmResetXp, setConfirmResetXp] = useState(false);
   
-  // Hugging Face configuration local state
-  const [draftHfKey, setDraftHfKey] = useState("");
-  const [draftHfModel, setDraftHfModel] = useState("silentone1234/linlearn-phi3-linux-assistant");
+  // Groq configuration local state
+  const [draftGroqKey, setDraftGroqKey] = useState("");
+  const [draftGroqModel, setDraftGroqModel] = useState("llama-3.3-70b-versatile");
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
 
   useEffect(() => {
-    const savedKey = localStorage.getItem("hfApiKey") || "";
-    const savedModel = localStorage.getItem("hfModel") || "silentone1234/linlearn-phi3-linux-assistant";
-    setDraftHfKey(savedKey);
-    setDraftHfModel(savedModel);
+    const savedKey = localStorage.getItem("groqApiKey") || "";
+    const savedModel = localStorage.getItem("groqModel") || "llama-3.3-70b-versatile";
+    setDraftGroqKey(savedKey);
+    setDraftGroqModel(savedModel);
   }, []);
 
   const showSaveStatus = (msg: string) => {
@@ -49,10 +49,10 @@ export function Settings({
     return () => clearTimeout(timer);
   };
 
-  const saveHfSettings = () => {
-    localStorage.setItem("hfApiKey", draftHfKey.trim());
-    localStorage.setItem("hfModel", draftHfModel.trim());
-    showSaveStatus("Hugging Face configuration saved!");
+  const saveGroqSettings = () => {
+    localStorage.setItem("groqApiKey", draftGroqKey.trim());
+    localStorage.setItem("groqModel", draftGroqModel.trim());
+    showSaveStatus("Groq configuration saved!");
   };
 
   return (
@@ -87,35 +87,35 @@ export function Settings({
       </GlassCard>
 
       <GlassCard className="space-y-3">
-        <p className="text-sm text-gray-400">Hugging Face AI Configuration (Vercel Fix)</p>
+        <p className="text-sm text-gray-400">Groq AI Configuration</p>
         <p className="text-xs text-gray-500">
-          Paste your Hugging Face Read Token below to fix the Llama AI features when running on live servers like Vercel.
+          Paste your Groq API key below to configure the AI features for simulated terminals, quizzes, and chat feedback.
         </p>
         <div className="space-y-3">
           <div>
-            <label className="text-xs text-gray-400 block mb-1">Hugging Face Access Token (API Key)</label>
+            <label className="text-xs text-gray-400 block mb-1">Groq API Key</label>
             <input
               type="password"
-              value={draftHfKey}
-              onChange={(event) => setDraftHfKey(event.target.value)}
+              value={draftGroqKey}
+              onChange={(event) => setDraftGroqKey(event.target.value)}
               className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white placeholder:text-gray-600 focus:border-[#E95420]/40 focus:outline-none text-sm font-mono"
-              placeholder="hf_••••••••••••••••••••••••••••••••"
+              placeholder="gsk_••••••••••••••••••••••••••••••••"
             />
           </div>
           <div>
-            <label className="text-xs text-gray-400 block mb-1">Hugging Face Model ID</label>
+            <label className="text-xs text-gray-400 block mb-1">Groq Model ID</label>
             <input
               type="text"
-              value={draftHfModel}
-              onChange={(event) => setDraftHfModel(event.target.value)}
+              value={draftGroqModel}
+              onChange={(event) => setDraftGroqModel(event.target.value)}
               className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white placeholder:text-gray-500 focus:border-[#E95420]/40 focus:outline-none text-sm font-mono"
-              placeholder="e.g. silentone1234/linlearn-phi3-linux-assistant"
+              placeholder="e.g. llama-3.3-70b-versatile"
             />
           </div>
         </div>
         <button
           type="button"
-          onClick={saveHfSettings}
+          onClick={saveGroqSettings}
           className="micro-button rounded-lg bg-[#E95420] px-4 py-2 text-sm text-white transition hover:bg-[#ff6b36]"
         >
           Save AI Configuration

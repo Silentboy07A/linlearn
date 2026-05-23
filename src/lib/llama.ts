@@ -1,20 +1,18 @@
 /**
  * llama.ts — AI client
  *
- * Calls your Hugging Face Phi-3 model (silentone1234/linlearn-phi3-linux-assistant)
- * via the HF Inference API, which exposes an OpenAI-compatible endpoint:
- *   https://api-inference.huggingface.co/models/<model>/v1/chat/completions
+ * Calls the Groq API (exposing an OpenAI-compatible endpoint):
+ *   https://api.groq.com/openai/v1/chat/completions
  *
  * Environment variables:
- *   HF_API_KEY   — your Hugging Face access token (required)
- *   HF_MODEL     — override the model ID (optional)
- *   HF_API_URL   — override the full endpoint URL (optional)
+ *   GROQ_API_KEY — your Groq API key (required)
+ *   GROQ_MODEL   — override the model ID (optional, defaults to llama-3.3-70b-versatile)
  */
 
 import { headers } from "next/headers";
 
 const DEFAULT_MODEL =
-  process.env.HF_MODEL ?? "silentone1234/linlearn-phi3-linux-assistant";
+  process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile";
 
 // ─── JSON helpers ─────────────────────────────────────────────────────────────
 
@@ -35,13 +33,13 @@ export async function callLlama(
   systemPrompt: string,
   userPrompt: string
 ): Promise<string> {
-  let apiKey = process.env.HF_API_KEY;
-  let model = process.env.HF_MODEL ?? DEFAULT_MODEL;
+  let apiKey = process.env.GROQ_API_KEY;
+  let model = process.env.GROQ_MODEL ?? DEFAULT_MODEL;
 
   try {
     const reqHeaders = headers();
-    const clientKey = reqHeaders.get("x-hf-api-key");
-    const clientModel = reqHeaders.get("x-hf-model");
+    const clientKey = reqHeaders.get("x-groq-api-key");
+    const clientModel = reqHeaders.get("x-groq-model");
     if (clientKey) {
       apiKey = clientKey;
     }
@@ -54,13 +52,11 @@ export async function callLlama(
 
   if (!apiKey) {
     throw new Error(
-      "HF_API_KEY is not set. Add your Hugging Face token to .env.local or configure it in Settings."
+      "GROQ_API_KEY is not set. Add your Groq API key to .env.local or configure it in Settings."
     );
   }
 
-  const url =
-    process.env.HF_API_URL ??
-    `https://api-inference.huggingface.co/models/${model}/v1/chat/completions`;
+  const url = "https://api.groq.com/openai/v1/chat/completions";
 
   const res = await fetch(url, {
     method: "POST",
@@ -83,23 +79,18 @@ export async function callLlama(
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(
-      `Hugging Face Phi-3 API error (${res.status}): ${errText.slice(0, 300)}`
+      `Groq API error (${res.status}): ${errText.slice(0, 300)}`
     );
   }
 
   const data = (await res.json()) as {
     choices?: { message?: { content?: string } }[];
-    // HF also sometimes returns `generated_text` at top level for older routes
-    generated_text?: string;
   };
 
-  // OpenAI-compatible path (preferred — /v1/chat/completions)
-  const content =
-    data.choices?.[0]?.message?.content?.trim() ??
-    data.generated_text?.trim();
+  const content = data.choices?.[0]?.message?.content?.trim();
 
   if (!content) {
-    throw new Error("Empty response from Hugging Face Phi-3 model");
+    throw new Error("Empty response from Groq model");
   }
 
   return content;
@@ -116,6 +107,6 @@ export async function callLlamaJson<T>(
     userPrompt
   );
   const parsed = parseJsonFromText<T>(raw);
-  if (!parsed) throw new Error("Failed to parse Phi-3 response as JSON");
+  if (!parsed) throw new Error("Failed to parse Groq response as JSON");
   return parsed;
 }
