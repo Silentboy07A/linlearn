@@ -8,6 +8,7 @@ export const XP_REWARDS = {
   errorExplain: 15,
   interviewGood: 30,
   cheatsheet: 20,
+  missionCompleted: 100,
 } as const;
 
 export function levelFromXp(xp: number): Level {

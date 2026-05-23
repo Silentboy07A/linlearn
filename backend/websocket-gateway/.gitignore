@@ -1,0 +1,8 @@
+# local dependencies
+node_modules/
+
+# build outputs
+dist/
+
+# logs
+*.log

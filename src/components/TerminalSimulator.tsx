@@ -12,6 +12,8 @@ import {
   resolvePath, 
   type VirtualSystemState 
 } from "@/lib/virtualOs";
+import { saveV86State, loadV86State, clearV86State } from "@/lib/v86db";
+import { updateMastery, DEFAULT_BKT_PARAMS, type LinuxTopic } from "@/lib/bkt";
 
 interface TerminalSimulatorProps {
   prefs: TerminalPrefs;
@@ -25,6 +27,56 @@ const themeColors = {
   amber: { background: "#06070a", foreground: "#fbbf24", cursor: "#fbbf24" },
   cyan: { background: "#06070a", foreground: "#22d3ee", cursor: "#22d3ee" },
   white: { background: "#06070a", foreground: "#f3f4f6", cursor: "#f3f4f6" },
+};
+
+const WASM_MISSION_CHECKS: Record<string, string> = {
+  pwd_ls: "true",
+  mkdir_proj: "[ -d Projects ] || [ -d /root/Projects ] || [ -d /home/user/Projects ]",
+  touch_config: "[ -f Projects/config.txt ] || [ -f /root/Projects/config.txt ] || [ -f /home/user/Projects/config.txt ]",
+  nginx: "true", 
+  logs: "true",
+  htop: "true",
+  permissions: "true",
+  lock_config: "true",
+  audit_dangerous: "true",
+  sysinfo: "true",
+  services: "true",
+  processes: "true"
+};
+
+const MISSION_TOPICS: Record<string, LinuxTopic> = {
+  pwd_ls: "navigation",
+  mkdir_proj: "files",
+  touch_config: "files",
+  nginx: "networking",
+  logs: "files",
+  htop: "processes",
+  permissions: "permissions",
+  lock_config: "permissions",
+  audit_dangerous: "permissions",
+  sysinfo: "navigation",
+  services: "processes",
+  processes: "processes"
+};
+
+const COMMAND_TOPICS: Record<string, LinuxTopic> = {
+  ls: "navigation",
+  cd: "navigation",
+  pwd: "navigation",
+  mkdir: "files",
+  touch: "files",
+  cat: "files",
+  echo: "files",
+  chmod: "permissions",
+  chown: "permissions",
+  docker: "networking",
+  systemctl: "processes",
+  service: "processes",
+  ps: "processes",
+  top: "processes",
+  kill: "processes",
+  apt: "packages",
+  man: "navigation"
 };
 
 // Help dictionary for command metadata, difficulty levels, related commands, and flags
@@ -229,9 +281,126 @@ export function TerminalSimulator({
   const [activeTab, setActiveTab] = useState<"explanations" | "missions" | "interview">("missions");
   const [learningMode, setLearningMode] = useState<"Beginner" | "DevOps" | "Security" | "Interview Prep">("Beginner");
   const [lastCommand, setLastCommand] = useState<string>("");
+  const [isV86Mode, setIsV86Mode] = useState<boolean>(false);
+  const [v86Booting, setV86Booting] = useState<boolean>(false);
+  const [isSavingV86, setIsSavingV86] = useState<boolean>(false);
+
+  const [masteryState, setMasteryState] = useState<Record<LinuxTopic, number>>(() => {
+    return {
+      navigation: DEFAULT_BKT_PARAMS.navigation.pL0,
+      files: DEFAULT_BKT_PARAMS.files.pL0,
+      permissions: DEFAULT_BKT_PARAMS.permissions.pL0,
+      networking: DEFAULT_BKT_PARAMS.networking.pL0,
+      processes: DEFAULT_BKT_PARAMS.processes.pL0,
+      packages: DEFAULT_BKT_PARAMS.packages.pL0,
+    };
+  });
+
+  useEffect(() => {
+    const saved = localStorage.getItem("linlearn_mastery");
+    if (saved) {
+      try {
+        setMasteryState(JSON.parse(saved));
+      } catch (e) {
+        console.error("Failed to restore BKT mastery state:", e);
+      }
+    }
+  }, []);
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
+  const v86EmulatorRef = useRef<any>(null);
+  
+  const [completedVasmMissions, setCompletedVasmMissions] = useState<Record<string, boolean>>({});
+  const [validatingMissions, setValidatingMissions] = useState<Record<string, boolean>>({});
+  const isCapturingValidationRef = useRef<boolean>(false);
+
+  const updateBKT = (topic: LinuxTopic, correct: boolean) => {
+    setMasteryState(prev => {
+      const pLCurrent = prev[topic] !== undefined ? prev[topic] : DEFAULT_BKT_PARAMS[topic].pL0;
+      const pLNext = updateMastery(pLCurrent, correct, topic);
+      const updated = { ...prev, [topic]: pLNext };
+      localStorage.setItem("linlearn_mastery", JSON.stringify(updated));
+
+      if (xtermInstance.current) {
+        const diff = pLNext - pLCurrent;
+        const indicator = diff >= 0 ? `\x1b[1;32m+${(diff*100).toFixed(1)}%\x1b[0m` : `\x1b[1;31m${(diff*100).toFixed(1)}%\x1b[0m`;
+        xtermInstance.current.write(`\r\n\x1b[1;90m[Telemetry] BKT Mastery for ${topic} updated to ${(pLNext*100).toFixed(1)}% (${indicator})\x1b[0m\r\n`);
+      }
+      return updated;
+    });
+  };
+
+  const handleSaveV86State = () => {
+    const emulator = v86EmulatorRef.current;
+    if (!emulator) return;
+    
+    setIsSavingV86(true);
+    emulator.save_state((error: any, state: ArrayBuffer) => {
+      if (error) {
+        console.error("Failed to save VM state:", error);
+        alert("Failed to save VM state.");
+        setIsSavingV86(false);
+      } else {
+        saveV86State(state).then(() => {
+          setIsSavingV86(false);
+          if (xtermInstance.current) {
+            xtermInstance.current.write("\r\n\x1b[1;32m[System] Virtual machine state successfully persisted to browser IndexedDB.\x1b[0m\r\n");
+          }
+        }).catch(err => {
+          console.error("Failed to save state to IndexedDB:", err);
+          setIsSavingV86(false);
+        });
+      }
+    });
+  };
+
+  const handleResetV86State = () => {
+    const confirmed = window.confirm("Are you sure you want to reset the WebAssembly VM state? All unpersisted work inside the guest kernel will be lost.");
+    if (confirmed) {
+      clearV86State().then(() => {
+        setIsV86Mode(false);
+        setTimeout(() => {
+          setIsV86Mode(true);
+        }, 100);
+      });
+    }
+  };
+
+  const runV86Validation = (command: string): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const emulator = v86EmulatorRef.current;
+      if (!emulator) {
+        resolve(false);
+        return;
+      }
+
+      isCapturingValidationRef.current = true;
+      let capturedBuffer = "";
+      const sentinelStart = "VAL_START_SENTINEL";
+      const sentinelEnd = "VAL_END_SENTINEL";
+
+      const tempListener = (char: string) => {
+        capturedBuffer += char;
+        if (capturedBuffer.includes(sentinelEnd)) {
+          emulator.remove_listener("serial0-output-char", tempListener);
+          isCapturingValidationRef.current = false;
+          const success = capturedBuffer.includes("VAL_SUCCESS");
+          resolve(success);
+        }
+      };
+
+      emulator.add_listener("serial0-output-char", tempListener);
+      
+      emulator.serial0_send(`\nclear\necho "${sentinelStart}" && if ${command}; then echo "VAL_SUCCESS"; else echo "VAL_FAILURE"; fi && echo "${sentinelEnd}"\n`);
+
+      setTimeout(() => {
+        emulator.remove_listener("serial0-output-char", tempListener);
+        isCapturingValidationRef.current = false;
+        resolve(false);
+      }, 4000);
+    });
+  };
   
   // Create refs to access the latest state in the event loop callbacks
   const stateRef = useRef(osState);
@@ -245,6 +414,24 @@ export function TerminalSimulator({
     onCommandLoggedRef.current = onCommandLogged;
     onDbFallbackRef.current = onDbFallback;
   }, [onCommandLogged, onDbFallback]);
+
+  // Auto-save WASM VM state periodically
+  useEffect(() => {
+    if (!isV86Mode || !v86EmulatorRef.current || v86Booting) return;
+    
+    const interval = setInterval(() => {
+      const emulator = v86EmulatorRef.current;
+      if (emulator && !isCapturingValidationRef.current) {
+        emulator.save_state((error: any, state: ArrayBuffer) => {
+          if (!error && state) {
+            saveV86State(state).catch(err => console.error("Auto-save failed:", err));
+          }
+        });
+      }
+    }, 45000); // auto-save every 45 seconds
+
+    return () => clearInterval(interval);
+  }, [isV86Mode, v86Booting]);
 
   // Handle clearSignal from parent
   useEffect(() => {
@@ -304,6 +491,43 @@ export function TerminalSimulator({
 
   // Missions completion checks
   const missions = useMemo(() => {
+    if (isV86Mode) {
+      const getWasmMission = (id: string, title: string, desc: string, hint: string) => ({
+        id,
+        title,
+        desc,
+        hint,
+        completed: !!completedVasmMissions[id]
+      });
+
+      if (learningMode === "Beginner") {
+        return [
+          getWasmMission("pwd_ls", "Explore Directories", "Execute 'pwd' and 'ls' to identify active path mappings.", "pwd && ls"),
+          getWasmMission("mkdir_proj", "Create Work Directory", "Create a new sub-folder directory at /home/user/Projects.", "mkdir -p /home/user/Projects"),
+          getWasmMission("touch_config", "Create Configuration File", "Initialize an empty file at /home/user/Projects/config.txt.", "touch /home/user/Projects/config.txt")
+        ];
+      }
+      if (learningMode === "DevOps") {
+        return [
+          getWasmMission("nginx", "Deploy Nginx Container", "Start a Docker container running Nginx on port 80.", "docker run -d -p 80:80 nginx"),
+          getWasmMission("logs", "Investigate Access Logs", "Inspect the Nginx access log file to see recent client hits.", "cat /var/log/nginx/access.log"),
+          getWasmMission("htop", "Install htop Tool", "Install the system resource monitor package 'htop' using the package manager.", "apt install htop")
+        ];
+      }
+      if (learningMode === "Security") {
+        return [
+          getWasmMission("permissions", "Create Executable Script", "Create a file at /home/user/Projects/deploy.sh and make it executable.", "touch /home/user/Projects/deploy.sh && chmod +x /home/user/Projects/deploy.sh"),
+          getWasmMission("lock_config", "Lock Config Permissions", "Remove write access permissions from /home/user/Projects/config.txt.", "chmod 400 /home/user/Projects/config.txt"),
+          getWasmMission("audit_dangerous", "Audit Sandbox Safeguards", "Test security safeguards by executing a dangerous command (e.g. rm -rf /).", "rm -rf /")
+        ];
+      }
+      return [
+        getWasmMission("sysinfo", "Query System Info", "Query virtual hostname and current user login context.", "whoami && uname -a"),
+        getWasmMission("services", "Review systemd Status", "Inspect active service configurations on the system.", "systemctl status nginx.service"),
+        getWasmMission("processes", "Inspect Process Tree", "Query standard process listing tables.", "ps aux")
+      ];
+    }
+
     const history = osState.history;
     const containers = osState.containers;
     const fs = osState.fs;
@@ -435,7 +659,7 @@ export function TerminalSimulator({
         completed: m3Complete
       }
     ];
-  }, [osState, learningMode]);
+  }, [osState, learningMode, isV86Mode, completedVasmMissions]);
 
   // Track completed missions count
   const completedCount = useMemo(() => missions.filter((m) => m.completed).length, [missions]);
@@ -503,175 +727,346 @@ export function TerminalSimulator({
 
       xtermInstance.current = term;
 
-      // Print Welcome Banner
-      term.write("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
-      term.write(" * Documentation:  \x1b[4mhttps://linlearn.dev/docs\x1b[0m\r\n");
-      term.write(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n\r\n");
-      term.write("Virtual subsystems hydrated. Try running: \x1b[1;33mdocker ps\x1b[0m, \x1b[1;33mps aux\x1b[0m, or \x1b[1;33mapt install htop\x1b[0m.\r\n");
-      term.write("Type \x1b[1;32mhelp\x1b[0m or \x1b[1;32mman\x1b[0m for commands lists.\r\n\r\n");
-      term.write(getPromptString(stateRef.current));
+      if (isV86Mode) {
+        // --- WASM v86 VM Mode ---
+        term.write("\x1b[1;36mInitializing v86 WebAssembly x86 Virtual Machine...\x1b[0m\r\n");
+        term.write(" * Fetching minimal Buildroot Linux disk image (~10MB)...\r\n");
+        term.write(" * Booting real Linux kernel in the browser sandbox...\r\n\r\n");
+        
+        setV86Booting(true);
 
-      let inputBuffer = "";
-      let historyIndex: number | null = null;
-      let historyDraft = "";
+        // Load the libv86 script from CDN if not already loaded
+        const loadV86Script = () => {
+          return new Promise<void>((resolve, reject) => {
+            if ((window as any).V86Starter) {
+              resolve();
+              return;
+            }
+            const script = document.createElement("script");
+            script.src = "https://copy.sh/v86/build/libv86.js";
+            script.async = true;
+            script.onload = () => resolve();
+            script.onerror = (err) => reject(err);
+            document.head.appendChild(script);
+          });
+        };
 
-      term.onKey((e: { key: string; domEvent: KeyboardEvent }) => {
-        const char = e.key;
-        const domEvent = e.domEvent;
+        try {
+          await loadV86Script();
+          if (!isMounted) return;
 
-        if (domEvent.keyCode === 13) {
-          // Enter key
-          term.write("\r\n");
-          const cmd = inputBuffer.trim();
-          if (cmd) {
-            // Process command
-            const result = executeCommand(cmd, stateRef.current);
-            
-            // Format and print output
-            if (result.shouldClear) {
+          // Attempt to load saved VM state from IndexedDB
+          let savedState: ArrayBuffer | null = null;
+          try {
+            savedState = await loadV86State();
+            if (savedState && xtermInstance.current) {
+              xtermInstance.current.write(" * Found saved session state. Restoring VM snapshot...\r\n");
+            }
+          } catch (e) {
+            console.error("Failed to load saved state:", e);
+          }
+
+          const v86Config: any = {
+            wasm_path: "https://copy.sh/v86/build/v86.wasm",
+            bios: {
+              url: "https://copy.sh/v86/bios/seabios.bin",
+            },
+            vga_bios: {
+              url: "https://copy.sh/v86/bios/vgabios.bin",
+            },
+            cdrom: {
+              url: "https://copy.sh/v86/images/linux4.iso",
+            },
+            autostart: true,
+          };
+
+          if (savedState) {
+            v86Config.initial_state = { buffer: savedState };
+          }
+
+          // Instantiate V86Starter
+          const emulator = new (window as any).V86Starter(v86Config);
+
+          v86EmulatorRef.current = emulator;
+
+          let isFirstChar = true;
+
+          // Connect guest serial output to xterm.js terminal
+          emulator.add_listener("serial0-output-char", (char: string) => {
+            if (isCapturingValidationRef.current) {
+              return;
+            }
+            if (isFirstChar) {
+              isFirstChar = false;
+              setV86Booting(false);
               term.clear();
+            }
+            term.write(char);
+          });
+
+          // Connect user input from xterm.js back to guest serial console
+          const dataDisposable = term.onData((data) => {
+            emulator.serial0_send(data);
+          });
+
+          // Save references to cleanly dispose
+          (term as any)._v86Disposable = dataDisposable;
+
+        } catch (err) {
+          console.error("Failed to load v86 VM:", err);
+          term.write("\r\n\x1b[1;31mError: Failed to fetch WebAssembly virtual machine libraries.\x1b[0m\r\n");
+          term.write("Verify your internet connection and CORS configurations.\r\n");
+          setV86Booting(false);
+        }
+
+      } else {
+        // --- Standard JS Simulation Mode ---
+        term.write("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
+        term.write(" * Documentation:  \x1b[4mhttps://linlearn.dev/docs\x1b[0m\r\n");
+        term.write(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n\r\n");
+        term.write("Virtual subsystems hydrated. Try running: \x1b[1;33mdocker ps\x1b[0m, \x1b[1;33mps aux\x1b[0m, or \x1b[1;33mapt install htop\x1b[0m.\r\n");
+        term.write("Type \x1b[1;32mhelp\x1b[0m or \x1b[1;32mman\x1b[0m for commands lists.\r\n\r\n");
+        term.write(getPromptString(stateRef.current));
+
+        let inputBuffer = "";
+        let cursorIndex = 0;
+        let historyIndex: number | null = null;
+        let historyDraft = "";
+
+        const keyDisposable = term.onKey((e: { key: string; domEvent: KeyboardEvent }) => {
+          const char = e.key;
+          const domEvent = e.domEvent;
+
+          if (domEvent.keyCode === 13) {
+            // Enter key
+            term.write("\r\n");
+            const cmd = inputBuffer.trim();
+            if (cmd) {
+              // Process command
+              const result = executeCommand(cmd, stateRef.current);
+              
+              // Format and print output
+              if (result.shouldClear) {
+                term.clear();
+              } else {
+                term.write(result.output.replace(/\r?\n/g, "\r\n"));
+                if (result.output && !result.output.endsWith("\n")) {
+                  term.write("\r\n");
+                }
+              }
+
+              // Save in history
+              const nextHistory = [...stateRef.current.history, cmd];
+              const updatedState = {
+                ...result.newState,
+                history: nextHistory
+              };
+
+              setOsState(updatedState);
+              setLastCommand(cmd);
+
+              // Update BKT cognitive modeling
+              const baseCmd = cmd.trim().split(/\s+/)[0];
+              const isCorrect = !result.output.includes("command not found") && !result.output.toLowerCase().includes("error");
+              const topic = COMMAND_TOPICS[baseCmd];
+              if (topic) {
+                updateBKT(topic, isCorrect);
+              }
+
+              // Log command (for XP and DB record syncing)
+              onCommandLoggedRef.current({
+                id: Math.random().toString(36).substring(2, 10),
+                input: cmd,
+                output: result.output,
+                source: "local",
+                createdAt: new Date().toISOString()
+              });
+
+              // Trigger fallback check if command not found
+              if (result.output.includes("command not found")) {
+                onDbFallbackRef.current();
+              }
             } else {
-              term.write(result.output.replace(/\r?\n/g, "\r\n"));
-              if (result.output && !result.output.endsWith("\n")) {
-                term.write("\r\n");
+              term.write("\r");
+            }
+
+            inputBuffer = "";
+            cursorIndex = 0;
+            historyIndex = null;
+            historyDraft = "";
+            term.write(getPromptString(stateRef.current));
+
+          } else if (domEvent.keyCode === 8) {
+            // Backspace key
+            if (cursorIndex > 0) {
+              inputBuffer = inputBuffer.slice(0, cursorIndex - 1) + inputBuffer.slice(cursorIndex);
+              cursorIndex--;
+              term.write("\b");
+              term.write(inputBuffer.slice(cursorIndex) + " ");
+              const moveBack = inputBuffer.length - cursorIndex + 1;
+              term.write("\x1b[" + moveBack + "D");
+            }
+
+          } else if (domEvent.keyCode === 46) {
+            // Delete key
+            if (cursorIndex < inputBuffer.length) {
+              inputBuffer = inputBuffer.slice(0, cursorIndex) + inputBuffer.slice(cursorIndex + 1);
+              term.write(inputBuffer.slice(cursorIndex) + " ");
+              const moveBack = inputBuffer.length - cursorIndex + 1;
+              term.write("\x1b[" + moveBack + "D");
+            }
+
+          } else if (domEvent.keyCode === 37) {
+            // Left Arrow
+            if (cursorIndex > 0) {
+              cursorIndex--;
+              term.write("\x1b[D");
+            }
+
+          } else if (domEvent.keyCode === 39) {
+            // Right Arrow
+            if (cursorIndex < inputBuffer.length) {
+              cursorIndex++;
+              term.write("\x1b[C");
+            }
+
+          } else if (domEvent.keyCode === 36) {
+            // Home key
+            if (cursorIndex > 0) {
+              term.write("\x1b[" + cursorIndex + "D");
+              cursorIndex = 0;
+            }
+
+          } else if (domEvent.keyCode === 35) {
+            // End key
+            const diff = inputBuffer.length - cursorIndex;
+            if (diff > 0) {
+              term.write("\x1b[" + diff + "C");
+              cursorIndex = inputBuffer.length;
+            }
+
+          } else if (domEvent.keyCode === 38) {
+            // Arrow Up (History Navigation)
+            domEvent.preventDefault();
+            const hist = stateRef.current.history;
+            if (hist.length === 0) return;
+
+            if (historyIndex === null) {
+              historyDraft = inputBuffer;
+              historyIndex = hist.length - 1;
+            } else {
+              historyIndex = Math.max(0, historyIndex - 1);
+            }
+
+            if (cursorIndex > 0) {
+              term.write("\x1b[" + cursorIndex + "D");
+            }
+            term.write("\x1b[K"); // Clear to end of line
+            
+            inputBuffer = hist[historyIndex];
+            term.write(inputBuffer);
+            cursorIndex = inputBuffer.length;
+
+          } else if (domEvent.keyCode === 40) {
+            // Arrow Down
+            domEvent.preventDefault();
+            const hist = stateRef.current.history;
+            if (historyIndex === null) return;
+
+            if (cursorIndex > 0) {
+              term.write("\x1b[" + cursorIndex + "D");
+            }
+            term.write("\x1b[K"); // Clear to end of line
+
+            if (historyIndex === hist.length - 1) {
+              historyIndex = null;
+              inputBuffer = historyDraft;
+            } else {
+              historyIndex += 1;
+              inputBuffer = hist[historyIndex];
+            }
+            
+            term.write(inputBuffer);
+            cursorIndex = inputBuffer.length;
+
+          } else if (domEvent.keyCode === 9) {
+            // Tab (Autocomplete)
+            domEvent.preventDefault();
+            const parts = inputBuffer.split(/\s+/);
+            const lastWord = parts[parts.length - 1] || "";
+            
+            const dirNode = getNode(stateRef.current.fs, stateRef.current.cwd);
+            if (dirNode && dirNode.type === "dir") {
+              const options = [
+                ...Object.keys(dirNode.children),
+                ...Object.keys(COMMAND_HELP_INFO)
+              ];
+              const matches = Array.from(new Set(options)).filter((opt) => opt.startsWith(lastWord));
+
+              if (matches.length === 1) {
+                const matchNode = getNode(stateRef.current.fs, resolvePath(stateRef.current.cwd, matches[0]));
+                const suffix = matchNode && matchNode.type === "dir" ? "/" : "";
+                const completion = matches[0].substring(lastWord.length) + suffix;
+                
+                const prefix = inputBuffer.slice(0, cursorIndex);
+                const suffixStr = inputBuffer.slice(cursorIndex);
+                inputBuffer = prefix + completion + suffixStr;
+                term.write(completion + suffixStr);
+                if (suffixStr.length > 0) {
+                  term.write("\x1b[" + suffixStr.length + "D");
+                }
+                cursorIndex += completion.length;
+              } else if (matches.length > 1) {
+                term.write("\r\n" + matches.join("    ") + "\r\n");
+                term.write(getPromptString(stateRef.current) + inputBuffer);
+                const diff = inputBuffer.length - cursorIndex;
+                if (diff > 0) {
+                  term.write("\x1b[" + diff + "D");
+                }
               }
             }
 
-            // Save in history
-            const nextHistory = [...stateRef.current.history, cmd];
-            const updatedState = {
-              ...result.newState,
-              history: nextHistory
-            };
-
-            setOsState(updatedState);
-            setLastCommand(cmd);
-
-            // Log command (for XP and DB record syncing)
-            onCommandLoggedRef.current({
-              id: Math.random().toString(36).substring(2, 10),
-              input: cmd,
-              output: result.output,
-              source: "local",
-              createdAt: new Date().toISOString()
-            });
-
-            // Trigger fallback check if command not found
-            if (result.output.includes("command not found")) {
-              onDbFallbackRef.current();
-            }
-          } else {
-            term.write("\r");
-          }
-
-          inputBuffer = "";
-          historyIndex = null;
-          historyDraft = "";
-          term.write(getPromptString(stateRef.current));
-
-        } else if (domEvent.keyCode === 8) {
-          // Backspace
-          if (inputBuffer.length > 0) {
-            inputBuffer = inputBuffer.slice(0, -1);
-            term.write("\b \b");
-          }
-
-        } else if (domEvent.keyCode === 38) {
-          // Arrow Up (History Navigation)
-          domEvent.preventDefault();
-          const hist = stateRef.current.history;
-          if (hist.length === 0) return;
-
-          if (historyIndex === null) {
-            historyDraft = inputBuffer;
-            historyIndex = hist.length - 1;
-          } else {
-            historyIndex = Math.max(0, historyIndex - 1);
-          }
-
-          // Erase current input visually
-          for (let i = 0; i < inputBuffer.length; i++) {
-            term.write("\b \b");
-          }
-
-          inputBuffer = hist[historyIndex];
-          term.write(inputBuffer);
-
-        } else if (domEvent.keyCode === 40) {
-          // Arrow Down
-          domEvent.preventDefault();
-          const hist = stateRef.current.history;
-          if (historyIndex === null) return;
-
-          // Erase current input
-          for (let i = 0; i < inputBuffer.length; i++) {
-            term.write("\b \b");
-          }
-
-          if (historyIndex === hist.length - 1) {
+          } else if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "c") {
+            term.write("^C\r\n");
+            inputBuffer = "";
+            cursorIndex = 0;
             historyIndex = null;
-            inputBuffer = historyDraft;
+            term.write(getPromptString(stateRef.current));
+
+          } else if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "l") {
+            domEvent.preventDefault();
+            term.clear();
+            term.write(getPromptString(stateRef.current) + inputBuffer);
+            const diff = inputBuffer.length - cursorIndex;
+            if (diff > 0) {
+              term.write("\x1b[" + diff + "D");
+            }
+
           } else {
-            historyIndex += 1;
-            inputBuffer = hist[historyIndex];
-          }
-          term.write(inputBuffer);
-
-        } else if (domEvent.keyCode === 9) {
-          // Tab (Autocomplete)
-          domEvent.preventDefault();
-          const parts = inputBuffer.split(/\s+/);
-          const lastWord = parts[parts.length - 1] || "";
-          
-          const dirNode = getNode(stateRef.current.fs, stateRef.current.cwd);
-          if (dirNode && dirNode.type === "dir") {
-            const options = [
-              ...Object.keys(dirNode.children),
-              ...Object.keys(COMMAND_HELP_INFO)
-            ];
-            const matches = Array.from(new Set(options)).filter((opt) => opt.startsWith(lastWord));
-
-            if (matches.length === 1) {
-              // Perfect unique autocomplete match
-              const matchNode = getNode(stateRef.current.fs, resolvePath(stateRef.current.cwd, matches[0]));
-              const suffix = matchNode && matchNode.type === "dir" ? "/" : "";
-              const completion = matches[0].substring(lastWord.length) + suffix;
-              term.write(completion);
-              inputBuffer += completion;
-            } else if (matches.length > 1) {
-              // List options
-              term.write("\r\n" + matches.join("    ") + "\r\n");
-              term.write(getPromptString(stateRef.current) + inputBuffer);
+            if (char.length === 1 && !domEvent.altKey && !domEvent.ctrlKey && !domEvent.metaKey) {
+              if (cursorIndex === inputBuffer.length) {
+                inputBuffer += char;
+                cursorIndex++;
+                term.write(char);
+              } else {
+                inputBuffer = inputBuffer.slice(0, cursorIndex) + char + inputBuffer.slice(cursorIndex);
+                term.write(inputBuffer.slice(cursorIndex));
+                cursorIndex++;
+                const moveBack = inputBuffer.length - cursorIndex;
+                if (moveBack > 0) {
+                  term.write("\x1b[" + moveBack + "D");
+                }
+              }
             }
           }
+        });
 
-        } else if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "c") {
-          // Ctrl+C
-          term.write("^C\r\n");
-          inputBuffer = "";
-          historyIndex = null;
-          term.write(getPromptString(stateRef.current));
-
-        } else if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "l") {
-          // Ctrl+L (Clear)
-          domEvent.preventDefault();
-          term.clear();
-          term.write(getPromptString(stateRef.current) + inputBuffer);
-
-        } else {
-          // Standard character input
-          // Filter out function keys, escape codes, arrows
-          if (char.length === 1 && !domEvent.altKey && !domEvent.ctrlKey && !domEvent.metaKey) {
-            inputBuffer += char;
-            term.write(char);
-          }
-        }
-      });
+        (term as any)._simDisposable = keyDisposable;
+      }
     };
 
     initTerm();
 
-    // Resize observer to auto-fit terminal on container change
     const resizeObserver = new ResizeObserver(() => {
       if (fitAddon && term) {
         try {
@@ -688,10 +1083,24 @@ export function TerminalSimulator({
       isMounted = false;
       resizeObserver.disconnect();
       if (term) {
+        if ((term as any)._simDisposable) {
+          (term as any)._simDisposable.dispose();
+        }
+        if ((term as any)._v86Disposable) {
+          (term as any)._v86Disposable.dispose();
+        }
         term.dispose();
       }
+      if (v86EmulatorRef.current) {
+        try {
+          v86EmulatorRef.current.destroy();
+        } catch (e) {
+          console.error("Failed to destroy v86 emulator:", e);
+        }
+        v86EmulatorRef.current = null;
+      }
     };
-  }, [prefs.theme, prefs.fontSize]);
+  }, [prefs.theme, prefs.fontSize, isV86Mode]);
 
   return (
     <div className="space-y-4">
@@ -708,12 +1117,44 @@ export function TerminalSimulator({
         </div>
         <div className="flex gap-2">
           <button
-            onClick={handleResetSandbox}
-            className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-all hover:bg-white/10 hover:text-white"
+            onClick={() => setIsV86Mode(!isV86Mode)}
+            className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-all ${
+              isV86Mode 
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20" 
+                : "border-white/10 bg-white/5 text-gray-300 hover:bg-white/10 hover:text-white"
+            }`}
           >
-            <RefreshCw className="h-3.5 w-3.5" />
-            Reset Sandbox VM
+            <TermIcon className="h-3.5 w-3.5" />
+            {isV86Mode ? "Simulation Mode" : "WASM VM Mode"}
           </button>
+          {isV86Mode && (
+            <>
+              <button
+                onClick={handleSaveV86State}
+                disabled={isSavingV86}
+                className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20 hover:text-white disabled:opacity-50"
+              >
+                <Award className="h-3.5 w-3.5" />
+                {isSavingV86 ? "Saving State..." : "Save VM State"}
+              </button>
+              <button
+                onClick={handleResetV86State}
+                className="flex items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-400 transition-all hover:bg-rose-500/20 hover:text-white"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Reset VM State
+              </button>
+            </>
+          )}
+          {!isV86Mode && (
+            <button
+              onClick={handleResetSandbox}
+              className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-all hover:bg-white/10 hover:text-white"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Reset Sandbox VM
+            </button>
+          )}
         </div>
       </div>
 
@@ -729,7 +1170,7 @@ export function TerminalSimulator({
               <div className="h-3 w-3 rounded-full bg-amber-500/80" />
               <div className="h-3 w-3 rounded-full bg-emerald-500/80" />
               <span className="ml-2 text-xs font-semibold text-gray-400 font-mono select-none">
-                user@linlearn: {osState.cwd} (virtual OS)
+                {isV86Mode ? "root@linlearn (WASM VM)" : `user@linlearn: ${osState.cwd} (virtual OS)`}
               </span>
             </div>
             <div className="flex items-center gap-2 text-xs font-mono text-gray-500">
@@ -738,7 +1179,14 @@ export function TerminalSimulator({
           </div>
           
           {/* Terminal Canvas Container */}
-          <div className="p-2 min-h-[500px] flex-1 flex flex-col justify-stretch">
+          <div className="p-2 min-h-[500px] flex-1 flex flex-col justify-stretch relative">
+            {isV86Mode && v86Booting && (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#06070a]/90 gap-3">
+                <RefreshCw className="h-8 w-8 text-[#E95420] animate-spin" />
+                <span className="text-sm font-mono text-gray-400">Booting Real Linux Kernel in WASM...</span>
+                <span className="text-xs font-mono text-gray-600">Downloading Buildroot disk image (~10MB)</span>
+              </div>
+            )}
             <div 
               ref={terminalRef} 
               className="w-full flex-1 overflow-hidden" 
@@ -820,6 +1268,32 @@ export function TerminalSimulator({
                   </div>
                 </div>
 
+                {/* BKT Cognitive Mastery Profile */}
+                <div className="p-3 rounded-lg border border-white/5 bg-white/[0.01] space-y-2">
+                  <div className="flex items-center justify-between border-b border-white/5 pb-1.5 mb-1.5">
+                    <span className="text-[10px] text-gray-400 font-mono uppercase font-bold tracking-wider">Cognitive Mastery Profile</span>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded font-mono bg-[#E95420]/15 text-[#E95420] border border-[#E95420]/25">
+                      Model: BKT Active
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 text-[10px] font-mono">
+                    {Object.entries(masteryState).map(([topic, val]) => (
+                      <div key={topic} className="space-y-1">
+                        <div className="flex justify-between text-gray-400 text-[9px] uppercase">
+                          <span>{topic}</span>
+                          <span className="text-gray-300">{(val * 100).toFixed(0)}%</span>
+                        </div>
+                        <div className="h-1 w-full bg-white/5 rounded-full overflow-hidden">
+                          <div 
+                            className="h-full rounded-full transition-all duration-500 bg-[#E95420]" 
+                            style={{ width: `${val * 100}%` }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="space-y-2">
                   {missions.map((mission) => (
                     <div 
@@ -844,8 +1318,51 @@ export function TerminalSimulator({
                             {mission.desc}
                           </p>
                           {!mission.completed && (
-                            <div className="mt-2 p-1.5 rounded bg-black/40 border border-white/5 font-mono text-[10px] text-gray-300 flex items-center justify-between">
-                              <span>{mission.hint}</span>
+                            <div className="mt-2 flex flex-col gap-1.5">
+                              <div className="p-1.5 rounded bg-black/40 border border-white/5 font-mono text-[10px] text-gray-300">
+                                <span>{mission.hint}</span>
+                              </div>
+                              {isV86Mode && (
+                                <button
+                                  disabled={validatingMissions[mission.id]}
+                                  onClick={async () => {
+                                    setValidatingMissions(prev => ({ ...prev, [mission.id]: true }));
+                                    const success = await runV86Validation(WASM_MISSION_CHECKS[mission.id]);
+                                    if (success) {
+                                      try {
+                                        const res = await fetch("/api/validate", {
+                                          method: "POST",
+                                          headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify({ missionId: mission.id, success: true })
+                                        });
+                                        if (res.ok) {
+                                          setCompletedVasmMissions(prev => ({ ...prev, [mission.id]: true }));
+                                          updateBKT(MISSION_TOPICS[mission.id] || "navigation", true);
+                                          onCommandLoggedRef.current({
+                                            id: Math.random().toString(36).substring(2, 10),
+                                            input: `Verify: ${mission.title}`,
+                                            output: `Mission "${mission.title}" verified successfully inside the WASM guest VM and recorded on the server!`,
+                                            source: "local",
+                                            createdAt: new Date().toISOString()
+                                          });
+                                        } else {
+                                          alert("Failed to submit verification to server. Make sure you are signed in.");
+                                        }
+                                      } catch (err) {
+                                        console.error("Failed to submit validation:", err);
+                                        alert("Server communication error. Please try again.");
+                                      }
+                                    } else {
+                                      updateBKT(MISSION_TOPICS[mission.id] || "navigation", false);
+                                      alert(`Verification failed for "${mission.title}". Make sure you completed the objective correctly inside the guest VM.`);
+                                    }
+                                    setValidatingMissions(prev => ({ ...prev, [mission.id]: false }));
+                                  }}
+                                  className="w-full py-1 text-[10px] uppercase font-bold text-center border rounded transition-all bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/25 disabled:opacity-50"
+                                >
+                                  {validatingMissions[mission.id] ? "Verifying..." : "Verify Solution"}
+                                </button>
+                              )}
                             </div>
                           )}
                         </div>
