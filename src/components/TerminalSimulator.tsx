@@ -59,11 +59,11 @@ const WASM_MISSION_CHECKS: Record<string, string> = {
   pwd_ls: "true",
   mkdir_proj: "[ -d Projects ] || [ -d /root/Projects ] || [ -d /home/user/Projects ]",
   touch_config: "[ -f Projects/config.txt ] || [ -f /root/Projects/config.txt ] || [ -f /home/user/Projects/config.txt ]",
-  nginx: "true", 
-  logs: "true",
-  htop: "true",
-  permissions: "true",
-  lock_config: "true",
+  nginx: "[ -f /etc/nginx/nginx.conf ] && ! grep -q 'syntax_error_here' /etc/nginx/nginx.conf", 
+  logs: "[ -f /var/log/nginx/access.log ] && grep -q '192.168.1.100' /var/log/nginx/access.log",
+  htop: "which htop || [ -f /usr/bin/htop ] || [ -f /usr/local/bin/htop ]",
+  permissions: "[ -x Projects/deploy.sh ] || [ -x /root/Projects/deploy.sh ] || [ -x /home/user/Projects/deploy.sh ] || [ -x deploy.sh ]",
+  lock_config: "([ -f Projects/config.txt ] && [ ! -w Projects/config.txt ]) || ([ -f /root/Projects/config.txt ] && [ ! -w /root/Projects/config.txt ]) || ([ -f /home/user/Projects/config.txt ] && [ ! -w /home/user/Projects/config.txt ])",
   audit_dangerous: "true",
   sysinfo: "true",
   services: "true",
@@ -535,16 +535,16 @@ export function TerminalSimulator({
       }
       if (learningMode === "DevOps") {
         return [
-          getWasmMission("nginx", "Deploy Nginx Container", "Start a Docker container running Nginx on port 80.", "docker run -d -p 80:80 nginx"),
-          getWasmMission("logs", "Investigate Access Logs", "Inspect the Nginx access log file to see recent client hits.", "cat /var/log/nginx/access.log"),
-          getWasmMission("htop", "Install htop Tool", "Install the system resource monitor package 'htop' using the package manager.", "apt install htop")
+          getWasmMission("nginx", "Fix Broken Nginx Config", "The Nginx configuration file /etc/nginx/nginx.conf has a syntax error. Edit it and delete the line containing 'syntax_error_here'.", "vi /etc/nginx/nginx.conf"),
+          getWasmMission("logs", "Investigate Access Logs", "Inspect the Nginx access log file at /var/log/nginx/access.log to trace client hits.", "cat /var/log/nginx/access.log"),
+          getWasmMission("htop", "Verify htop Installation", "Verify if the htop system monitoring binary is successfully located in the system path.", "which htop")
         ];
       }
       if (learningMode === "Security") {
         return [
-          getWasmMission("permissions", "Create Executable Script", "Create a file at /home/user/Projects/deploy.sh and make it executable.", "touch /home/user/Projects/deploy.sh && chmod +x /home/user/Projects/deploy.sh"),
-          getWasmMission("lock_config", "Lock Config Permissions", "Remove write access permissions from /home/user/Projects/config.txt.", "chmod 400 /home/user/Projects/config.txt"),
-          getWasmMission("audit_dangerous", "Audit Sandbox Safeguards", "Test security safeguards by executing a dangerous command (e.g. rm -rf /).", "rm -rf /")
+          getWasmMission("permissions", "Create Executable Script", "Create an executable script at Projects/deploy.sh.", "touch Projects/deploy.sh && chmod +x Projects/deploy.sh"),
+          getWasmMission("lock_config", "Lock Config Permissions", "Set Projects/config.txt to be read-only (remove all write permissions).", "chmod 400 Projects/config.txt"),
+          getWasmMission("audit_dangerous", "Audit Sandbox Safeguards", "Test security safeguards by attempting to execute a dangerous or destructive command.", "rm -rf /")
         ];
       }
       return [
@@ -826,6 +826,8 @@ export function TerminalSimulator({
           v86EmulatorRef.current = emulator;
 
           let isFirstChar = true;
+          let isProvisioned = false;
+          let outputBuffer = "";
 
           // Connect guest serial output to xterm.js terminal
           emulator.add_listener("serial0-output-char", (char: string) => {
@@ -838,6 +840,31 @@ export function TerminalSimulator({
               term.clear();
             }
             term.write(char);
+
+            // Provision guest environment silently once shell prompt is ready
+            if (!isProvisioned) {
+              outputBuffer += char;
+              if (outputBuffer.length > 64) {
+                outputBuffer = outputBuffer.substring(outputBuffer.length - 64);
+              }
+              if (outputBuffer.endsWith("~% ") || outputBuffer.endsWith("# ") || outputBuffer.endsWith("~# ")) {
+                isProvisioned = true;
+                isCapturingValidationRef.current = true;
+                
+                // Write broken config files and mock log states
+                emulator.serial0_send("mkdir -p /etc/nginx && echo 'server { listen 80; root /var/www/html; syntax_error_here; }' > /etc/nginx/nginx.conf\n");
+                emulator.serial0_send("mkdir -p /var/log/nginx && echo '192.168.1.100 - - [23/May/2026:10:40:02 +0530] \"GET / HTTP/1.1\" 200 3126' > /var/log/nginx/access.log\n");
+                emulator.serial0_send("mkdir -p Projects\n");
+                
+                // Yield console print buffer back to user terminal cleanly
+                setTimeout(() => {
+                  emulator.serial0_send("clear\n");
+                  setTimeout(() => {
+                    isCapturingValidationRef.current = false;
+                  }, 200);
+                }, 1000);
+              }
+            }
           });
 
           // Connect user input from xterm.js back to guest serial console
