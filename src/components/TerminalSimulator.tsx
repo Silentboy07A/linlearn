@@ -1,30 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2 } from "lucide-react";
-import type { CommandSource } from "@/lib/commandDB";
-import { sourceTag, type SessionCommand, type TerminalPrefs } from "@/lib/session";
-import { getHfHeaders } from "@/lib/utils";
-
-interface DirNode {
-  type: "dir";
-  children: Record<string, FsNode>;
-}
-
-interface FileNode {
-  type: "file";
-  content: string;
-}
-
-type FsNode = DirNode | FileNode;
-
-interface TerminalEntry {
-  id: string;
-  command: string;
-  output: string;
-  source: CommandSource;
-  cwd: string;
-}
+import { useEffect, useRef, useState, useMemo } from "react";
+import { RefreshCw, Terminal as TermIcon, BookOpen, Award, CheckCircle, HelpCircle } from "lucide-react";
+import type { Terminal } from "xterm";
+import type { FitAddon } from "xterm-addon-fit";
+import type { TerminalPrefs, SessionCommand } from "@/lib/session";
+import { 
+  getInitialState, 
+  executeCommand, 
+  getNode, 
+  resolvePath, 
+  type VirtualSystemState 
+} from "@/lib/virtualOs";
 
 interface TerminalSimulatorProps {
   prefs: TerminalPrefs;
@@ -33,166 +20,203 @@ interface TerminalSimulatorProps {
   onDbFallback: () => void;
 }
 
-const LOCAL_BASE_COMMANDS = new Set([
-  "ls",
-  "cd",
-  "pwd",
-  "mkdir",
-  "touch",
-  "rm",
-  "cat",
-  "echo",
-  "whoami",
-  "date",
-  "clear",
-  "history",
-  "help",
-]);
+const themeColors = {
+  green: { background: "#06070a", foreground: "#4ade80", cursor: "#4ade80" },
+  amber: { background: "#06070a", foreground: "#fbbf24", cursor: "#fbbf24" },
+  cyan: { background: "#06070a", foreground: "#22d3ee", cursor: "#22d3ee" },
+  white: { background: "#06070a", foreground: "#f3f4f6", cursor: "#f3f4f6" },
+};
 
-const fontClassMap = {
-  small: "text-xs",
-  medium: "text-sm",
-  large: "text-base",
-} satisfies Record<TerminalPrefs["fontSize"], string>;
-
-const terminalThemeMap = {
-  green: {
-    prompt: "text-green-300",
-    path: "text-emerald-400",
-    command: "text-white",
-    output: "text-gray-200",
-  },
-  amber: {
-    prompt: "text-amber-300",
-    path: "text-orange-300",
-    command: "text-white",
-    output: "text-gray-200",
-  },
-  cyan: {
-    prompt: "text-cyan-300",
-    path: "text-sky-300",
-    command: "text-white",
-    output: "text-gray-200",
-  },
-  white: {
-    prompt: "text-gray-200",
-    path: "text-gray-100",
-    command: "text-white",
-    output: "text-gray-200",
-  },
-} satisfies Record<TerminalPrefs["theme"], Record<"prompt" | "path" | "command" | "output", string>>;
-
-function initialFs(): DirNode {
-  return {
-    type: "dir",
-    children: {
-      home: {
-        type: "dir",
-        children: {
-          user: {
-            type: "dir",
-            children: {
-              Documents: { type: "dir", children: {} },
-              Projects: { type: "dir", children: {} },
-              "notes.txt": { type: "file", content: "Welcome to LinLearn Terminal Simulator." },
-            },
-          },
-        },
-      },
+// Help dictionary for command metadata, difficulty levels, related commands, and flags
+const COMMAND_HELP_INFO: Record<string, {
+  name: string;
+  difficulty: "Beginner" | "Intermediate" | "Advanced";
+  desc: string;
+  flags: Record<string, string>;
+  related: string[];
+}> = {
+  ls: {
+    name: "ls",
+    difficulty: "Beginner",
+    desc: "Lists files and directories in the current folder.",
+    flags: {
+      "-l": "Long format, showing file permissions, owner, size, and modified date.",
+      "-a": "Shows all files, including hidden ones (starting with a dot).",
+      "-la": "Combines long format and lists hidden files."
     },
-  };
-}
-
-function cloneFs<T>(input: T): T {
-  return JSON.parse(JSON.stringify(input)) as T;
-}
-
-function normalizePath(path: string): string[] {
-  const parts = path.split("/").filter(Boolean);
-  const normalized: string[] = [];
-  for (const part of parts) {
-    if (part === ".") continue;
-    if (part === "..") {
-      normalized.pop();
-      continue;
-    }
-    normalized.push(part);
+    related: ["cd", "pwd", "mkdir"]
+  },
+  cd: {
+    name: "cd",
+    difficulty: "Beginner",
+    desc: "Changes the current working directory.",
+    flags: {
+      "~": "Changes directory to user's home folder.",
+      "..": "Moves up one level to the parent directory.",
+      "/": "Moves to the root directory."
+    },
+    related: ["pwd", "ls"]
+  },
+  pwd: {
+    name: "pwd",
+    difficulty: "Beginner",
+    desc: "Prints the absolute path of the current working directory.",
+    flags: {},
+    related: ["cd", "ls"]
+  },
+  mkdir: {
+    name: "mkdir",
+    difficulty: "Beginner",
+    desc: "Creates a new folder at the specified path.",
+    flags: {},
+    related: ["touch", "rm"]
+  },
+  touch: {
+    name: "touch",
+    difficulty: "Beginner",
+    desc: "Creates an empty file or updates the timestamp of an existing file.",
+    flags: {},
+    related: ["mkdir", "cat", "rm"]
+  },
+  cat: {
+    name: "cat",
+    difficulty: "Beginner",
+    desc: "Concatenates and displays file contents in the terminal.",
+    flags: {},
+    related: ["echo", "nano", "grep"]
+  },
+  echo: {
+    name: "echo",
+    difficulty: "Beginner",
+    desc: "Prints the input arguments to standard output.",
+    flags: {
+      ">": "Redirects output to create/overwrite a file.",
+      ">>": "Redirects output to append to an existing file."
+    },
+    related: ["cat", "grep"]
+  },
+  chmod: {
+    name: "chmod",
+    difficulty: "Intermediate",
+    desc: "Modifies read, write, and execute permissions of files and directories.",
+    flags: {
+      "755": "Read/Write/Execute for owner, Read/Execute for group and others.",
+      "644": "Read/Write for owner, Read-only for group and others.",
+      "+x": "Makes the file executable."
+    },
+    related: ["chown", "ls"]
+  },
+  chown: {
+    name: "chown",
+    difficulty: "Intermediate",
+    desc: "Changes file owner and group ownership properties.",
+    flags: {
+      "owner:group": "Sets both user owner and group owner."
+    },
+    related: ["chmod", "ls"]
+  },
+  docker: {
+    name: "docker",
+    difficulty: "Advanced",
+    desc: "Manages images, containers, and configurations on the Docker virtual engine.",
+    flags: {
+      "ps": "Lists running containers. Add '-a' or '--all' to show all containers.",
+      "images": "Lists local cached images.",
+      "run -d -p 80:80 nginx": "Starts nginx container in background (detached) mapping port 80.",
+      "stop <id>": "Gracefully halts a running container instance.",
+      "rm <id>": "Permanently deletes a stopped container."
+    },
+    related: ["systemctl", "ps"]
+  },
+  systemctl: {
+    name: "systemctl",
+    difficulty: "Intermediate",
+    desc: "Controls and views services, daemons, and systemd units.",
+    flags: {
+      "status <service>": "Inspects whether a service is running or stopped.",
+      "start <service>": "Activates a service daemon.",
+      "stop <service>": "Halts a running service daemon.",
+      "restart <service>": "Restarts a service instance."
+    },
+    related: ["service", "ps"]
+  },
+  service: {
+    name: "service",
+    difficulty: "Intermediate",
+    desc: "Runs System V init service scripts.",
+    flags: {
+      "--status-all": "Lists status of all registered system services."
+    },
+    related: ["systemctl"]
+  },
+  ps: {
+    name: "ps",
+    difficulty: "Intermediate",
+    desc: "Lists active processes running in the current shell context.",
+    flags: {
+      "aux": "Lists all processes running on the OS with detailed CPU/Mem stats."
+    },
+    related: ["top", "kill"]
+  },
+  top: {
+    name: "top",
+    difficulty: "Intermediate",
+    desc: "Displays an interactive, real-time list of active processes.",
+    flags: {},
+    related: ["ps", "kill"]
+  },
+  kill: {
+    name: "kill",
+    difficulty: "Intermediate",
+    desc: "Sends termination signals to processes by PID.",
+    flags: {
+      "-9": "Forces process termination (SIGKILL) immediately."
+    },
+    related: ["ps", "top"]
+  },
+  apt: {
+    name: "apt",
+    difficulty: "Intermediate",
+    desc: "Advanced Package Tool (apt) manages installation/removal of software packages.",
+    flags: {
+      "update": "Fetches database information of latest repository packages.",
+      "install <pkg>": "Downloads and installs a software package (e.g., htop, tmux).",
+      "remove <pkg>": "Uninstalls a package from the system."
+    },
+    related: ["systemctl", "service"]
+  },
+  man: {
+    name: "man",
+    difficulty: "Beginner",
+    desc: "Displays the reference manual page for a command.",
+    flags: {},
+    related: ["help"]
   }
-  return normalized;
-}
+};
 
-function resolvePath(cwd: string, rawPath: string): string {
-  if (!rawPath || rawPath === "~") return "/home/user";
-  if (rawPath.startsWith("/")) {
-    const parts = normalizePath(rawPath);
-    return `/${parts.join("/")}`.replace(/\/+$/, "") || "/";
+// Simulated Interview flashcards
+const INTERVIEW_PREP_DATA = [
+  {
+    q: "How do you check running containers and start a new one in the background?",
+    a: "Use `docker ps` to view containers and `docker run -d -p 80:80 nginx` to start a new container in detached (-d) mode."
+  },
+  {
+    q: "What command shows all active services and their status?",
+    a: "Use `systemctl status` to view active units or `service --status-all` to list System V init service status mappings."
+  },
+  {
+    q: "How do you check process lists sorted by CPU or memory usage?",
+    a: "Run `top` for a live process monitor, or `ps aux` to get a formatted snapshot of all active processes."
+  },
+  {
+    q: "How do you create a file and make it read-write-execute for owners, but read-only for others?",
+    a: "Use `touch script.sh` followed by `chmod 744 script.sh` or `chmod u+x script.sh`."
+  },
+  {
+    q: "How do you download and install software packages on Debian-based Ubuntu?",
+    a: "Run `apt update` first to fetch the package definitions, then run `apt install <package_name>`."
   }
-  if (rawPath === ".") return cwd;
-  const current = cwd === "/" ? "" : cwd;
-  const parts = normalizePath(`${current}/${rawPath}`);
-  return `/${parts.join("/")}`.replace(/\/+$/, "") || "/";
-}
-
-function getNode(root: DirNode, path: string): FsNode | null {
-  const parts = normalizePath(path);
-  let pointer: FsNode = root;
-  for (const part of parts) {
-    if (pointer.type !== "dir") return null;
-    const next: FsNode | undefined = pointer.children[part];
-    if (!next) return null;
-    pointer = next;
-  }
-  return pointer;
-}
-
-function setNode(root: DirNode, path: string, node: FsNode): DirNode {
-  const draft = cloneFs(root);
-  const parts = normalizePath(path);
-  if (parts.length === 0) return draft;
-
-  let pointer: FsNode = draft;
-  for (let i = 0; i < parts.length - 1; i += 1) {
-    const segment = parts[i];
-    if (pointer.type !== "dir") return draft;
-    if (!pointer.children[segment]) {
-      pointer.children[segment] = { type: "dir", children: {} };
-    }
-    pointer = pointer.children[segment];
-  }
-
-  if (pointer.type === "dir") {
-    pointer.children[parts[parts.length - 1]] = node;
-  }
-  return draft;
-}
-
-function deleteNode(root: DirNode, path: string): DirNode {
-  const draft = cloneFs(root);
-  const parts = normalizePath(path);
-  if (parts.length === 0) return draft;
-
-  let pointer: FsNode = draft;
-  for (let i = 0; i < parts.length - 1; i += 1) {
-    const segment = parts[i];
-    if (pointer.type !== "dir") return draft;
-    const next: FsNode | undefined = pointer.children[segment];
-    if (!next) return draft;
-    pointer = next;
-  }
-
-  if (pointer.type === "dir") {
-    delete pointer.children[parts[parts.length - 1]];
-  }
-  return draft;
-}
-
-function promptPath(cwd: string): string {
-  return cwd.startsWith("/home/user") ? cwd.replace("/home/user", "~") || "~" : cwd;
-}
-
-function nextId() {
-  return Math.random().toString(36).slice(2, 10);
-}
+];
 
 export function TerminalSimulator({
   prefs,
@@ -200,372 +224,621 @@ export function TerminalSimulator({
   onCommandLogged,
   onDbFallback,
 }: TerminalSimulatorProps) {
-  const [filesystem, setFilesystem] = useState<DirNode>(initialFs);
-  const [cwd, setCwd] = useState("/home/user");
-  const [entries, setEntries] = useState<TerminalEntry[]>([]);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [commandHistory, setCommandHistory] = useState<string[]>([]);
-  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
-  const [historyDraft, setHistoryDraft] = useState("");
+  // Virtual System State
+  const [osState, setOsState] = useState<VirtualSystemState>(getInitialState);
+  const [activeTab, setActiveTab] = useState<"explanations" | "missions" | "interview">("missions");
+  const [lastCommand, setLastCommand] = useState<string>("");
 
-  const inputRef = useRef<HTMLInputElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  const theme = terminalThemeMap[prefs.theme];
-
+  const terminalRef = useRef<HTMLDivElement>(null);
+  const xtermInstance = useRef<Terminal | null>(null);
+  
+  // Create refs to access the latest state in the event loop callbacks
+  const stateRef = useRef(osState);
   useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+    stateRef.current = osState;
+  }, [osState]);
 
+  const onCommandLoggedRef = useRef(onCommandLogged);
+  const onDbFallbackRef = useRef(onDbFallback);
   useEffect(() => {
-    if (!scrollRef.current) return;
-    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [entries, loading]);
+    onCommandLoggedRef.current = onCommandLogged;
+    onDbFallbackRef.current = onDbFallback;
+  }, [onCommandLogged, onDbFallback]);
 
+  // Handle clearSignal from parent
   useEffect(() => {
     if (clearSignal === 0) return;
-    setEntries([]);
+    if (xtermInstance.current) {
+      xtermInstance.current.clear();
+      xtermInstance.current.write(getPromptString(stateRef.current));
+    }
   }, [clearSignal]);
 
-  const availableCommands = useMemo(
-    () => [
-      ...Array.from(LOCAL_BASE_COMMANDS),
-      "uname -a",
-      "Ctrl+L clears terminal",
-      "Ctrl+K opens command search",
-      "Ctrl+B opens bookmarks",
-    ],
-    []
-  );
+  // Load state from local storage on mount (hydration)
+  useEffect(() => {
+    const saved = localStorage.getItem("linlearn_virtual_os");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        parsed.packages = new Set(parsed.packages);
+        setOsState(parsed);
+      } catch (e) {
+        console.error("Failed to restore virtual OS state:", e);
+      }
+    }
+  }, []);
 
-  function pushEntry(command: string, output: string, source: CommandSource, entryCwd: string) {
-    const item: TerminalEntry = {
-      id: nextId(),
-      command,
-      output,
-      source,
-      cwd: entryCwd,
+  // Persist state on change
+  useEffect(() => {
+    const serialized = {
+      ...osState,
+      packages: Array.from(osState.packages),
     };
-    setEntries((previous) => [...previous, item]);
-    onCommandLogged({
-      id: item.id,
-      input: command,
-      output,
-      source,
-      createdAt: new Date().toISOString(),
+    localStorage.setItem("linlearn_virtual_os", JSON.stringify(serialized));
+  }, [osState]);
+
+  // Reset function
+  const handleResetSandbox = () => {
+    const confirmed = window.confirm("Are you sure you want to reset the Virtual Linux Sandbox? This will restore initial files, containers, and services.");
+    if (confirmed) {
+      const fresh = getInitialState();
+      setOsState(fresh);
+      setLastCommand("");
+      if (xtermInstance.current) {
+        xtermInstance.current.clear();
+        xtermInstance.current.write("\r\n\x1b[1;33mSystem restored. Virtual filesystem, Docker, and services refreshed.\x1b[0m\r\n\r\n");
+        xtermInstance.current.write(getPromptString(fresh));
+      }
+    }
+  };
+
+  // Helper to get prompt string
+  const getPromptString = (state: VirtualSystemState) => {
+    const promptPath = state.cwd.startsWith("/home/user")
+      ? state.cwd.replace("/home/user", "~")
+      : state.cwd;
+    const symbol = state.currentUser === "root" ? "#" : "$";
+    return `\x1b[1;32m${state.currentUser}@linlearn\x1b[0m:\x1b[1;34m${promptPath}\x1b[0m${symbol} `;
+  };
+
+  // Missions completion checks
+  const missions = useMemo(() => {
+    const history = osState.history;
+    const containers = osState.containers;
+    const fs = osState.fs;
+    const packages = osState.packages;
+
+    // Mission 1: Start Nginx container on port 80
+    const m1Complete = containers.some(
+      (c) => c.image.includes("nginx") && c.status.startsWith("Up") && c.ports.includes("80")
+    );
+
+    // Mission 2: Inspect Nginx log
+    const m2Complete = history.some(
+      (h) => h.includes("cat ") && h.includes("access.log")
+    );
+
+    // Mission 3: Create deploy.sh and make it executable
+    const deployNode = getNode(fs, "/home/user/Projects/deploy.sh");
+    const m3Complete = !!deployNode && deployNode.type === "file" && deployNode.permissions.includes("x");
+
+    // Mission 4: Install htop package
+    const m4Complete = packages.has("htop");
+
+    return [
+      {
+        id: "nginx",
+        title: "Deploy Nginx Container",
+        desc: "Start a Docker container running Nginx on port 80.",
+        hint: "docker run -d -p 80:80 nginx",
+        completed: m1Complete
+      },
+      {
+        id: "logs",
+        title: "Investigate Access Logs",
+        desc: "Inspect the Nginx access log file to see recent client hits.",
+        hint: "cat /var/log/nginx/access.log",
+        completed: m2Complete
+      },
+      {
+        id: "permissions",
+        title: "Create Executable Script",
+        desc: "Create a file at /home/user/Projects/deploy.sh and make it executable.",
+        hint: "touch /home/user/Projects/deploy.sh && chmod +x /home/user/Projects/deploy.sh",
+        completed: m3Complete
+      },
+      {
+        id: "htop",
+        title: "Install htop Tool",
+        desc: "Install the system resource monitor package 'htop' using the package manager.",
+        hint: "apt install htop",
+        completed: m4Complete
+      }
+    ];
+  }, [osState]);
+
+  // Track completed missions count
+  const completedCount = useMemo(() => missions.filter((m) => m.completed).length, [missions]);
+
+  // Command explanation extraction based on last run command
+  const commandExpl = useMemo(() => {
+    if (!lastCommand) return null;
+    const baseCmd = lastCommand.trim().split(/\s+/)[0];
+    const match = COMMAND_HELP_INFO[baseCmd];
+    if (!match) return null;
+
+    // Match active flags in lastCommand
+    const flagsUsed: { flag: string; desc: string }[] = [];
+    Object.keys(match.flags).forEach((f) => {
+      if (lastCommand.includes(f)) {
+        flagsUsed.push({ flag: f, desc: match.flags[f] });
+      }
     });
-  }
 
-  function executeLocal(commandLine: string): { handled: boolean; output: string; source: CommandSource } {
-    if (commandLine === "uname -a") {
-      return {
-        handled: true,
-        output: "Linux linlearn 5.15.0-ubuntu #1 SMP x86_64 GNU/Linux",
-        source: "local",
-      };
-    }
+    return {
+      ...match,
+      flagsUsed
+    };
+  }, [lastCommand]);
 
-    const [baseCommand, ...args] = commandLine.split(/\s+/);
-    if (!LOCAL_BASE_COMMANDS.has(baseCommand)) {
-      return { handled: false, output: "", source: "local" };
-    }
+  // Initialize xterm.js instance
+  useEffect(() => {
+    let isMounted = true;
+    let term: Terminal;
+    let fitAddon: FitAddon;
 
-    if (baseCommand === "clear") {
-      setEntries([]);
-      return { handled: true, output: "", source: "local" };
-    }
+    const initTerm = async () => {
+      // Dynamic import to prevent Node.js environment build errors
+      const { Terminal } = await import("xterm");
+      const { FitAddon } = await import("xterm-addon-fit");
 
-    if (baseCommand === "help") {
-      return { handled: true, output: availableCommands.join("\n"), source: "local" };
-    }
+      if (!isMounted) return;
 
-    if (baseCommand === "history") {
-      const output = commandHistory.map((value, index) => `${index + 1}  ${value}`).join("\n");
-      return { handled: true, output, source: "local" };
-    }
+      const theme = themeColors[prefs.theme] || themeColors.green;
+      const fontSizeMap = { small: 12, medium: 14, large: 16 };
 
-    if (baseCommand === "pwd") {
-      return { handled: true, output: cwd, source: "local" };
-    }
-
-    if (baseCommand === "whoami") {
-      return { handled: true, output: "user", source: "local" };
-    }
-
-    if (baseCommand === "date") {
-      return { handled: true, output: new Date().toString(), source: "local" };
-    }
-
-    if (baseCommand === "echo") {
-      return { handled: true, output: args.join(" "), source: "local" };
-    }
-
-    if (baseCommand === "ls") {
-      const target = args[0] ? resolvePath(cwd, args[0]) : cwd;
-      const node = getNode(filesystem, target);
-      if (!node) {
-        return {
-          handled: true,
-          output: `ls: cannot access '${args[0]}': No such file or directory`,
-          source: "local",
-        };
-      }
-      if (node.type !== "dir") {
-        return { handled: true, output: args[0], source: "local" };
-      }
-      return { handled: true, output: Object.keys(node.children).join("  "), source: "local" };
-    }
-
-    if (baseCommand === "cd") {
-      const target = resolvePath(cwd, args[0] || "~");
-      const node = getNode(filesystem, target);
-      if (!node || node.type !== "dir") {
-        return {
-          handled: true,
-          output: `bash: cd: ${args[0] || "~"}: No such file or directory`,
-          source: "local",
-        };
-      }
-      setCwd(target);
-      return { handled: true, output: "", source: "local" };
-    }
-
-    if (baseCommand === "mkdir") {
-      const name = args[0];
-      if (!name) {
-        return { handled: true, output: "mkdir: missing operand", source: "local" };
-      }
-      const target = resolvePath(cwd, name);
-      if (getNode(filesystem, target)) {
-        return {
-          handled: true,
-          output: `mkdir: cannot create directory '${name}': File exists`,
-          source: "local",
-        };
-      }
-      setFilesystem((previous) => setNode(previous, target, { type: "dir", children: {} }));
-      return { handled: true, output: "", source: "local" };
-    }
-
-    if (baseCommand === "touch") {
-      const name = args[0];
-      if (!name) {
-        return { handled: true, output: "touch: missing file operand", source: "local" };
-      }
-      const target = resolvePath(cwd, name);
-      setFilesystem((previous) => {
-        const existing = getNode(previous, target);
-        if (existing && existing.type === "file") {
-          return previous;
-        }
-        return setNode(previous, target, { type: "file", content: "" });
-      });
-      return { handled: true, output: "", source: "local" };
-    }
-
-    if (baseCommand === "rm") {
-      const name = args[0];
-      if (!name) {
-        return { handled: true, output: "rm: missing operand", source: "local" };
-      }
-      const target = resolvePath(cwd, name);
-      const existing = getNode(filesystem, target);
-      if (!existing) {
-        return {
-          handled: true,
-          output: `rm: cannot remove '${name}': No such file or directory`,
-          source: "local",
-        };
-      }
-      setFilesystem((previous) => deleteNode(previous, target));
-      return { handled: true, output: "", source: "local" };
-    }
-
-    if (baseCommand === "cat") {
-      const name = args[0];
-      if (!name) {
-        return { handled: true, output: "cat: missing file operand", source: "local" };
-      }
-      const target = resolvePath(cwd, name);
-      const node = getNode(filesystem, target);
-      if (!node) {
-        return {
-          handled: true,
-          output: `cat: ${name}: No such file or directory`,
-          source: "local",
-        };
-      }
-      if (node.type === "dir") {
-        return {
-          handled: true,
-          output: `cat: ${name}: Is a directory`,
-          source: "local",
-        };
-      }
-      return { handled: true, output: node.content, source: "local" };
-    }
-
-    return { handled: false, output: "", source: "local" };
-  }
-
-  async function runCommand(commandLine: string) {
-    const localResult = executeLocal(commandLine);
-    if (localResult.handled) {
-      if (commandLine !== "clear") {
-        pushEntry(commandLine, localResult.output, localResult.source, cwd);
-      }
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const response = await fetch("/api/terminal", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...getHfHeaders(),
+      term = new Terminal({
+        cursorBlink: true,
+        cursorStyle: "block",
+        theme: {
+          background: theme.background,
+          foreground: theme.foreground,
+          cursor: theme.cursor,
+          cursorAccent: theme.background,
+          selectionBackground: "rgba(233,84,32,0.3)",
         },
-        body: JSON.stringify({ command: commandLine, cwd, filesystem }),
+        fontSize: fontSizeMap[prefs.fontSize] || 14,
+        fontFamily: "JetBrains Mono, Ubuntu Mono, Courier New, monospace",
+        convertEol: true,
+        rows: 25,
       });
-      const data = (await response.json()) as {
-        output: string;
-        source: CommandSource;
-        fsUpdate?: DirNode | null;
-      };
 
-      if (data.fsUpdate) {
-        setFilesystem(data.fsUpdate);
+      fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
+
+      if (terminalRef.current) {
+        term.open(terminalRef.current);
+        fitAddon.fit();
       }
-      if (data.source === "db") {
-        onDbFallback();
-      }
-      pushEntry(commandLine, data.output, data.source, cwd);
-    } catch {
-      const fallback = `bash: ${commandLine.split(" ")[0]}: command not found`;
-      pushEntry(commandLine, fallback, "db", cwd);
-      onDbFallback();
-    } finally {
-      setLoading(false);
-    }
-  }
 
-  async function handleSubmit(event: React.FormEvent) {
-    event.preventDefault();
-    const commandLine = input.trim();
-    if (!commandLine || loading) return;
+      xtermInstance.current = term;
 
-    setInput("");
-    setCommandHistory((previous) => [...previous, commandLine]);
-    setHistoryIndex(null);
-    setHistoryDraft("");
-    await runCommand(commandLine);
-  }
+      // Print Welcome Banner
+      term.write("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
+      term.write(" * Documentation:  \x1b[4mhttps://linlearn.dev/docs\x1b[0m\r\n");
+      term.write(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n\r\n");
+      term.write("Virtual subsystems hydrated. Try running: \x1b[1;33mdocker ps\x1b[0m, \x1b[1;33mps aux\x1b[0m, or \x1b[1;33mapt install htop\x1b[0m.\r\n");
+      term.write("Type \x1b[1;32mhelp\x1b[0m or \x1b[1;32mman\x1b[0m for commands lists.\r\n\r\n");
+      term.write(getPromptString(stateRef.current));
 
-  function handleHistoryNavigation(event: React.KeyboardEvent<HTMLInputElement>) {
-    if (event.ctrlKey && event.key.toLowerCase() === "l") {
-      event.preventDefault();
-      setEntries([]);
-      return;
-    }
+      let inputBuffer = "";
+      let historyIndex: number | null = null;
+      let historyDraft = "";
 
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      if (!commandHistory.length) return;
-      setHistoryIndex((previous) => {
-        const next = previous === null ? commandHistory.length - 1 : Math.max(0, previous - 1);
-        if (previous === null) {
-          setHistoryDraft(input);
+      term.onKey((e: { key: string; domEvent: KeyboardEvent }) => {
+        const char = e.key;
+        const domEvent = e.domEvent;
+
+        if (domEvent.keyCode === 13) {
+          // Enter key
+          term.write("\r\n");
+          const cmd = inputBuffer.trim();
+          if (cmd) {
+            // Process command
+            const result = executeCommand(cmd, stateRef.current);
+            
+            // Format and print output
+            if (result.shouldClear) {
+              term.clear();
+            } else {
+              term.write(result.output.replace(/\r?\n/g, "\r\n"));
+              if (result.output && !result.output.endsWith("\n")) {
+                term.write("\r\n");
+              }
+            }
+
+            // Save in history
+            const nextHistory = [...stateRef.current.history, cmd];
+            const updatedState = {
+              ...result.newState,
+              history: nextHistory
+            };
+
+            setOsState(updatedState);
+            setLastCommand(cmd);
+
+            // Log command (for XP and DB record syncing)
+            onCommandLoggedRef.current({
+              id: Math.random().toString(36).substring(2, 10),
+              input: cmd,
+              output: result.output,
+              source: "local",
+              createdAt: new Date().toISOString()
+            });
+
+            // Trigger fallback check if command not found
+            if (result.output.includes("command not found")) {
+              onDbFallbackRef.current();
+            }
+          } else {
+            term.write("\r");
+          }
+
+          inputBuffer = "";
+          historyIndex = null;
+          historyDraft = "";
+          term.write(getPromptString(stateRef.current));
+
+        } else if (domEvent.keyCode === 8) {
+          // Backspace
+          if (inputBuffer.length > 0) {
+            inputBuffer = inputBuffer.slice(0, -1);
+            term.write("\b \b");
+          }
+
+        } else if (domEvent.keyCode === 38) {
+          // Arrow Up (History Navigation)
+          domEvent.preventDefault();
+          const hist = stateRef.current.history;
+          if (hist.length === 0) return;
+
+          if (historyIndex === null) {
+            historyDraft = inputBuffer;
+            historyIndex = hist.length - 1;
+          } else {
+            historyIndex = Math.max(0, historyIndex - 1);
+          }
+
+          // Erase current input visually
+          for (let i = 0; i < inputBuffer.length; i++) {
+            term.write("\b \b");
+          }
+
+          inputBuffer = hist[historyIndex];
+          term.write(inputBuffer);
+
+        } else if (domEvent.keyCode === 40) {
+          // Arrow Down
+          domEvent.preventDefault();
+          const hist = stateRef.current.history;
+          if (historyIndex === null) return;
+
+          // Erase current input
+          for (let i = 0; i < inputBuffer.length; i++) {
+            term.write("\b \b");
+          }
+
+          if (historyIndex === hist.length - 1) {
+            historyIndex = null;
+            inputBuffer = historyDraft;
+          } else {
+            historyIndex += 1;
+            inputBuffer = hist[historyIndex];
+          }
+          term.write(inputBuffer);
+
+        } else if (domEvent.keyCode === 9) {
+          // Tab (Autocomplete)
+          domEvent.preventDefault();
+          const parts = inputBuffer.split(/\s+/);
+          const lastWord = parts[parts.length - 1] || "";
+          
+          const dirNode = getNode(stateRef.current.fs, stateRef.current.cwd);
+          if (dirNode && dirNode.type === "dir") {
+            const options = [
+              ...Object.keys(dirNode.children),
+              ...Object.keys(COMMAND_HELP_INFO)
+            ];
+            const matches = Array.from(new Set(options)).filter((opt) => opt.startsWith(lastWord));
+
+            if (matches.length === 1) {
+              // Perfect unique autocomplete match
+              const matchNode = getNode(stateRef.current.fs, resolvePath(stateRef.current.cwd, matches[0]));
+              const suffix = matchNode && matchNode.type === "dir" ? "/" : "";
+              const completion = matches[0].substring(lastWord.length) + suffix;
+              term.write(completion);
+              inputBuffer += completion;
+            } else if (matches.length > 1) {
+              // List options
+              term.write("\r\n" + matches.join("    ") + "\r\n");
+              term.write(getPromptString(stateRef.current) + inputBuffer);
+            }
+          }
+
+        } else if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "c") {
+          // Ctrl+C
+          term.write("^C\r\n");
+          inputBuffer = "";
+          historyIndex = null;
+          term.write(getPromptString(stateRef.current));
+
+        } else if (domEvent.ctrlKey && domEvent.key.toLowerCase() === "l") {
+          // Ctrl+L (Clear)
+          domEvent.preventDefault();
+          term.clear();
+          term.write(getPromptString(stateRef.current) + inputBuffer);
+
+        } else {
+          // Standard character input
+          // Filter out function keys, escape codes, arrows
+          if (char.length === 1 && !domEvent.altKey && !domEvent.ctrlKey && !domEvent.metaKey) {
+            inputBuffer += char;
+            term.write(char);
+          }
         }
-        setInput(commandHistory[next]);
-        return next;
       });
-      return;
+    };
+
+    initTerm();
+
+    // Resize observer to auto-fit terminal on container change
+    const resizeObserver = new ResizeObserver(() => {
+      if (fitAddon && term) {
+        try {
+          fitAddon.fit();
+        } catch {}
+      }
+    });
+
+    if (terminalRef.current) {
+      resizeObserver.observe(terminalRef.current);
     }
 
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (historyIndex === null) return;
-      const next = historyIndex + 1;
-      if (next >= commandHistory.length) {
-        setHistoryIndex(null);
-        setInput(historyDraft);
-      } else {
-        setHistoryIndex(next);
-        setInput(commandHistory[next]);
+    return () => {
+      isMounted = false;
+      resizeObserver.disconnect();
+      if (term) {
+        term.dispose();
       }
-    }
-  }
+    };
+  }, [prefs.theme, prefs.fontSize]);
 
   return (
     <div className="space-y-4">
-      <div>
-        <h2 className="text-2xl font-bold text-white">Terminal Simulator</h2>
-        <p className="mt-1 text-sm text-gray-400">
-          Three-tier simulation with local execution, AI runtime, and DB fallback.
-        </p>
+      {/* Title & Control Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold text-white tracking-tight flex items-center gap-2">
+            <TermIcon className="h-6 w-6 text-[#E95420]" />
+            Immersive Ubuntu Terminal
+          </h2>
+          <p className="mt-1 text-sm text-gray-400">
+            Learn commands safely via an interactive sandbox environment with live state tracking.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={handleResetSandbox}
+            className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-all hover:bg-white/10 hover:text-white"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            Reset Sandbox VM
+          </button>
+        </div>
       </div>
 
-      <div
-        className={`flex min-h-[540px] flex-col rounded-xl border border-white/10 bg-[#06070b] p-4 font-mono ${fontClassMap[prefs.fontSize]}`}
-      >
-        <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto pr-1">
-          {entries.map((entry) => (
-            <div key={entry.id} className="space-y-1">
-              <div className={theme.command}>
-                <span className={theme.prompt}>user@linlearn</span>
-                <span className="text-gray-600">:</span>
-                <span className={theme.path}>{promptPath(entry.cwd)}</span>$ {entry.command}
-              </div>
+      {/* Main Layout Grid */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-10">
+        
+        {/* Left: Terminal container (70% width) */}
+        <div className="lg:col-span-7 flex flex-col rounded-xl border border-white/10 bg-[#06070a] overflow-hidden shadow-2xl">
+          {/* Simulated Ubuntu window header */}
+          <div className="flex items-center justify-between bg-[#15161c] px-4 py-2 border-b border-white/5">
+            <div className="flex items-center gap-2">
+              <div className="h-3 w-3 rounded-full bg-rose-500/80" />
+              <div className="h-3 w-3 rounded-full bg-amber-500/80" />
+              <div className="h-3 w-3 rounded-full bg-emerald-500/80" />
+              <span className="ml-2 text-xs font-semibold text-gray-400 font-mono select-none">
+                user@linlearn: {osState.cwd} (virtual OS)
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-xs font-mono text-gray-500">
+              <span>bash</span>
+            </div>
+          </div>
+          
+          {/* Terminal Canvas Container */}
+          <div className="p-2 min-h-[500px] flex-1 flex flex-col justify-stretch">
+            <div 
+              ref={terminalRef} 
+              className="w-full flex-1 overflow-hidden" 
+              style={{ minHeight: "480px" }}
+            />
+          </div>
+        </div>
 
-              <div className="space-y-0.5">
-                {(entry.output || "").split("\n").map((line, lineIndex) => (
-                  <div key={`${entry.id}-${lineIndex}`} className="flex gap-2">
-                    {prefs.showSourceTags && (
-                      <span className="w-10 shrink-0 text-[10px] uppercase tracking-wide text-gray-600">
-                        {sourceTag(entry.source)}
-                      </span>
-                    )}
-                    <span className={`${theme.output} whitespace-pre-wrap break-words`}>{line}</span>
+        {/* Right: Learning Dashboard Control Panel (30% width) */}
+        <div className="lg:col-span-3 flex flex-col rounded-xl border border-white/10 bg-white/[0.02] backdrop-blur-md overflow-hidden">
+          {/* Tab Navigation */}
+          <div className="flex border-b border-white/10 bg-white/[0.02]">
+            <button
+              onClick={() => setActiveTab("missions")}
+              className={`flex-1 py-3 text-xs font-bold tracking-wider uppercase border-b-2 flex items-center justify-center gap-1.5 transition-all ${
+                activeTab === "missions"
+                  ? "border-[#E95420] text-white bg-white/[0.04]"
+                  : "border-transparent text-gray-400 hover:text-white"
+              }`}
+            >
+              <Award className="h-3.5 w-3.5" />
+              Missions ({completedCount}/4)
+            </button>
+            <button
+              onClick={() => setActiveTab("explanations")}
+              className={`flex-1 py-3 text-xs font-bold tracking-wider uppercase border-b-2 flex items-center justify-center gap-1.5 transition-all ${
+                activeTab === "explanations"
+                  ? "border-[#E95420] text-white bg-white/[0.04]"
+                  : "border-transparent text-gray-400 hover:text-white"
+              }`}
+            >
+              <BookOpen className="h-3.5 w-3.5" />
+              Command Info
+            </button>
+            <button
+              onClick={() => setActiveTab("interview")}
+              className={`flex-1 py-3 text-xs font-bold tracking-wider uppercase border-b-2 flex items-center justify-center gap-1.5 transition-all ${
+                activeTab === "interview"
+                  ? "border-[#E95420] text-white bg-white/[0.04]"
+                  : "border-transparent text-gray-400 hover:text-white"
+              }`}
+            >
+              <HelpCircle className="h-3.5 w-3.5" />
+              Interview Prep
+            </button>
+          </div>
+
+          {/* Tab Contents */}
+          <div className="p-4 flex-1 overflow-y-auto space-y-4 max-h-[500px]">
+            {activeTab === "missions" && (
+              <div className="space-y-3">
+                <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-semibold text-emerald-300">Sandbox Challenges</p>
+                    <p className="text-[11px] text-gray-400 mt-0.5">Complete missions to log skills and earn XP!</p>
                   </div>
-                ))}
-                {!entry.output && (
-                  <div className="flex gap-2">
-                    {prefs.showSourceTags && (
-                      <span className="w-10 shrink-0 text-[10px] uppercase tracking-wide text-gray-700">
-                        {sourceTag(entry.source)}
+                  <div className="text-right">
+                    <span className="text-xl font-extrabold text-emerald-400">{Math.round((completedCount/4)*100)}%</span>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  {missions.map((mission) => (
+                    <div 
+                      key={mission.id} 
+                      className={`p-3 rounded-lg border transition-all ${
+                        mission.completed 
+                          ? "bg-emerald-500/5 border-emerald-500/20" 
+                          : "bg-white/[0.02] border-white/5 hover:border-white/10"
+                      }`}
+                    >
+                      <div className="flex items-start gap-2">
+                        {mission.completed ? (
+                          <CheckCircle className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
+                        ) : (
+                          <div className="h-4 w-4 rounded-full border-2 border-gray-600 shrink-0 mt-0.5" />
+                        )}
+                        <div>
+                          <p className={`text-sm font-semibold ${mission.completed ? "text-gray-300 line-through" : "text-white"}`}>
+                            {mission.title}
+                          </p>
+                          <p className="text-xs text-gray-400 mt-1 leading-relaxed">
+                            {mission.desc}
+                          </p>
+                          {!mission.completed && (
+                            <div className="mt-2 p-1.5 rounded bg-black/40 border border-white/5 font-mono text-[10px] text-gray-300 flex items-center justify-between">
+                              <span>{mission.hint}</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {activeTab === "explanations" && (
+              <div className="space-y-4">
+                {commandExpl ? (
+                  <div className="space-y-3 font-mono">
+                    <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                      <h3 className="text-lg font-bold text-white">{commandExpl.name}</h3>
+                      <span className={`text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded ${
+                        commandExpl.difficulty === "Beginner" 
+                          ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" 
+                          : commandExpl.difficulty === "Intermediate"
+                            ? "bg-amber-500/10 text-amber-300 border border-amber-500/20"
+                            : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                      }`}>
+                        {commandExpl.difficulty}
                       </span>
+                    </div>
+
+                    <div>
+                      <p className="text-xs text-gray-300 font-sans leading-relaxed">{commandExpl.desc}</p>
+                    </div>
+
+                    {commandExpl.flagsUsed.length > 0 && (
+                      <div className="space-y-2">
+                        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Flags Explanations</p>
+                        <div className="space-y-1.5">
+                          {commandExpl.flagsUsed.map((fu) => (
+                            <div key={fu.flag} className="p-2 rounded bg-black/40 border border-white/5 text-xs">
+                              <span className="text-[#E95420] font-bold">{fu.flag}</span>
+                              <span className="text-gray-400 text-[11px] block mt-0.5 font-sans">{fu.desc}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     )}
+
+                    {commandExpl.related.length > 0 && (
+                      <div className="space-y-1.5 border-t border-white/5 pt-2">
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide">Related Commands</p>
+                        <div className="flex flex-wrap gap-1">
+                          {commandExpl.related.map((rc) => (
+                            <span key={rc} className="text-[11px] bg-white/5 border border-white/10 text-gray-300 px-1.5 py-0.5 rounded">
+                              {rc}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-center py-8 text-gray-500 font-sans">
+                    <p className="text-sm">Run a command in the terminal to view detailed explanations and flags analysis.</p>
                   </div>
                 )}
               </div>
-            </div>
-          ))}
-        </div>
+            )}
 
-        <form onSubmit={handleSubmit} className="mt-3 border-t border-white/10 pt-3">
-          <div className="flex items-center gap-2">
-            <span className={theme.prompt}>user@linlearn</span>
-            <span className="text-gray-600">:</span>
-            <span className={theme.path}>{promptPath(cwd)}</span>
-            <span className="text-gray-500">$</span>
-            <input
-              ref={inputRef}
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={handleHistoryNavigation}
-              disabled={loading}
-              className={`w-full bg-transparent ${theme.command} focus:outline-none`}
-              autoComplete="off"
-              spellCheck={false}
-            />
-            {loading ? (
-              <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
-            ) : (
-              <span className="terminal-cursor text-gray-400">|</span>
+            {activeTab === "interview" && (
+              <div className="space-y-3 font-sans">
+                <div className="p-3 rounded-lg bg-indigo-500/10 border border-indigo-500/20">
+                  <p className="text-sm font-semibold text-indigo-300">DevOps Q&A Flashcards</p>
+                  <p className="text-[11px] text-gray-400 mt-0.5">Click questions to reveal model answers.</p>
+                </div>
+
+                <div className="space-y-2.5">
+                  {INTERVIEW_PREP_DATA.map((card, idx) => (
+                    <details 
+                      key={idx} 
+                      className="group p-3 rounded-lg border border-white/5 bg-white/[0.01] hover:border-white/10 transition-all select-none cursor-pointer"
+                    >
+                      <summary className="text-xs font-semibold text-gray-300 group-open:text-white flex items-center justify-between list-none">
+                        <span>{idx + 1}. {card.q}</span>
+                        <span className="text-indigo-400 font-bold text-base transition-transform group-open:rotate-45">+</span>
+                      </summary>
+                      <p className="mt-2 text-[11px] text-gray-400 border-t border-white/5 pt-2 leading-relaxed">
+                        {card.a}
+                      </p>
+                    </details>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
-        </form>
+        </div>
       </div>
     </div>
   );

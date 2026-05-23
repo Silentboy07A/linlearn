@@ -10,7 +10,6 @@ interface SettingsProps {
   onUsernameChange: (value: string) => void;
   onThemeChange: (theme: TerminalTheme) => void;
   onFontSizeChange: (size: TerminalFontSize) => void;
-  onShowTagsToggle: (value: boolean) => void;
   onResetXp: () => void;
   onResetStreak: () => void;
 }
@@ -24,7 +23,6 @@ export function Settings({
   onUsernameChange,
   onThemeChange,
   onFontSizeChange,
-  onShowTagsToggle,
   onResetXp,
   onResetStreak,
 }: SettingsProps) {
@@ -168,28 +166,7 @@ export function Settings({
         </div>
       </GlassCard>
 
-      <GlassCard className="space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-sm text-gray-300">Show terminal source tags</p>
-            <p className="text-xs text-gray-500">Display [AI], [DB], and [local] next to output lines.</p>
-          </div>
-          <button
-            type="button"
-            onClick={() => {
-              onShowTagsToggle(!prefs.showSourceTags);
-              showSaveStatus(`Source tags turned ${!prefs.showSourceTags ? "ON" : "OFF"}!`);
-            }}
-            className={`micro-button rounded-full border px-3 py-1 text-xs ${
-              prefs.showSourceTags
-                ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
-                : "border-white/10 text-gray-300"
-            }`}
-          >
-            {prefs.showSourceTags ? "ON" : "OFF"}
-          </button>
-        </div>
-      </GlassCard>
+
 
       <GlassCard className="space-y-3">
         <p className="text-sm text-gray-400">Danger zone</p>

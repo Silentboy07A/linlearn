@@ -73,16 +73,17 @@ const SUGGESTIONS: Record<string, string[]> = {
 
 const WELCOME_MSG: ChatMessage = {
   role: "assistant",
-  content: `Welcome to **LinLearn AI** — your personal Linux tutor! 🐧
+  content: `SYSTEM DIAGNOSTIC: LinLearn Educational Terminal Core v1.0.0
 
-I can help you with:
-- \`Linux commands\` and their usage
-- **File system** navigation and management
-- **Networking**, **permissions**, **package management**
-- Shell scripting and automation
-- Docker, Git, and DevOps tools
+Welcome to the LinLearn interactive Linux training and command analysis terminal.
+Enter a command query, permissions task, or scripting architecture question to generate a structured system impact audit.
 
-💡 *Try clicking a category below or just ask me anything!*`,
+Core modules available for reference:
+* virtualfs   - Local filesystem sandbox state
+* networkfs   - Virtual ports, routing, and sockets
+* container   - Virtual docker engine processes
+* pkgmgr      - Apt package installation indexing
+* permissions - SUID/SGID, chown, chmod operations`,
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -182,6 +183,268 @@ function extractExplanation(content: string): ExplanationPanel {
   return panel;
 }
 
+interface ChatbotConsoleCard {
+  isConsoleCard: boolean;
+  severity: "INFO" | "WARNING" | "CRITICAL" | "BLOCKED" | "SIMULATED";
+  command: string;
+  impact: string[];
+  sandboxStatus: string;
+  safeAlternatives: string[];
+  summary?: string;
+}
+
+function parseConsoleCard(content: string): ChatbotConsoleCard {
+  const lines = content.split("\n").map((l) => l.trim());
+
+  // Validate if it fits a console card format
+  const hasCommand = lines.some((l) => l.toLowerCase() === "command:");
+  const hasImpact = lines.some((l) => l.toLowerCase() === "impact:");
+  const hasSandbox = lines.some((l) => l.toLowerCase() === "sandbox status:");
+  const hasAlternatives = lines.some((l) => l.toLowerCase() === "safe alternatives:");
+
+  if (!hasCommand || !hasImpact || !hasSandbox || !hasAlternatives) {
+    return {
+      isConsoleCard: false,
+      severity: "INFO",
+      command: "",
+      impact: [],
+      sandboxStatus: "",
+      safeAlternatives: [],
+      summary: "",
+    };
+  }
+
+  let severity: ChatbotConsoleCard["severity"] = "INFO";
+  
+  // Find first non-empty line to extract severity
+  const firstLine = lines.find((l) => l !== "") || "";
+  const firstLineUpper = firstLine.toUpperCase();
+
+  if (firstLineUpper.includes("CRITICAL")) {
+    severity = "CRITICAL";
+  } else if (firstLineUpper.includes("BLOCKED")) {
+    severity = "BLOCKED";
+  } else if (firstLineUpper.includes("SIMULATED")) {
+    severity = "SIMULATED";
+  } else if (firstLineUpper.includes("WARNING")) {
+    severity = "WARNING";
+  } else if (firstLineUpper.includes("INFO")) {
+    severity = "INFO";
+  }
+
+  let command = "";
+  const impact: string[] = [];
+  let sandboxStatus = "";
+  const safeAlternatives: string[] = [];
+  let summary = "";
+
+  let currentSection: "none" | "command" | "impact" | "sandbox" | "alternatives" | "summary" = "none";
+
+  for (const line of lines) {
+    if (line === "") continue;
+
+    const lineLower = line.toLowerCase();
+
+    // Check if line is the legacy SEVERITY indicator
+    if (lineLower.startsWith("severity:")) {
+      const level = line.replace(/severity:/i, "").trim().toUpperCase();
+      if (level.includes("CRITICAL")) severity = "CRITICAL";
+      else if (level.includes("BLOCKED")) severity = "BLOCKED";
+      else if (level.includes("SIMULATED")) severity = "SIMULATED";
+      else if (level.includes("WARNING")) severity = "WARNING";
+      else if (level.includes("INFO")) severity = "INFO";
+      continue;
+    }
+
+    if (lineLower === "command:") {
+      currentSection = "command";
+      continue;
+    }
+    if (lineLower === "impact:") {
+      currentSection = "impact";
+      continue;
+    }
+    if (lineLower === "sandbox status:") {
+      currentSection = "sandbox";
+      continue;
+    }
+    if (lineLower === "safe alternatives:") {
+      currentSection = "alternatives";
+      continue;
+    }
+    if (lineLower.startsWith("detailed technical summary:") || lineLower.startsWith("summary:") || lineLower.startsWith("context:")) {
+      currentSection = "summary";
+      continue;
+    }
+
+    // Skip the severity header line itself
+    const isHeaderLine = 
+      lineLower.includes("critical warning") ||
+      lineLower === "critical" ||
+      lineLower === "blocked" ||
+      lineLower === "simulated" ||
+      lineLower === "warning" ||
+      lineLower === "info";
+    
+    if (isHeaderLine && currentSection === "none") {
+      continue;
+    }
+
+    if (currentSection === "command") {
+      command = line;
+    } else if (currentSection === "impact") {
+      if (line.startsWith("*") || line.startsWith("-")) {
+        impact.push(line.replace(/^[-*]\s*/, "").trim());
+      } else {
+        impact.push(line);
+      }
+    } else if (currentSection === "sandbox") {
+      sandboxStatus = line;
+    } else if (currentSection === "alternatives") {
+      if (line.startsWith("*") || line.startsWith("-")) {
+        safeAlternatives.push(line.replace(/^[-*]\s*/, "").trim());
+      } else if (line !== "None" && line !== "none") {
+        safeAlternatives.push(line);
+      }
+    } else if (currentSection === "summary") {
+      summary = summary ? summary + " " + line : line;
+    }
+  }
+
+  return {
+    isConsoleCard: true,
+    severity,
+    command,
+    impact,
+    sandboxStatus,
+    safeAlternatives,
+    summary,
+  };
+}
+
+function ConsoleCardView({ card }: { card: ChatbotConsoleCard }) {
+  const styles = {
+    INFO: {
+      border: "border-l-4 border-emerald-500 bg-[#0c1612] border-white/5",
+      text: "text-emerald-400",
+      accentBg: "bg-emerald-950/20",
+      header: "[ INFO ] SYSTEM DIAGNOSTIC REPORT",
+    },
+    WARNING: {
+      border: "border-l-4 border-amber-500 bg-[#16130c] border-white/5",
+      text: "text-amber-400",
+      accentBg: "bg-amber-950/20",
+      header: "[ WARNING ] PRIVILEGE OR CONFIGURATION OPERATION",
+    },
+    CRITICAL: {
+      border: "border-l-4 border-rose-500 bg-[#160d0e] border-white/5",
+      text: "text-rose-400",
+      accentBg: "bg-rose-950/20",
+      header: "[ CRITICAL WARNING ] DESTRUCTIVE OPERATIONAL RISK",
+    },
+    BLOCKED: {
+      border: "border-l-4 border-red-600 bg-[#180a0c] border-white/5 animate-pulse",
+      text: "text-red-500 font-extrabold",
+      accentBg: "bg-red-950/30",
+      header: "[ BLOCKED ] ACCESS DENIED / HOST PROTECTION ACTIVE",
+    },
+    SIMULATED: {
+      border: "border-l-4 border-sky-500 bg-[#0d141c] border-white/5",
+      text: "text-sky-400",
+      accentBg: "bg-sky-950/20",
+      header: "[ SIMULATED ] VIRTUAL SUBSYSTEM EMULATION",
+    },
+  }[card.severity];
+
+  const handleCopy = (txt: string) => {
+    navigator.clipboard.writeText(txt);
+  };
+
+  return (
+    <div className={`w-full rounded-lg border p-4 font-mono shadow-md ${styles.border}`}>
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-white/10 pb-2 mb-3">
+        <span className={`text-xs font-bold tracking-wider ${styles.text}`}>
+          {styles.header}
+        </span>
+        <span className="text-[10px] text-gray-500 font-sans">linlearn-auditd</span>
+      </div>
+
+      {/* Target Command */}
+      {card.command && card.command !== "None" && card.command !== "none" && (
+        <div className="mb-3">
+          <span className="text-[10px] text-gray-500 uppercase block mb-1">Command:</span>
+          <code className="text-white bg-black/40 border border-white/10 px-2 py-1 rounded text-xs inline-block">
+            {card.command}
+          </code>
+        </div>
+      )}
+
+      {/* Impact */}
+      {card.impact.length > 0 && (
+        <div className="mb-3">
+          <span className="text-[10px] text-gray-500 uppercase block mb-1">Impact:</span>
+          <ul className="space-y-1">
+            {card.impact.map((point, i) => (
+              <li key={i} className="flex items-start gap-1.5 text-xs text-gray-300">
+                <span className={`${styles.text} shrink-0`}>*</span>
+                <span>{point}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Sandbox Status */}
+      {card.sandboxStatus && (
+        <div className="mb-3">
+          <span className="text-[10px] text-gray-500 uppercase block mb-1">Sandbox Status:</span>
+          <span className={`text-xs font-semibold ${
+            card.sandboxStatus.toLowerCase().includes("block") 
+              ? "text-red-400" 
+              : card.sandboxStatus.toLowerCase().includes("simul") 
+                ? "text-sky-300" 
+                : "text-emerald-300"
+          }`}>
+            {card.sandboxStatus}
+          </span>
+        </div>
+      )}
+
+      {/* Recommended Alternatives */}
+      {card.safeAlternatives && card.safeAlternatives.length > 0 && (
+        <div className="mb-3">
+          <span className="text-[10px] text-gray-500 uppercase block mb-1">Safe Alternatives:</span>
+          <div className="space-y-1.5 max-w-md">
+            {card.safeAlternatives.map((alt, i) => (
+              <div 
+                key={i} 
+                className="flex items-center justify-between gap-3 bg-black/40 hover:bg-black/60 px-2.5 py-1 rounded border border-white/5 group transition-colors cursor-pointer"
+                onClick={() => handleCopy(alt)}
+                title="Click to copy command"
+              >
+                <code className="text-sky-300 text-xs">$ {alt}</code>
+                <span className="opacity-0 group-hover:opacity-100 text-[10px] text-gray-500 flex items-center gap-1 transition-opacity">
+                  <Copy className="h-3 w-3" />
+                  <span>Copy</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Technical Context Summary */}
+      {card.summary && (
+        <div className="border-t border-white/5 pt-3 mt-3">
+          <span className="text-[10px] text-gray-500 uppercase block mb-1">Technical Context:</span>
+          <p className="text-xs text-gray-400 leading-relaxed font-sans">{card.summary}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
 function CopyBtn({ text }: { text: string }) {
@@ -250,6 +513,7 @@ function TypingIndicator() {
 function MessageBubble({ message, index }: { message: ChatMessage; index: number }) {
   const isUser = message.role === "user";
   const blocks = parseContent(message.content);
+  const consoleCard = !isUser ? parseConsoleCard(message.content) : null;
 
   return (
     <motion.div
@@ -273,6 +537,8 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
             </div>
             <p className="text-sm text-white">{message.content}</p>
           </div>
+        ) : consoleCard && consoleCard.isConsoleCard ? (
+          <ConsoleCardView card={consoleCard} />
         ) : (
           <div className="rounded-xl rounded-tl-sm border border-white/8 bg-[#0d1017]/70 px-4 py-3">
             <div className="flex items-center gap-1.5 mb-2">

@@ -149,13 +149,6 @@ export default function DashboardPage() {
     });
   }, []);
 
-  const handleShowTagsToggle = useCallback((showSourceTags: boolean) => {
-    setTerminalPrefs((prev) => {
-      const next = { ...prev, showSourceTags };
-      localStorage.setItem("terminalPrefs", JSON.stringify(next));
-      return next;
-    });
-  }, []);
 
   const handleCopy = useCallback(() => {
     // Handled in sub-components
@@ -424,7 +417,6 @@ export default function DashboardPage() {
             onUsernameChange={handleUsernameChange}
             onThemeChange={handleThemeChange}
             onFontSizeChange={handleFontSizeChange}
-            onShowTagsToggle={handleShowTagsToggle}
             onResetXp={handleResetXp}
             onResetStreak={handleResetStreak}
           />

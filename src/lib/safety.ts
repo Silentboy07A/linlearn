@@ -57,3 +57,60 @@ export function checkDangerousCommand(cmd: string): DangerCheckResult | null {
   }
   return null;
 }
+
+
+const DANGEROUS_OPERATORS = [
+  "|",
+  "&&",
+  ";",
+  "`",
+  "$()",
+  ">",
+  "<",
+  "../..",
+  "~/.."
+];
+
+export interface ValidationResult {
+  valid: boolean;
+  error?: string;
+}
+
+export function validateTerminalCommand(commandLine: string): ValidationResult {
+  const trimmed = commandLine.trim();
+  if (!trimmed) {
+    return { valid: true };
+  }
+
+  // 1. Check for dangerous operators and traversals
+  for (const op of DANGEROUS_OPERATORS) {
+    if (trimmed.includes(op)) {
+      return {
+        valid: false,
+        error: `Permission denied: Dangerous operator or path traversal '${op}' is blocked.`
+      };
+    }
+  }
+
+  // 2. Tokenize to find the base command and arguments
+  const args = trimmed.split(/\s+/);
+  const baseCommand = args[0];
+
+  // 3. Block destructive rm
+  if (baseCommand === "rm" && (args.includes("-rf") || args.includes("-f") || args.includes("/")) && (args.includes("/") || args.includes("*"))) {
+    return {
+      valid: false,
+      error: "LinLearn Sandbox:\nDestructive filesystem operations are disabled."
+    };
+  }
+
+  // 4. Block destructive OS commands
+  if (["dd", "mkfs", "fdisk", "shutdown", "reboot", "poweroff", "halt"].includes(baseCommand)) {
+    return {
+      valid: false,
+      error: "LinLearn Sandbox:\nDestructive operating system commands are disabled."
+    };
+  }
+
+  return { valid: true };
+}
