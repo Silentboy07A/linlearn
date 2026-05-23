@@ -28,7 +28,9 @@ interface WindowWithV86 extends Window {
     wasm_path: string;
     bios: { url: string };
     vga_bios: { url: string };
-    cdrom: { url: string };
+    bzimage?: { url: string; async?: boolean };
+    cdrom?: { url: string };
+    cmdline?: string;
     autostart: boolean;
     initial_state?: { buffer: ArrayBuffer };
   }) => V86StarterInstance;
@@ -767,7 +769,7 @@ export function TerminalSimulator({
               return;
             }
             const script = document.createElement("script");
-            script.src = "https://copy.sh/v86/build/libv86.js";
+            script.src = "/v86/libv86.js";
             script.async = true;
             script.onload = () => resolve();
             script.onerror = (err) => reject(err);
@@ -794,20 +796,23 @@ export function TerminalSimulator({
             wasm_path: string;
             bios: { url: string };
             vga_bios: { url: string };
-            cdrom: { url: string };
+            bzimage: { url: string; async?: boolean };
+            cmdline: string;
             autostart: boolean;
             initial_state?: { buffer: ArrayBuffer };
           } = {
-            wasm_path: "https://copy.sh/v86/build/v86.wasm",
+            wasm_path: "/v86/v86.wasm",
             bios: {
-              url: "https://copy.sh/v86/bios/seabios.bin",
+              url: "/v86/bios/seabios.bin",
             },
             vga_bios: {
-              url: "https://copy.sh/v86/bios/vgabios.bin",
+              url: "/v86/bios/vgabios.bin",
             },
-            cdrom: {
-              url: "https://copy.sh/v86/images/linux4.iso",
+            bzimage: {
+              url: "/v86/images/bzImage",
+              async: false,
             },
+            cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
             autostart: true,
           };
 
