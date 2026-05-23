@@ -6,11 +6,11 @@ LinLearn combines ultra-fast AI generation with interactive learning tools, offe
 
 ##  Features
 
-- ** AI Mock Interviews:** Practice your Linux and DevOps skills with a conversational AI interviewer that provides real-time feedback.
-- ** Cheat Sheet Generator:** Instantly generate custom, formatted cheat sheets for any Linux command or concept.
-- ** Command & Script Generator:** Describe what you want to do in plain English, and get secure, optimized bash scripts or one-line commands.
-- ** Error Explainer:** Paste confusing terminal errors and get plain-English explanations and step-by-step solutions.
-- ** Lightning Fast AI:** Powered by Groq's LPU inference engine for near-instant AI responses.
+-  AI Mock Interviews: Practice your Linux and DevOps skills with a conversational AI interviewer that provides real-time feedback.
+-  Cheat Sheet Generator:Instantly generate custom, formatted cheat sheets for any Linux command or concept.
+-  Command & Script Generator: Describe what you want to do in plain English, and get secure, optimized bash scripts or one-line commands.
+-  Error Explainer: Paste confusing terminal errors and get plain-English explanations and step-by-step solutions.
+-  Lightning Fast AI: Powered by Groq's LPU inference engine for near-instant AI responses.
 
 ##  Tech Stack
 
