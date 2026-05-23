@@ -1,18 +1,18 @@
-# 🐧 LinLearn
+#  LinLearn
 
 > An intelligent, AI-powered platform designed to help developers and students master Linux commands, shell scripting, and terminal environments.
 
 LinLearn combines ultra-fast AI generation with interactive learning tools, offering mock interviews, cheat sheet generation, and intelligent error explanations. Built with a modern, secure, and highly scalable serverless architecture.
 
-## ✨ Features
+##  Features
 
-- **🤖 AI Mock Interviews:** Practice your Linux and DevOps skills with a conversational AI interviewer that provides real-time feedback.
-- **📄 Cheat Sheet Generator:** Instantly generate custom, formatted cheat sheets for any Linux command or concept.
-- **💻 Command & Script Generator:** Describe what you want to do in plain English, and get secure, optimized bash scripts or one-line commands.
-- **🔍 Error Explainer:** Paste confusing terminal errors and get plain-English explanations and step-by-step solutions.
-- **⚡ Lightning Fast AI:** Powered by Groq's LPU inference engine for near-instant AI responses.
+- ** AI Mock Interviews:** Practice your Linux and DevOps skills with a conversational AI interviewer that provides real-time feedback.
+- ** Cheat Sheet Generator:** Instantly generate custom, formatted cheat sheets for any Linux command or concept.
+- ** Command & Script Generator:** Describe what you want to do in plain English, and get secure, optimized bash scripts or one-line commands.
+- ** Error Explainer:** Paste confusing terminal errors and get plain-English explanations and step-by-step solutions.
+- ** Lightning Fast AI:** Powered by Groq's LPU inference engine for near-instant AI responses.
 
-## 🛠️ Tech Stack
+##  Tech Stack
 
 This project is built using a modern, production-ready stack:
 
@@ -24,7 +24,7 @@ This project is built using a modern, production-ready stack:
 - **Rate Limiting & Quotas:** [Upstash Redis](https://upstash.com/)
 - **Hosting:** [Vercel](https://vercel.com/) (Serverless & Edge)
 
-## 🔒 Enterprise-Grade Security
+##  Enterprise-Grade Security
 
 LinLearn is built with security as a first-class citizen:
 
@@ -34,7 +34,7 @@ LinLearn is built with security as a first-class citizen:
 - **Prompt Sanitization:** Incoming prompts are stripped of malicious tags to prevent prompt injection attacks.
 - **Secure Auth:** JWT-based sessions securely handled via `HttpOnly` cookies.
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### Prerequisites
 
@@ -79,10 +79,10 @@ You will need accounts on the following platforms to run this project:
 5. **Open your browser**
    Navigate to [http://localhost:3000](http://localhost:3000) to see the application in action.
 
-## 🤝 Contributing
+## Contributing
 
 Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/Silentboy07A/linlearn/issues).
 
-## 📄 License
+##  License
 
 This project is licensed under the MIT License.
