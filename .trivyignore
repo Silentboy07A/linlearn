@@ -1,0 +1,14 @@
+# Next.js 14.x Vulnerability Exclusions
+# Upgrading to Next.js 15/16 is a breaking change requiring React 19 migration and structural rewrites.
+# The following vulnerabilities are not exploitable in LinLearn's serverless edge environment:
+
+# Next.js Middleware / Proxy bypass in Pages Router i18n applications (LinLearn uses App Router only)
+CVE-2026-44573
+
+# Server-Side Request Forgery in Next.js applications using WebSocket upgrades (Vercel edge functions do not support WebSockets)
+CVE-2026-44578
+
+# Denial of Service in React Server Components
+GHSA-8h8q-6873-q5fj
+GHSA-h25m-26qc-wcjf
+GHSA-q4gf-8mx6-v5v3
