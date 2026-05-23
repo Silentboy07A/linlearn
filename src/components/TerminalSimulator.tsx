@@ -227,6 +227,7 @@ export function TerminalSimulator({
   // Virtual System State
   const [osState, setOsState] = useState<VirtualSystemState>(getInitialState);
   const [activeTab, setActiveTab] = useState<"explanations" | "missions" | "interview">("missions");
+  const [learningMode, setLearningMode] = useState<"Beginner" | "DevOps" | "Security" | "Interview Prep">("Beginner");
   const [lastCommand, setLastCommand] = useState<string>("");
 
   const terminalRef = useRef<HTMLDivElement>(null);
@@ -308,54 +309,133 @@ export function TerminalSimulator({
     const fs = osState.fs;
     const packages = osState.packages;
 
-    // Mission 1: Start Nginx container on port 80
-    const m1Complete = containers.some(
-      (c) => c.image.includes("nginx") && c.status.startsWith("Up") && c.ports.includes("80")
-    );
+    if (learningMode === "Beginner") {
+      const m1Complete = history.some((h) => h.trim() === "pwd" || h.trim() === "ls" || h.trim().startsWith("ls "));
+      const ProjectsNode = getNode(fs, "/home/user/Projects");
+      const m2Complete = !!ProjectsNode && ProjectsNode.type === "dir";
+      const configNode = getNode(fs, "/home/user/Projects/config.txt");
+      const m3Complete = !!configNode && configNode.type === "file";
 
-    // Mission 2: Inspect Nginx log
-    const m2Complete = history.some(
-      (h) => h.includes("cat ") && h.includes("access.log")
-    );
+      return [
+        {
+          id: "pwd_ls",
+          title: "Explore Directories",
+          desc: "Execute 'pwd' and 'ls' to identify active path mappings.",
+          hint: "pwd && ls",
+          completed: m1Complete
+        },
+        {
+          id: "mkdir_proj",
+          title: "Create Work Directory",
+          desc: "Create a new sub-folder directory at /home/user/Projects.",
+          hint: "mkdir -p /home/user/Projects",
+          completed: m2Complete
+        },
+        {
+          id: "touch_config",
+          title: "Create Configuration File",
+          desc: "Initialize an empty file at /home/user/Projects/config.txt.",
+          hint: "touch /home/user/Projects/config.txt",
+          completed: m3Complete
+        }
+      ];
+    }
 
-    // Mission 3: Create deploy.sh and make it executable
-    const deployNode = getNode(fs, "/home/user/Projects/deploy.sh");
-    const m3Complete = !!deployNode && deployNode.type === "file" && deployNode.permissions.includes("x");
+    if (learningMode === "DevOps") {
+      const m1Complete = containers.some(
+        (c) => c.image.includes("nginx") && c.status.startsWith("Up") && c.ports.includes("80")
+      );
+      const m2Complete = history.some(
+        (h) => h.includes("cat ") && h.includes("access.log")
+      );
+      const m3Complete = packages.has("htop");
 
-    // Mission 4: Install htop package
-    const m4Complete = packages.has("htop");
+      return [
+        {
+          id: "nginx",
+          title: "Deploy Nginx Container",
+          desc: "Start a Docker container running Nginx on port 80.",
+          hint: "docker run -d -p 80:80 nginx",
+          completed: m1Complete
+        },
+        {
+          id: "logs",
+          title: "Investigate Access Logs",
+          desc: "Inspect the Nginx access log file to see recent client hits.",
+          hint: "cat /var/log/nginx/access.log",
+          completed: m2Complete
+        },
+        {
+          id: "htop",
+          title: "Install htop Tool",
+          desc: "Install the system resource monitor package 'htop' using the package manager.",
+          hint: "apt install htop",
+          completed: m3Complete
+        }
+      ];
+    }
+
+    if (learningMode === "Security") {
+      const deployNode = getNode(fs, "/home/user/Projects/deploy.sh");
+      const m1Complete = !!deployNode && deployNode.type === "file" && deployNode.permissions.includes("x");
+      const configNode = getNode(fs, "/home/user/Projects/config.txt");
+      const m2Complete = !!configNode && !configNode.permissions.includes("w");
+      const m3Complete = history.some((h) => h.includes("rm -rf") || h.includes("chmod 777 /") || h.includes("mkfs"));
+
+      return [
+        {
+          id: "permissions",
+          title: "Create Executable Script",
+          desc: "Create a file at /home/user/Projects/deploy.sh and make it executable.",
+          hint: "touch /home/user/Projects/deploy.sh && chmod +x /home/user/Projects/deploy.sh",
+          completed: m1Complete
+        },
+        {
+          id: "lock_config",
+          title: "Lock Config Permissions",
+          desc: "Remove write access permissions from /home/user/Projects/config.txt.",
+          hint: "chmod 400 /home/user/Projects/config.txt",
+          completed: m2Complete
+        },
+        {
+          id: "audit_dangerous",
+          title: "Audit Sandbox Safeguards",
+          desc: "Test security safeguards by executing a dangerous command (e.g. rm -rf /).",
+          hint: "rm -rf /",
+          completed: m3Complete
+        }
+      ];
+    }
+
+    // Interview Prep
+    const m1Complete = history.some((h) => h.includes("uname") || h.includes("whoami"));
+    const m2Complete = history.some((h) => h.includes("systemctl") || h.includes("service"));
+    const m3Complete = history.some((h) => h.includes("ps") || h.includes("top"));
 
     return [
       {
-        id: "nginx",
-        title: "Deploy Nginx Container",
-        desc: "Start a Docker container running Nginx on port 80.",
-        hint: "docker run -d -p 80:80 nginx",
+        id: "sysinfo",
+        title: "Query System Info",
+        desc: "Query virtual hostname and current user login context.",
+        hint: "whoami && uname -a",
         completed: m1Complete
       },
       {
-        id: "logs",
-        title: "Investigate Access Logs",
-        desc: "Inspect the Nginx access log file to see recent client hits.",
-        hint: "cat /var/log/nginx/access.log",
+        id: "services",
+        title: "Review systemd Status",
+        desc: "Inspect active service configurations on the system.",
+        hint: "systemctl status nginx.service",
         completed: m2Complete
       },
       {
-        id: "permissions",
-        title: "Create Executable Script",
-        desc: "Create a file at /home/user/Projects/deploy.sh and make it executable.",
-        hint: "touch /home/user/Projects/deploy.sh && chmod +x /home/user/Projects/deploy.sh",
+        id: "processes",
+        title: "Inspect Process Tree",
+        desc: "Query standard process listing tables.",
+        hint: "ps aux",
         completed: m3Complete
-      },
-      {
-        id: "htop",
-        title: "Install htop Tool",
-        desc: "Install the system resource monitor package 'htop' using the package manager.",
-        hint: "apt install htop",
-        completed: m4Complete
       }
     ];
-  }, [osState]);
+  }, [osState, learningMode]);
 
   // Track completed missions count
   const completedCount = useMemo(() => missions.filter((m) => m.completed).length, [missions]);
@@ -680,7 +760,7 @@ export function TerminalSimulator({
               }`}
             >
               <Award className="h-3.5 w-3.5" />
-              Missions ({completedCount}/4)
+              Missions ({completedCount}/{missions.length})
             </button>
             <button
               onClick={() => setActiveTab("explanations")}
@@ -710,13 +790,33 @@ export function TerminalSimulator({
           <div className="p-4 flex-1 overflow-y-auto space-y-4 max-h-[500px]">
             {activeTab === "missions" && (
               <div className="space-y-3">
+                {/* Learning Mode Selector */}
+                <div className="flex flex-col gap-1.5 p-2.5 rounded-lg border border-white/5 bg-black/20 mb-2">
+                  <span className="text-[10px] text-gray-500 font-mono uppercase font-bold tracking-wider">Learning Mode:</span>
+                  <div className="grid grid-cols-2 gap-1">
+                    {(["Beginner", "DevOps", "Security", "Interview Prep"] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        onClick={() => setLearningMode(mode)}
+                        className={`px-2 py-1 rounded text-[10px] font-mono text-center transition-all ${
+                          learningMode === mode 
+                            ? "bg-[#E95420]/25 text-[#E95420] border border-[#E95420]/30 font-bold" 
+                            : "bg-white/5 text-gray-400 border border-transparent hover:text-white"
+                        }`}
+                      >
+                        {mode}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-between">
                   <div>
                     <p className="text-sm font-semibold text-emerald-300">Sandbox Challenges</p>
                     <p className="text-[11px] text-gray-400 mt-0.5">Complete missions to log skills and earn XP!</p>
                   </div>
                   <div className="text-right">
-                    <span className="text-xl font-extrabold text-emerald-400">{Math.round((completedCount/4)*100)}%</span>
+                    <span className="text-xl font-extrabold text-emerald-400">{Math.round((completedCount/missions.length)*100)}%</span>
                   </div>
                 </div>
 
