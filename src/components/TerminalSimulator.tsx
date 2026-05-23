@@ -15,26 +15,7 @@ import {
 import { saveV86State, loadV86State, clearV86State } from "@/lib/v86db";
 import { updateMastery, DEFAULT_BKT_PARAMS, type LinuxTopic } from "@/lib/bkt";
 
-interface V86StarterInstance {
-  save_state: (cb: (err: unknown, state: ArrayBuffer) => void) => void;
-  destroy: () => void;
-  serial0_send: (data: string) => void;
-  add_listener: (event: string, cb: (char: string) => void) => void;
-  remove_listener: (event: string, cb: (char: string) => void) => void;
-}
 
-interface WindowWithV86 extends Window {
-  V86: new (config: {
-    wasm_path: string;
-    bios: { url: string };
-    vga_bios: { url: string };
-    bzimage?: { url: string; async?: boolean };
-    cdrom?: { url: string };
-    cmdline?: string;
-    autostart: boolean;
-    initial_state?: { buffer: ArrayBuffer };
-  }) => V86StarterInstance;
-}
 
 interface CustomTerminal extends Terminal {
   _simDisposable?: { dispose: () => void };
@@ -104,6 +85,26 @@ const COMMAND_TOPICS: Record<string, LinuxTopic> = {
   apt: "packages",
   man: "navigation"
 };
+
+// Helper function to calculate HMAC-SHA256 in the browser using the Web Cryptography API
+async function computeHMAC(keyStr: string, dataStr: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await window.crypto.subtle.importKey(
+    "raw",
+    enc.encode(keyStr),
+    { name: "HMAC", hash: { name: "SHA-256" } },
+    false,
+    ["sign"]
+  );
+  const signature = await window.crypto.subtle.sign(
+    "HMAC",
+    key,
+    enc.encode(dataStr)
+  );
+  return Array.from(new Uint8Array(signature))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 // Help dictionary for command metadata, difficulty levels, related commands, and flags
 const COMMAND_HELP_INFO: Record<string, {
@@ -335,7 +336,9 @@ export function TerminalSimulator({
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
-  const v86EmulatorRef = useRef<V86StarterInstance | null>(null);
+  const v86EmulatorRef = useRef<Worker | null>(null);
+  const validationResolverRef = useRef<((val: boolean) => void) | null>(null);
+  const validationBufferRef = useRef("");
   
   const [completedVasmMissions, setCompletedVasmMissions] = useState<Record<string, boolean>>({});
   const [validatingMissions, setValidatingMissions] = useState<Record<string, boolean>>({});
@@ -358,27 +361,11 @@ export function TerminalSimulator({
   };
 
   const handleSaveV86State = () => {
-    const emulator = v86EmulatorRef.current;
-    if (!emulator) return;
+    const worker = v86EmulatorRef.current;
+    if (!worker) return;
     
     setIsSavingV86(true);
-    emulator.save_state((error: unknown, state: ArrayBuffer) => {
-      if (error) {
-        console.error("Failed to save VM state:", error);
-        alert("Failed to save VM state.");
-        setIsSavingV86(false);
-      } else {
-        saveV86State(state).then(() => {
-          setIsSavingV86(false);
-          if (xtermInstance.current) {
-            xtermInstance.current.write("\r\n\x1b[1;32m[System] Virtual machine state successfully persisted to browser IndexedDB.\x1b[0m\r\n");
-          }
-        }).catch(err => {
-          console.error("Failed to save state to IndexedDB:", err);
-          setIsSavingV86(false);
-        });
-      }
-    });
+    worker.postMessage({ type: "SAVE_STATE" });
   };
 
   const handleResetV86State = () => {
@@ -395,35 +382,30 @@ export function TerminalSimulator({
 
   const runV86Validation = (command: string): Promise<boolean> => {
     return new Promise((resolve) => {
-      const emulator = v86EmulatorRef.current;
-      if (!emulator) {
+      const worker = v86EmulatorRef.current;
+      if (!worker) {
         resolve(false);
         return;
       }
 
       isCapturingValidationRef.current = true;
-      let capturedBuffer = "";
+      validationBufferRef.current = "";
+      validationResolverRef.current = resolve;
+
       const sentinelStart = "VAL_START_SENTINEL";
       const sentinelEnd = "VAL_END_SENTINEL";
 
-      const tempListener = (char: string) => {
-        capturedBuffer += char;
-        if (capturedBuffer.includes(sentinelEnd)) {
-          emulator.remove_listener("serial0-output-char", tempListener);
-          isCapturingValidationRef.current = false;
-          const success = capturedBuffer.includes("VAL_SUCCESS");
-          resolve(success);
-        }
-      };
-
-      emulator.add_listener("serial0-output-char", tempListener);
-      
-      emulator.serial0_send(`\nclear\necho "${sentinelStart}" && if ${command}; then echo "VAL_SUCCESS"; else echo "VAL_FAILURE"; fi && echo "${sentinelEnd}"\n`);
+      worker.postMessage({
+        type: "INPUT",
+        payload: `\nclear\necho "${sentinelStart}" && if ${command}; then echo "VAL_SUCCESS"; else echo "VAL_FAILURE"; fi && echo "${sentinelEnd}"\n`
+      });
 
       setTimeout(() => {
-        emulator.remove_listener("serial0-output-char", tempListener);
-        isCapturingValidationRef.current = false;
-        resolve(false);
+        if (validationResolverRef.current === resolve) {
+          isCapturingValidationRef.current = false;
+          validationResolverRef.current = null;
+          resolve(false);
+        }
       }, 4000);
     });
   };
@@ -446,13 +428,9 @@ export function TerminalSimulator({
     if (!isV86Mode || !v86EmulatorRef.current || v86Booting) return;
     
     const interval = setInterval(() => {
-      const emulator = v86EmulatorRef.current;
-      if (emulator && !isCapturingValidationRef.current) {
-        emulator.save_state((error: unknown, state: ArrayBuffer) => {
-          if (!error && state) {
-            saveV86State(state).catch(err => console.error("Auto-save failed:", err));
-          }
-        });
+      const worker = v86EmulatorRef.current;
+      if (worker && !isCapturingValidationRef.current) {
+        worker.postMessage({ type: "SAVE_STATE" });
       }
     }, 45000); // auto-save every 45 seconds
 
@@ -761,26 +739,7 @@ export function TerminalSimulator({
         
         setV86Booting(true);
 
-        // Load the libv86 script from CDN if not already loaded
-        const loadV86Script = () => {
-          return new Promise<void>((resolve, reject) => {
-            if ((window as unknown as WindowWithV86).V86) {
-              resolve();
-              return;
-            }
-            const script = document.createElement("script");
-            script.src = window.location.origin + "/v86/libv86.js";
-            script.async = true;
-            script.onload = () => resolve();
-            script.onerror = (err) => reject(err);
-            document.head.appendChild(script);
-          });
-        };
-
         try {
-          await loadV86Script();
-          if (!isMounted) return;
-
           // Attempt to load saved VM state from IndexedDB
           let savedState: ArrayBuffer | null = null;
           try {
@@ -792,85 +751,134 @@ export function TerminalSimulator({
             console.error("Failed to load saved state:", e);
           }
 
-          const origin = window.location.origin;
-          const v86Config: {
-            wasm_path: string;
-            bios: { url: string };
-            vga_bios: { url: string };
-            bzimage: { url: string; async?: boolean };
-            cmdline: string;
-            autostart: boolean;
-            initial_state?: { buffer: ArrayBuffer };
-          } = {
-            wasm_path: `${origin}/v86/v86.wasm`,
-            bios: {
-              url: `${origin}/v86/bios/seabios.bin`,
-            },
-            vga_bios: {
-              url: `${origin}/v86/bios/vgabios.bin`,
-            },
-            bzimage: {
-              url: `${origin}/v86/images/bzImage`,
-              async: false,
-            },
-            cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
-            autostart: true,
-          };
-
-          if (savedState) {
-            v86Config.initial_state = { buffer: savedState };
-          }
-
-          // Instantiate V86
-          const emulator = new (window as unknown as WindowWithV86).V86(v86Config);
-
-          v86EmulatorRef.current = emulator;
+          // Instantiate Web Worker
+          const worker = new Worker(new URL("../services/v86/v86.worker.ts", import.meta.url));
+          v86EmulatorRef.current = worker;
 
           let isFirstChar = true;
           let isProvisioned = false;
           let outputBuffer = "";
 
-          // Connect guest serial output to xterm.js terminal
-          emulator.add_listener("serial0-output-char", (char: string) => {
-            if (isCapturingValidationRef.current) {
-              return;
-            }
-            if (isFirstChar) {
-              isFirstChar = false;
-              setV86Booting(false);
-              term.clear();
-            }
-            term.write(char);
+          worker.onmessage = (e: MessageEvent) => {
+            const { type, payload } = e.data;
+            if (!isMounted) return;
 
-            // Provision guest environment silently once shell prompt is ready
-            if (!isProvisioned) {
-              outputBuffer += char;
-              if (outputBuffer.length > 64) {
-                outputBuffer = outputBuffer.substring(outputBuffer.length - 64);
-              }
-              if (outputBuffer.endsWith("~% ") || outputBuffer.endsWith("# ") || outputBuffer.endsWith("~# ")) {
-                isProvisioned = true;
-                isCapturingValidationRef.current = true;
+            switch (type) {
+              case "INIT_SUCCESS":
+                // VM initialized successfully
+                break;
+              case "INIT_FAILURE":
+                console.error("Failed to load v86 VM in worker:", payload);
+                term.write(`\r\n\x1b[1;31mError: Failed to fetch WebAssembly virtual machine libraries.\x1b[0m\r\n`);
+                term.write(`\x1b[1;30m[Debug Info] ${payload}\x1b[0m\r\n`);
+                term.write("Verify your internet connection and CORS configurations.\r\n");
+                setV86Booting(false);
+                break;
+              case "SERIAL_OUT":
+                const char = payload;
                 
-                // Write broken config files and mock log states
-                emulator.serial0_send("mkdir -p /etc/nginx && echo 'server { listen 80; root /var/www/html; syntax_error_here; }' > /etc/nginx/nginx.conf\n");
-                emulator.serial0_send("mkdir -p /var/log/nginx && echo '192.168.1.100 - - [23/May/2026:10:40:02 +0530] \"GET / HTTP/1.1\" 200 3126' > /var/log/nginx/access.log\n");
-                emulator.serial0_send("mkdir -p Projects\n");
-                
-                // Yield console print buffer back to user terminal cleanly
-                setTimeout(() => {
-                  emulator.serial0_send("clear\n");
-                  setTimeout(() => {
+                // Bridge outputs to PTY validation checker if active
+                if (isCapturingValidationRef.current && validationResolverRef.current) {
+                  validationBufferRef.current += char;
+                  if (validationBufferRef.current.includes("VAL_END_SENTINEL")) {
+                    const success = validationBufferRef.current.includes("VAL_SUCCESS");
                     isCapturingValidationRef.current = false;
-                  }, 200);
-                }, 1000);
-              }
+                    const resolve = validationResolverRef.current;
+                    validationResolverRef.current = null;
+                    resolve(success);
+                  }
+                  return;
+                }
+
+                // Standard terminal output bridge
+                if (isFirstChar) {
+                  isFirstChar = false;
+                  setV86Booting(false);
+                  term.clear();
+                }
+                term.write(char);
+                
+                // Silent provisioning checking
+                if (!isProvisioned) {
+                  outputBuffer += char;
+                  if (outputBuffer.length > 64) {
+                    outputBuffer = outputBuffer.substring(outputBuffer.length - 64);
+                  }
+                  if (outputBuffer.endsWith("~% ") || outputBuffer.endsWith("# ") || outputBuffer.endsWith("~# ")) {
+                    isProvisioned = true;
+                    isCapturingValidationRef.current = true;
+                    
+                    worker.postMessage({
+                      type: "INPUT",
+                      payload: "mkdir -p /etc/nginx && echo 'server { listen 80; root /var/www/html; syntax_error_here; }' > /etc/nginx/nginx.conf\n"
+                    });
+                    worker.postMessage({
+                      type: "INPUT",
+                      payload: "mkdir -p /var/log/nginx && echo '192.168.1.100 - - [23/May/2026:10:40:02 +0530] \"GET / HTTP/1.1\" 200 3126' > /var/log/nginx/access.log\n"
+                    });
+                    worker.postMessage({
+                      type: "INPUT",
+                      payload: "mkdir -p Projects\n"
+                    });
+                    
+                    setTimeout(() => {
+                      worker.postMessage({ type: "INPUT", payload: "clear\n" });
+                      setTimeout(() => {
+                        isCapturingValidationRef.current = false;
+                      }, 200);
+                    }, 1000);
+                  }
+                }
+                break;
+              case "SAVE_SUCCESS":
+                saveV86State(payload).then(() => {
+                  setIsSavingV86(false);
+                  term.write("\r\n\x1b[1;32m[System] Virtual machine state successfully persisted to browser IndexedDB.\x1b[0m\r\n");
+                }).catch(err => {
+                  console.error("Failed to save state to IndexedDB:", err);
+                  setIsSavingV86(false);
+                });
+                break;
+              case "SAVE_FAILURE":
+                console.error("Failed to save VM state:", payload);
+                alert("Failed to save VM state.");
+                setIsSavingV86(false);
+                break;
+            }
+          };
+
+          // Send initialization payload to worker
+          worker.postMessage({
+            type: "INIT",
+            payload: {
+              origin: window.location.origin,
+              initial_state: savedState
             }
           });
 
-          // Connect user input from xterm.js back to guest serial console
+          // Connect user input from xterm.js back to guest serial console in worker
           const dataDisposable = term.onData((data) => {
-            emulator.serial0_send(data);
+            worker.postMessage({ type: "INPUT", payload: data });
+          });
+
+          // Attach custom key event handler for signal intercepts
+          term.attachCustomKeyEventHandler((ev) => {
+            if (ev.ctrlKey && ev.type === "keydown") {
+              const code = ev.key.toLowerCase();
+              if (code === "c") {
+                worker.postMessage({ type: "INPUT", payload: "\x03" });
+                return false;
+              }
+              if (code === "z") {
+                worker.postMessage({ type: "INPUT", payload: "\x1a" });
+                return false;
+              }
+              if (code === "d") {
+                worker.postMessage({ type: "INPUT", payload: "\x04" });
+                return false;
+              }
+            }
+            return true;
           });
 
           // Save references to cleanly dispose
@@ -879,7 +887,7 @@ export function TerminalSimulator({
 
         } catch (err) {
           console.error("Failed to load v86 VM:", err);
-          const errorMsg = err instanceof Error ? err.message : (err instanceof Event ? "Script load failed" : String(err));
+          const errorMsg = err instanceof Error ? err.message : String(err);
           term.write("\r\n\x1b[1;31mError: Failed to fetch WebAssembly virtual machine libraries.\x1b[0m\r\n");
           term.write(`\x1b[1;30m[Debug Info] ${errorMsg}\x1b[0m\r\n`);
           term.write("Verify your internet connection and CORS configurations.\r\n");
@@ -1162,9 +1170,9 @@ export function TerminalSimulator({
       }
       if (v86EmulatorRef.current) {
         try {
-          v86EmulatorRef.current.destroy();
+          v86EmulatorRef.current.postMessage({ type: "DESTROY" });
         } catch (e) {
-          console.error("Failed to destroy v86 emulator:", e);
+          console.error("Failed to destroy v86 worker:", e);
         }
         v86EmulatorRef.current = null;
       }
@@ -1399,11 +1407,29 @@ export function TerminalSimulator({
                                     const success = await runV86Validation(WASM_MISSION_CHECKS[mission.id]);
                                     if (success) {
                                       try {
-                                        const res = await fetch("/api/validate", {
-                                          method: "POST",
-                                          headers: { "Content-Type": "application/json" },
-                                          body: JSON.stringify({ missionId: mission.id, success: true })
-                                        });
+                                         // 1. Fetch challenge nonce from server
+                                         const challengeRes = await fetch("/api/validate/challenge");
+                                         if (!challengeRes.ok) {
+                                           throw new Error("Failed to retrieve challenge nonce from server.");
+                                         }
+                                         const { nonce, expires, signature } = await challengeRes.json();
+
+                                         // 2. Compute the state HMAC on the client
+                                         const clientHash = await computeHMAC(nonce, `${mission.id}:true`);
+
+                                         // 3. Post verification payload with challenge details
+                                         const res = await fetch("/api/validate", {
+                                           method: "POST",
+                                           headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({
+                                             missionId: mission.id,
+                                             success: true,
+                                             nonce,
+                                             expires,
+                                             signature,
+                                             clientHash
+                                           })
+                                         });
                                         if (res.ok) {
                                           setCompletedVasmMissions(prev => ({ ...prev, [mission.id]: true }));
                                           updateBKT(MISSION_TOPICS[mission.id] || "navigation", true);
