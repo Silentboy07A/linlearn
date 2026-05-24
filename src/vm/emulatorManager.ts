@@ -205,8 +205,17 @@ export class EmulatorManager {
 
   public sendInput(data: string): void {
     const stateName = this.lifecycle.getState().state;
+    if (stateName !== "running") {
+      Logger.warn("VM", `Refusing to send user keyboard input: VM is in non-running state: ${stateName}`);
+      return;
+    }
+    this.bridge.post("INPUT", data);
+  }
+
+  public sendProgrammaticInput(data: string): void {
+    const stateName = this.lifecycle.getState().state;
     if (stateName !== "running" && stateName !== "booting" && stateName !== "provisioning") {
-      Logger.warn("VM", `Refusing to send serial input: VM is in non-interactive state: ${stateName}`);
+      Logger.warn("VM", `Refusing to send programmatic serial input: VM is in non-interactive state: ${stateName}`);
       return;
     }
     this.bridge.post("INPUT", data);
@@ -216,24 +225,48 @@ export class EmulatorManager {
     this.lifecycle.transitionTo(newState);
     if (this.onStateChange) this.onStateChange(newState);
 
-    if (newState === "running" || newState === "stopped" || newState === "error") {
+    // Synchronize state with worker
+    let workerState: string = newState;
+    if (newState === "stopped") workerState = "destroyed";
+    if (newState === "error") workerState = "failed";
+    this.bridge.post("SET_STATE", workerState);
+
+    if (newState === "provisioning") {
+      this.startProvisioningWatchdog();
+    } else if (newState === "running" || newState === "stopped" || newState === "error") {
       this.stopWatchdog();
     }
   }
 
   private startWatchdog(): void {
     this.stopWatchdog();
-    Logger.info("VM", "Starting provisioning watchdog timer...");
+    Logger.info("VM", "Starting boot watchdog timer (45s)...");
     this.watchdogTimer = setTimeout(() => {
       const currentState = this.lifecycle.getState().state;
-      if (currentState === "booting" || currentState === "provisioning") {
-        Logger.warn("VM", `[WATCHDOG] VM boot/provisioning stalled in state: ${currentState}. Recovering...`);
+      if (currentState === "loading" || currentState === "booting") {
+        Logger.warn("VM", `[WATCHDOG] VM boot stalled in state: ${currentState}. Recovering...`);
         this.transitionState("running");
         if (this.onSerialOutput) {
           this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Boot took too long. Forcing interactive mode...\x1b[0m\r\n");
         }
       }
-    }, 25000); // 25 seconds boot/provisioning limit
+    }, 45000); // 45 seconds for kernel boot
+  }
+
+  private startProvisioningWatchdog(): void {
+    this.stopWatchdog();
+    Logger.info("VM", "Starting provisioning watchdog timer (15s)...");
+    this.watchdogTimer = setTimeout(() => {
+      const currentState = this.lifecycle.getState().state;
+      if (currentState === "provisioning") {
+        Logger.warn("VM", `[WATCHDOG] VM provisioning stalled. Recovering...`);
+        this.transitionState("running");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Provisioning took too long. Forcing interactive mode...\x1b[0m\r\n");
+        }
+      }
+    }, 15000); // 15 seconds for provisioning commands
+
   }
 
   private stopWatchdog(): void {

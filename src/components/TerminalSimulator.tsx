@@ -23,6 +23,8 @@ import { getMissionsByCategory, type MissionCategory } from "@/missions/config";
 interface CustomTerminal extends Terminal {
   _simDisposable?: { dispose: () => void };
   _v86Disposable?: { dispose: () => void };
+  _handleFocus?: () => void;
+  _handleBlur?: () => void;
 }
 
 interface TerminalSimulatorProps {
@@ -303,6 +305,8 @@ export function TerminalSimulator({
 
   const [isV86Running, setIsV86Running] = useState<boolean>(false);
   const [vmStateName, setVmStateName] = useState<string>("idle");
+  const [isFocused, setIsFocused] = useState<boolean>(false);
+  const [termResetCounter, setTermResetCounter] = useState<number>(0);
 
   const [masteryState, setMasteryState] = useState<Record<LinuxTopic, number>>(() => {
     return {
@@ -716,6 +720,18 @@ export function TerminalSimulator({
       if (terminalRef.current) {
         term.open(terminalRef.current);
         fitAddon.fit();
+
+        const handleFocus = () => setIsFocused(true);
+        const handleBlur = () => setIsFocused(false);
+
+        if (term.element) {
+          term.element.addEventListener("focus", handleFocus);
+          term.element.addEventListener("blur", handleBlur);
+        }
+
+        const customTerm = term as unknown as CustomTerminal;
+        customTerm._handleFocus = handleFocus;
+        customTerm._handleBlur = handleBlur;
       }
 
       xtermInstance.current = term;
@@ -769,13 +785,13 @@ export function TerminalSimulator({
           // State checking for guest provisioning
           if (!isProvisioned) {
             outputBuffer += char;
-            if (outputBuffer.length > 128) {
-              outputBuffer = outputBuffer.substring(outputBuffer.length - 128);
+            if (outputBuffer.length > 256) {
+              outputBuffer = outputBuffer.substring(outputBuffer.length - 256);
             }
 
-            // Detect prompt patterns
+            // Detect prompt/sentinel patterns
             const hasRootPrompt = outputBuffer.endsWith("~% ") || outputBuffer.endsWith("# ") || outputBuffer.endsWith("~# ");
-            const hasUserPrompt = outputBuffer.endsWith("user@linlearn:~$ ") || outputBuffer.endsWith("user@linlearn:~$");
+            const hasUserSentinel = outputBuffer.includes("PROVISIONING_COMPLETE");
 
             if (hasRootPrompt && !isProvisioning) {
               // Initiate silent environment provisioning
@@ -784,10 +800,10 @@ export function TerminalSimulator({
               // Clear screen first so root setup commands are totally hidden
               term.write("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
               
-              // Send silent provisioning string
-              emulator.sendInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\necho 'export HOME=/home/user' > /home/user/.profile\necho 'export PS1="user@linlearn:\\\\w\\\\$ "' >> /home/user/.profile\necho 'cd /home/user' >> /home/user/.profile\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nsu - user\nstty echo\nclear\n`);
-            } else if (hasUserPrompt) {
-              // User prompt matched: provisioning successfully complete!
+              // Send silent provisioning string with permissions, echo recovery, self-healing loop, and sentinel
+              emulator.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\ncat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\$(pwd | sed "s|^\$HOME|~|")\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
+            } else if (hasUserSentinel) {
+              // User prompt sentinel matched: provisioning successfully complete!
               isProvisioning = false;
               isProvisioned = true;
               emulator.transitionState("running");
@@ -801,6 +817,9 @@ export function TerminalSimulator({
               term.write(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
               term.write(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
               term.write("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
+              
+              // Focus terminal automatically when ready
+              term.focus();
             }
           }
         };
@@ -817,6 +836,7 @@ export function TerminalSimulator({
             isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(true);
+            term.focus();
           } else if (newState === "provisioning") {
             isProvisioned = false;
             isProvisioning = true;
@@ -844,6 +864,7 @@ export function TerminalSimulator({
             isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(true);
+            term.focus();
           } else if (currentVmState === "provisioning") {
             isProvisioned = false;
             isProvisioning = true;
@@ -880,6 +901,7 @@ export function TerminalSimulator({
                 setV86Booting(false);
                 setIsV86Running(true);
                 term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
+                term.focus();
               }
             } catch (bootErr) {
               if (!isMounted) return;
@@ -906,6 +928,13 @@ export function TerminalSimulator({
         // 3. Setup client key handler to bridge typed commands
         let currentLine = "";
         const dataDisposable = term.onData((data) => {
+          if (isCapturingValidationRef.current) {
+            return;
+          }
+          if (emulator.getLifecycleState().state !== "running") {
+            return;
+          }
+
           if (data === "\r" || data === "\n") {
             if (currentLine.trim()) {
               lastCommandRef.current = currentLine.trim();
@@ -938,6 +967,9 @@ export function TerminalSimulator({
         });
 
         term.attachCustomKeyEventHandler((ev) => {
+          if (isCapturingValidationRef.current || emulator.getLifecycleState().state !== "running") {
+            return false;
+          }
           if (ev.ctrlKey && ev.type === "keydown") {
             const code = ev.key.toLowerCase();
             if (code === "c") {
@@ -1230,6 +1262,14 @@ export function TerminalSimulator({
         if (customTerm._v86Disposable) {
           customTerm._v86Disposable.dispose();
         }
+        if (term.element) {
+          if (customTerm._handleFocus) {
+            term.element.removeEventListener("focus", customTerm._handleFocus);
+          }
+          if (customTerm._handleBlur) {
+            term.element.removeEventListener("blur", customTerm._handleBlur);
+          }
+        }
         term.dispose();
       }
       setIsV86Running(false);
@@ -1238,7 +1278,7 @@ export function TerminalSimulator({
       }
       persistenceManager.cancelPendingSaves();
     };
-  }, [prefs.theme, prefs.fontSize, isV86Mode]);
+  }, [prefs.theme, prefs.fontSize, isV86Mode, termResetCounter]);
 
   return (
     <div className="space-y-4">
@@ -1268,6 +1308,13 @@ export function TerminalSimulator({
           {isV86Mode && (
             <>
               <button
+                onClick={() => setTermResetCounter(prev => prev + 1)}
+                className="flex items-center gap-2 rounded-lg border border-[#E95420]/35 bg-[#E95420]/10 px-3 py-1.5 text-xs font-semibold text-[#E95420] transition-all hover:bg-[#E95420]/20 hover:text-white"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Reconnect Terminal
+              </button>
+              <button
                 onClick={handleResetV86State}
                 className="flex items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-400 transition-all hover:bg-rose-500/20 hover:text-white"
               >
@@ -1292,7 +1339,18 @@ export function TerminalSimulator({
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-10">
         
         {/* Left: Terminal container (70% width) */}
-        <div className="lg:col-span-7 flex flex-col rounded-xl border border-white/10 bg-[#06070a] overflow-hidden shadow-2xl">
+        <div 
+          onClick={() => {
+            if (xtermInstance.current) {
+              xtermInstance.current.focus();
+            }
+          }}
+          className={`lg:col-span-7 flex flex-col rounded-xl border transition-all duration-200 bg-[#06070a] overflow-hidden shadow-2xl cursor-text ${
+            isFocused 
+              ? "border-[#E95420] ring-1 ring-[#E95420]/35 shadow-lg shadow-[#E95420]/5" 
+              : "border-white/10"
+          }`}
+        >
           {/* Simulated Ubuntu window header */}
           <div className="flex items-center justify-between bg-[#15161c] px-4 py-2 border-b border-white/5">
             <div className="flex items-center gap-2">
@@ -1329,7 +1387,7 @@ export function TerminalSimulator({
             )}
             <div 
               ref={terminalRef} 
-              className="w-full flex-1 overflow-hidden" 
+              className="w-full flex-1 overflow-hidden cursor-text" 
               style={{ minHeight: "480px" }}
             />
             {isV86Mode && (

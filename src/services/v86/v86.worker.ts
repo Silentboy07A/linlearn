@@ -46,6 +46,7 @@ self.onmessage = async (e: MessageEvent) => {
         log("debug", `Ignored serial input: VM is in non-interactive state (state: ${getLifecycleState()})`);
         break;
       }
+      log("debug", `Routing serial input of length ${payload ? payload.length : 0} to emulator`);
       try {
         emulator.serial0_send(payload);
       } catch (err: any) {
@@ -53,6 +54,10 @@ self.onmessage = async (e: MessageEvent) => {
       }
       break;
     }
+
+    case "SET_STATE":
+      setLifecycleState(payload);
+      break;
 
     case "SET_RUNNING":
       if (getLifecycleState() === "booting") {

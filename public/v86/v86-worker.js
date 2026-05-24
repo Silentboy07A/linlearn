@@ -28,7 +28,7 @@ function log(level, msg) {
 
 // ─── 2. VM LIFECYCLE STATE MACHINE MODULE ────────────────────────────────────
 /**
- * @typedef {'idle' | 'loading' | 'initialized' | 'booting' | 'running' | 'failed' | 'destroyed'} EmulatorState
+ * @typedef {'idle' | 'loading' | 'initialized' | 'booting' | 'provisioning' | 'running' | 'failed' | 'destroyed'} EmulatorState
  */
 
 /** @type {EmulatorState} */
@@ -53,7 +53,7 @@ function canInitialize() {
 }
 
 function canSendInput() {
-  return lifecycleState === "booting" || lifecycleState === "running";
+  return lifecycleState === "booting" || lifecycleState === "provisioning" || lifecycleState === "running";
 }
 
 // ─── 3. ASSET LOADER MODULE ──────────────────────────────────────────────────
@@ -209,11 +209,16 @@ self.onmessage = async function (e) {
         log("debug", "Ignored serial input: VM is in non-interactive state (state: " + lifecycleState + ")");
         break;
       }
+      log("debug", "Routing serial input of length " + (payload ? payload.length : 0) + " to emulator");
       try {
         emulator.serial0_send(payload);
       } catch (err) {
         log("error", "Failed to send serial input: " + (err.message || String(err)));
       }
+      break;
+
+    case "SET_STATE":
+      setLifecycleState(payload);
       break;
 
     case "SET_RUNNING":
