@@ -248,7 +248,7 @@ export function LinuxVM() {
       xtermRef.current = term;
 
       // ── 3. Create worker (plain JS from public/) ───────────────────────
-      const workerUrl = window.location.origin + "/v86/v86-worker.js";
+      const workerUrl = window.location.origin + "/v86/v86-worker.js?v=" + Date.now();
       const worker = new Worker(workerUrl);
       workerRef.current = worker;
 

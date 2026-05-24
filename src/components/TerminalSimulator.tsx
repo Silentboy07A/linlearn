@@ -755,7 +755,7 @@ export function TerminalSimulator({
           const attemptedRestore = !!savedState;
 
           // Instantiate Web Worker (using plain JS from public/ to bypass Next.js webpack issues)
-          const workerUrl = window.location.origin + "/v86/v86-worker.js";
+          const workerUrl = window.location.origin + "/v86/v86-worker.js?v=" + Date.now();
           const worker = new Worker(workerUrl);
           v86EmulatorRef.current = worker;
 
