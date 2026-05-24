@@ -11,9 +11,24 @@ export class VMLifecycleManager {
 
   private bootStartTimestamp: number | null = null;
 
+  private static readonly VALID_TRANSITIONS: Record<VMState["state"], Set<VMState["state"]>> = {
+    idle: new Set<VMState["state"]>(["loading", "stopped"]),
+    loading: new Set<VMState["state"]>(["booting", "error", "stopped"]),
+    booting: new Set<VMState["state"]>(["provisioning", "running", "error", "stopped"]),
+    provisioning: new Set<VMState["state"]>(["running", "error", "stopped"]),
+    running: new Set<VMState["state"]>(["stopped", "error"]),
+    stopped: new Set<VMState["state"]>(["idle", "loading"]),
+    error: new Set<VMState["state"]>(["idle", "loading", "stopped"]),
+  };
+
   public transitionTo(newState: VMState["state"], ramBytes?: number): void {
     const oldState = this.currentState.state;
     if (oldState === newState) return;
+
+    const allowed = VMLifecycleManager.VALID_TRANSITIONS[oldState]?.has(newState);
+    if (!allowed) {
+      Logger.warn("VM", `Lifecycle transition constraint warning: ${oldState} -> ${newState} is not standard`);
+    }
 
     this.currentState.state = newState;
     this.currentState.lastActiveTimestamp = Date.now();
@@ -38,8 +53,8 @@ export class VMLifecycleManager {
   public isAlive(): boolean {
     return (
       this.currentState.state !== "idle" &&
-      this.currentState.state !== "failed" &&
-      this.currentState.state !== "destroyed"
+      this.currentState.state !== "error" &&
+      this.currentState.state !== "stopped"
     );
   }
 }

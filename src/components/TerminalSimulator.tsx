@@ -302,6 +302,7 @@ export function TerminalSimulator({
   const [v86Booting, setV86Booting] = useState<boolean>(false);
 
   const [isV86Running, setIsV86Running] = useState<boolean>(false);
+  const [vmStateName, setVmStateName] = useState<string>("idle");
 
   const [masteryState, setMasteryState] = useState<Record<LinuxTopic, number>>(() => {
     return {
@@ -364,13 +365,21 @@ export function TerminalSimulator({
     if (window.confirm("Are you sure you want to reset the Virtual Machine? This will delete all saved snapshots and restore a clean environment.")) {
       setIsV86Running(false);
       setV86Booting(true);
+      setVmStateName("loading");
       
       // Cancel autosave loops
       persistenceManagerRef.current.cancelPendingSaves();
       
+      // Stop the VM emulator completely (kills worker)
+      if (v86EmulatorRef.current) {
+        await v86EmulatorRef.current.stop();
+        v86EmulatorRef.current = null;
+      }
+      
       // Clear IndexedDB snapshot
       await persistenceManagerRef.current.clearState("default_session");
       setHasSavedState(false);
+      lastOutputRef.current = ""; // Clear command history rolling log!
 
       setIsV86Mode(false);
       setTimeout(() => {
@@ -719,7 +728,12 @@ export function TerminalSimulator({
         setV86Booting(true);
         setIsV86Running(false);
 
-        const emulator = new EmulatorManager();
+        let emulator = EmulatorManager.getActiveInstance();
+        const isReattached = !!emulator;
+        if (!emulator) {
+          emulator = new EmulatorManager();
+          EmulatorManager.setActiveInstance(emulator);
+        }
         v86EmulatorRef.current = emulator;
 
         let isProvisioned = false;
@@ -766,6 +780,7 @@ export function TerminalSimulator({
             if (hasRootPrompt && !isProvisioning) {
               // Initiate silent environment provisioning
               isProvisioning = true;
+              emulator.transitionState("provisioning");
               // Clear screen first so root setup commands are totally hidden
               term.write("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
               
@@ -775,6 +790,7 @@ export function TerminalSimulator({
               // User prompt matched: provisioning successfully complete!
               isProvisioning = false;
               isProvisioned = true;
+              emulator.transitionState("running");
               setV86Booting(false);
               setIsV86Running(true);
               
@@ -791,15 +807,60 @@ export function TerminalSimulator({
 
         const onState = (newState: string) => {
           if (!isMounted) return;
-          if (newState === "failed") {
+          setVmStateName(newState);
+          if (newState === "error") {
             term.write(`\r\n\x1b[1;31mError: Failed to boot guest virtual machine.\x1b[0m\r\n`);
             setV86Booting(false);
+            setIsV86Running(false);
+          } else if (newState === "running") {
+            isProvisioned = true;
+            isProvisioning = false;
+            setV86Booting(false);
+            setIsV86Running(true);
+          } else if (newState === "provisioning") {
+            isProvisioned = false;
+            isProvisioning = true;
+            setV86Booting(true);
+            setIsV86Running(false);
+          } else if (newState === "booting" || newState === "loading") {
+            isProvisioned = false;
+            isProvisioning = false;
+            setV86Booting(true);
+            setIsV86Running(false);
           }
         };
 
-        try {
-          // 1. Fetch saved state snapshot
-          persistenceManagerRef.current.loadState("default_session").then(async (savedState) => {
+        if (isReattached) {
+          term.write(" * Reattaching to active VM session...\r\n");
+          emulator.reattach(onSerial, onState);
+          // Print terminal history
+          term.write(lastOutputRef.current);
+          
+          // Re-sync local flags from emulator state
+          const currentVmState = emulator.getLifecycleState().state;
+          setVmStateName(currentVmState);
+          if (currentVmState === "running") {
+            isProvisioned = true;
+            isProvisioning = false;
+            setV86Booting(false);
+            setIsV86Running(true);
+          } else if (currentVmState === "provisioning") {
+            isProvisioned = false;
+            isProvisioning = true;
+            setV86Booting(true);
+            setIsV86Running(false);
+          } else {
+            isProvisioned = false;
+            isProvisioning = false;
+            setV86Booting(true);
+            setIsV86Running(false);
+          }
+        } else {
+          try {
+            // 1. Fetch saved state snapshot
+            const savedState = await persistenceManager.loadState("default_session");
+            if (!isMounted) return;
+
             if (savedState) {
               term.write(" * Found saved snapshot. Restoring VM state...\r\n");
               setHasSavedState(true);
@@ -809,82 +870,94 @@ export function TerminalSimulator({
             }
 
             // 2. Start VM
-            await emulator.start(window.location.origin, onSerial, onState, savedState || undefined);
-            
-            if (savedState) {
-              // Restored state is immediately provisioned and interactive!
-              isProvisioned = true;
-              isProvisioning = false;
-              setV86Booting(false);
-              setIsV86Running(true);
-              term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
-            }
-          });
-
-          // 3. Setup client key handler to bridge typed commands
-          let currentLine = "";
-          const dataDisposable = term.onData((data) => {
-            // Keep a local log of user's command typed (for KKM semantic checks)
-            if (data === "\r" || data === "\n") {
-              if (currentLine.trim()) {
-                lastCommandRef.current = currentLine.trim();
-                
-                // Trigger auto-save debounced snapshot loop!
-                persistenceManagerRef.current.triggerAutosave("default_session", async () => {
-                  if (v86EmulatorRef.current) {
-                    setIsPersistenceSaving(true);
-                    try {
-                      const rawSnapshot = await v86EmulatorRef.current.saveState();
-                      setHasSavedState(true);
-                      return rawSnapshot;
-                    } catch (e) {
-                      console.error("Autosave snapshot failed:", e);
-                      return null;
-                    } finally {
-                      setIsPersistenceSaving(false);
-                    }
-                  }
-                  return null;
-                });
+            try {
+              await emulator.start(window.location.origin, onSerial, onState, savedState || undefined);
+              if (!isMounted) return;
+              
+              if (savedState) {
+                isProvisioned = true;
+                isProvisioning = false;
+                setV86Booting(false);
+                setIsV86Running(true);
+                term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
               }
-              currentLine = "";
-            } else if (data === "\x7f" || data === "\b") {
-              currentLine = currentLine.slice(0, -1);
-            } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
-              currentLine += data;
-            }
-            emulator.sendInput(data);
-          });
-
-          term.attachCustomKeyEventHandler((ev) => {
-            if (ev.ctrlKey && ev.type === "keydown") {
-              const code = ev.key.toLowerCase();
-              if (code === "c") {
-                emulator.sendInput("\x03");
-                return false;
-              }
-              if (code === "z") {
-                emulator.sendInput("\x1a");
-                return false;
-              }
-              if (code === "d") {
-                emulator.sendInput("\x04");
-                return false;
+            } catch (bootErr) {
+              if (!isMounted) return;
+              if (savedState) {
+                term.write("\r\n\x1b[1;33m[VM] Snapshot restoration failed. Clearing corrupted state and performing cold boot...\x1b[0m\r\n");
+                await persistenceManager.clearState("default_session");
+                setHasSavedState(false);
+                // Fallback to cold boot
+                await emulator.start(window.location.origin, onSerial, onState, undefined);
+                if (!isMounted) return;
+              } else {
+                throw bootErr;
               }
             }
-            return true;
-          });
-
-          const customTerm = term as unknown as CustomTerminal;
-          customTerm._v86Disposable = dataDisposable;
-
-        } catch (err: unknown) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          console.error("Failed to load v86 VM:", err);
-          term.write(`\r\n\x1b[1;31mError: Failed to load VM. ${errMsg}\x1b[0m\r\n`);
-          setV86Booting(false);
+          } catch (err: unknown) {
+            if (!isMounted) return;
+            const errMsg = err instanceof Error ? err.message : String(err);
+            console.error("Failed to load v86 VM:", err);
+            term.write(`\r\n\x1b[1;31mError: Failed to load VM. ${errMsg}\x1b[0m\r\n`);
+            setV86Booting(false);
+          }
         }
 
+        // 3. Setup client key handler to bridge typed commands
+        let currentLine = "";
+        const dataDisposable = term.onData((data) => {
+          if (data === "\r" || data === "\n") {
+            if (currentLine.trim()) {
+              lastCommandRef.current = currentLine.trim();
+              
+              // Trigger auto-save debounced snapshot loop!
+              persistenceManager.triggerAutosave("default_session", async () => {
+                if (v86EmulatorRef.current) {
+                  setIsPersistenceSaving(true);
+                  try {
+                    const rawSnapshot = await v86EmulatorRef.current.saveState();
+                    setHasSavedState(true);
+                    return rawSnapshot;
+                  } catch (e) {
+                    console.error("Autosave snapshot failed:", e);
+                    return null;
+                  } finally {
+                    setIsPersistenceSaving(false);
+                  }
+                }
+                return null;
+              });
+            }
+            currentLine = "";
+          } else if (data === "\x7f" || data === "\b") {
+            currentLine = currentLine.slice(0, -1);
+          } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+            currentLine += data;
+          }
+          emulator.sendInput(data);
+        });
+
+        term.attachCustomKeyEventHandler((ev) => {
+          if (ev.ctrlKey && ev.type === "keydown") {
+            const code = ev.key.toLowerCase();
+            if (code === "c") {
+              emulator.sendInput("\x03");
+              return false;
+            }
+            if (code === "z") {
+              emulator.sendInput("\x1a");
+              return false;
+            }
+            if (code === "d") {
+              emulator.sendInput("\x04");
+              return false;
+            }
+          }
+          return true;
+        });
+
+        const customTerm = term as unknown as CustomTerminal;
+        customTerm._v86Disposable = dataDisposable;
       } else {
         // --- Standard JS Simulation Mode ---
         term.write("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
@@ -1161,8 +1234,7 @@ export function TerminalSimulator({
       }
       setIsV86Running(false);
       if (v86EmulatorRef.current) {
-        v86EmulatorRef.current.stop();
-        v86EmulatorRef.current = null;
+        v86EmulatorRef.current.detach();
       }
       persistenceManager.cancelPendingSaves();
     };
@@ -1238,11 +1310,21 @@ export function TerminalSimulator({
           
           {/* Terminal Canvas Container */}
           <div className="p-2 min-h-[500px] flex-1 flex flex-col justify-stretch relative">
-            {isV86Mode && v86Booting && (
+            {isV86Mode && (vmStateName === "loading" || vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "idle") && (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#06070a]/90 gap-3">
                 <RefreshCw className="h-8 w-8 text-[#E95420] animate-spin" />
-                <span className="text-sm font-mono text-gray-400">Booting Real Linux Kernel in WASM...</span>
-                <span className="text-xs font-mono text-gray-600">Downloading Buildroot disk image (~10MB)</span>
+                <span className="text-sm font-mono text-gray-400">
+                  {vmStateName === "loading" ? "Downloading WebAssembly & Linux Kernel..." :
+                   vmStateName === "booting" ? "Booting Real Linux Kernel in WASM..." :
+                   vmStateName === "provisioning" ? "Provisioning User Environment Silently..." :
+                   "Initializing Virtual Machine..."}
+                </span>
+                <span className="text-xs font-mono text-gray-600">
+                  {vmStateName === "loading" ? "Downloading Buildroot disk image (~10MB)" :
+                   vmStateName === "booting" ? "Decompressing kernel & starting x86 CPU" :
+                   vmStateName === "provisioning" ? "Configuring user login & inspect hooks" :
+                   "Configuring virtual resources (96MB RAM)"}
+                </span>
               </div>
             )}
             <div 
@@ -1254,13 +1336,17 @@ export function TerminalSimulator({
               <div className="flex items-center justify-between bg-black/40 border-t border-white/5 px-4 py-2 text-xs font-mono text-gray-500 rounded-b-lg">
                 <div className="flex items-center gap-4">
                   <div className="flex items-center gap-1.5">
-                    <span className={`h-2 w-2 rounded-full ${isV86Running ? "bg-emerald-500 animate-pulse" : "bg-amber-500"}`} />
-                    <span>Status: {v86Booting ? "Booting" : isV86Running ? "Running" : "Stopped"}</span>
+                    <span className={`h-2 w-2 rounded-full ${
+                      vmStateName === "running" ? "bg-emerald-500 animate-pulse" : 
+                      (vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "loading") ? "bg-amber-500 animate-pulse" : 
+                      vmStateName === "error" ? "bg-rose-500 animate-pulse" : "bg-gray-500"
+                    }`} />
+                    <span>Status: <span className="uppercase text-[10px] font-bold px-1.5 py-0.5 rounded bg-white/5">{vmStateName}</span></span>
                   </div>
                   {bootTimeRef.current !== null && (
                     <div>Boot: {(bootTimeRef.current / 1000).toFixed(1)}s</div>
                   )}
-                  <div>RAM: 64MB</div>
+                  <div>RAM: 96MB</div>
                 </div>
                 <div className="flex items-center gap-2">
                   {isPersistenceSaving ? (

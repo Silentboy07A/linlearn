@@ -2,10 +2,10 @@
 import { VMSessionConfig } from "../lib/types";
 
 export const DEFAULT_RESOURCE_LIMITS: VMSessionConfig = {
-  memoryLimitBytes: 64 * 1024 * 1024,
+  memoryLimitBytes: 96 * 1024 * 1024,
   vgaMemoryLimitBytes: 8 * 1024 * 1024,
   cpuThrottlePercent: 50,
-  timeoutMs: 15000,
+  timeoutMs: 30000,
 };
 
 export class ResourceLimitsValidator {
@@ -24,8 +24,8 @@ export class ResourceLimitsValidator {
     if (cpu < 10 || cpu > 100) {
       throw new Error("CPU throttling percentage must be between 10% and 100%");
     }
-    if (timeout < 5000 || timeout > 60000) {
-      throw new Error("VM execution timeout must be between 5s and 60s");
+    if (timeout < 5000 || timeout > 90000) {
+      throw new Error("VM execution timeout must be between 5s and 90s");
     }
 
     return {

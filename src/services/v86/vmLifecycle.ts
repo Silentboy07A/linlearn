@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { log } from "./logger";
 
-export type EmulatorState = "idle" | "loading" | "booting" | "running" | "failed" | "destroyed";
+export type EmulatorState = "idle" | "loading" | "booting" | "provisioning" | "running" | "stopped" | "error";
 
 let lifecycleState: EmulatorState = "idle";
 let isBootingInProgress = false;
@@ -29,7 +29,7 @@ export function isBooting(): boolean {
 }
 
 export function canInitialize(): boolean {
-  return lifecycleState === "idle" || lifecycleState === "failed" || lifecycleState === "destroyed";
+  return lifecycleState === "idle" || lifecycleState === "error" || lifecycleState === "stopped";
 }
 
 export function canSaveState(): boolean {
@@ -37,5 +37,5 @@ export function canSaveState(): boolean {
 }
 
 export function canSendInput(): boolean {
-  return lifecycleState === "booting" || lifecycleState === "running";
+  return lifecycleState === "booting" || lifecycleState === "provisioning" || lifecycleState === "running";
 }

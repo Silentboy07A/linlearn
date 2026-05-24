@@ -112,7 +112,7 @@ async function handleInit(payload: any) {
   } catch (err: any) {
     const msg = `Failed to load libv86.js: ${err.message || String(err)}`;
     log("error", msg);
-    setLifecycleState("failed");
+    setLifecycleState("error");
     (self as any).postMessage({ type: "INIT_FAILURE", payload: msg });
     return;
   }
@@ -121,7 +121,7 @@ async function handleInit(payload: any) {
   if (!win.V86) {
     const errMsg = "V86 constructor not found after importScripts";
     log("error", errMsg);
-    setLifecycleState("failed");
+    setLifecycleState("error");
     (self as any).postMessage({ type: "INIT_FAILURE", payload: errMsg });
     return;
   }
@@ -174,7 +174,7 @@ async function handleInit(payload: any) {
     log("info", "v86 emulator successfully created. Transitioned to booting guest...");
     setLifecycleState("booting");
   } catch (err: any) {
-    setLifecycleState("failed");
+    setLifecycleState("error");
     await destroyEmulator();
     const initErr = `Emulator initialization failed: ${err.message || String(err)}`;
     log("error", initErr);
@@ -215,7 +215,7 @@ function handleRestart() {
 
 async function handleDestroy() {
   log("info", "Destroying emulator worker context...");
-  setLifecycleState("destroyed");
+  setLifecycleState("stopped");
   await destroyEmulator();
   self.close();
 }

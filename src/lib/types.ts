@@ -31,7 +31,7 @@ export interface VMSessionConfig {
 }
 
 export interface VMState {
-  state: "idle" | "loading" | "booting" | "running" | "failed" | "destroyed";
+  state: "idle" | "loading" | "booting" | "provisioning" | "running" | "stopped" | "error";
   bootTimeMs?: number;
   lastActiveTimestamp: number;
   ramUsageBytes: number;
