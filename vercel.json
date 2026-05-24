@@ -52,6 +52,14 @@
       "source": "/v86/bios/(.*)",
       "headers": [
         {
+          "key": "Content-Type",
+          "value": "application/octet-stream"
+        },
+        {
+          "key": "Content-Encoding",
+          "value": "identity"
+        },
+        {
           "key": "Cache-Control",
           "value": "public, max-age=31536000, immutable"
         }
@@ -60,6 +68,14 @@
     {
       "source": "/v86/images/(.*)",
       "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/octet-stream"
+        },
+        {
+          "key": "Content-Encoding",
+          "value": "identity"
+        },
         {
           "key": "Accept-Ranges",
           "value": "bytes"
