@@ -96,6 +96,7 @@ async function loadAsset(
     if (options.autoAlign && byteLength % 4 !== 0) {
       const padBytes = 4 - (byteLength % 4);
       log("info", `Auto-aligning asset ${name}: padding ${byteLength} bytes with ${padBytes} bytes to make it a multiple of 4.`);
+      console.log(`[v86-worker] [DEBUG] Padding ${name} from ${byteLength} to ${byteLength + padBytes} bytes.`);
       const alignedBuffer = new ArrayBuffer(byteLength + padBytes);
       new Uint8Array(alignedBuffer).set(new Uint8Array(buffer));
       buffer = alignedBuffer;
@@ -278,6 +279,7 @@ async function handleInit(payload: any) {
       emulator = null;
     }
 
+    console.log(`[v86-worker] [DEBUG] Initializing V86 with bzimage buffer length: ${config.bzimage ? config.bzimage.buffer.byteLength : "N/A"}`);
     emulator = new win.V86(config);
 
     // Bridge serial0 output back to main thread
