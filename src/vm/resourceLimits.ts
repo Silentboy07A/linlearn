@@ -3,7 +3,7 @@ import { VMSessionConfig } from "../lib/types";
 
 export const DEFAULT_RESOURCE_LIMITS: VMSessionConfig = {
   memoryLimitBytes: 64 * 1024 * 1024,
-  vgaMemoryLimitBytes: 2 * 1024 * 1024,
+  vgaMemoryLimitBytes: 8 * 1024 * 1024,
   cpuThrottlePercent: 50,
   timeoutMs: 15000,
 };

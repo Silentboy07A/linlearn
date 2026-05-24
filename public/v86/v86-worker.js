@@ -138,7 +138,7 @@ async function createEmulator(config, win) {
     // Sane memory limits to prevent memory abuse
     var finalConfig = Object.assign({}, config, {
       memory_size: Math.min(config.memory_size || 64 * 1024 * 1024, 128 * 1024 * 1024), // Sane RAM limit: max 128MB
-      vga_memory_size: 2 * 1024 * 1024, // Minimal VGA memory: 2MB
+      vga_memory_size: Math.min(config.vga_memory_size || 8 * 1024 * 1024, 16 * 1024 * 1024), // Sane VGA RAM limit: max 16MB
       autostart: true
     });
 
@@ -319,9 +319,11 @@ async function handleInit(payload) {
       bios: { buffer: biosBuffer },
       vga_bios: { buffer: vgaBiosBuffer },
       bzimage: { buffer: bzImageBuffer },
+      filesystem: {},
       autostart: true,
       cmdline: payload.cmdline || "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
-      memory_size: payload.memory_size || 64 * 1024 * 1024
+      memory_size: payload.memory_size || 64 * 1024 * 1024,
+      vga_memory_size: payload.vga_memory_size || 8 * 1024 * 1024
     };
 
     // Step 4: Create emulator

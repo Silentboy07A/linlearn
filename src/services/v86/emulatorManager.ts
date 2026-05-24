@@ -12,6 +12,7 @@ export interface V86StarterConfig {
   autostart: boolean;
   memory_size?: number;
   vga_memory_size?: number;
+  filesystem?: any;
 }
 
 export interface V86StarterInstance {
@@ -41,7 +42,7 @@ export async function createEmulator(config: V86StarterConfig, win: any) {
     const finalConfig: V86StarterConfig = {
       ...config,
       memory_size: Math.min(config.memory_size || 64 * 1024 * 1024, 128 * 1024 * 1024),
-      vga_memory_size: 2 * 1024 * 1024,
+      vga_memory_size: Math.min(config.vga_memory_size || 8 * 1024 * 1024, 16 * 1024 * 1024),
       autostart: true,
     };
 

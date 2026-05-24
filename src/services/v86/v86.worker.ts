@@ -134,9 +134,11 @@ async function handleInit(payload: any) {
       bios: { buffer: biosBuffer },
       vga_bios: { buffer: vgaBiosBuffer },
       bzimage: { buffer: bzImageBuffer },
+      filesystem: {},
       autostart: true,
       cmdline: payload.cmdline || "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
       memory_size: payload.memory_size || 64 * 1024 * 1024,
+      vga_memory_size: payload.vga_memory_size || 8 * 1024 * 1024,
     };
 
     // Step 4: Create emulator

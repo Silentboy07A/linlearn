@@ -106,6 +106,7 @@ export class EmulatorManager {
       this.bridge.post("INIT", {
         origin,
         memory_size: this.config.memoryLimitBytes,
+        vga_memory_size: this.config.vgaMemoryLimitBytes,
         version: Date.now().toString(),
       });
     });
