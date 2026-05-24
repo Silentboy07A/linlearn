@@ -182,6 +182,11 @@ p {
   to   { width: 100%; }
 }
 
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════════
    UTILITY LAYER
 ═══════════════════════════════════════════════════════════════════════════════ */
@@ -290,6 +295,9 @@ p {
   .dot-offline  { @apply w-1.5 h-1.5 rounded-full bg-status-error; }
   .dot-warning  { @apply w-1.5 h-1.5 rounded-full bg-status-warning; }
   .dot-loading  { @apply w-1.5 h-1.5 rounded-full bg-brand-500 animate-pulse; }
+  .animate-cursor-blink {
+    animation: cursor-blink 1s steps(2, start) infinite;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -348,6 +356,29 @@ p {
     @apply card
            hover:border-[var(--border-brand)] hover:shadow-card-hover
            hover:-translate-y-px cursor-pointer;
+  }
+
+  .premium-card {
+    @apply rounded-xl border border-white/[0.06] bg-[#0c0a1e]/20
+           backdrop-blur-md shadow-e2
+           transition-all duration-normal;
+    position: relative;
+    overflow: hidden;
+  }
+  .premium-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(350px circle at var(--mouse-x, 50%) var(--mouse-y, 50%), rgba(255, 255, 255, 0.05), transparent 40%);
+    opacity: 0;
+    transition: opacity 0.5s ease;
+    pointer-events: none;
+  }
+  .premium-card:hover::before {
+    opacity: 1;
+  }
+  .premium-card:hover {
+    @apply -translate-y-px;
   }
 
   .card-elevated {
