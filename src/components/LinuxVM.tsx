@@ -1,37 +1,54 @@
 "use client";
+// src/components/LinuxVM.tsx
+// ─────────────────────────────────────────────────────────────────────────────
+// Primary v86 VM component.  Worker-based architecture, xterm.js terminal,
+// serial bridge, deterministic lifecycle management.
+//
+// Fixed:
+//  - Uses plain JS worker from public/ (no Webpack bundling issues)
+//  - Correct v86 config with initrd + console=ttyS0
+//  - Shell-prompt detection for boot completion (not first-char)
+//  - React StrictMode guard (initialization ref)
+//  - Frame-batched serial output rendering
+//  - Proper cleanup on unmount
+//  - xterm.css imported
+//  - No competing main-thread v86 instance
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { Terminal } from "xterm";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { FADE } from "@/lib/motion";
-import {
-  Eraser,
-  Maximize2,
-  Minimize2,
-} from "lucide-react";
+import { Eraser, Maximize2, Minimize2 } from "lucide-react";
 
-// ─── xterm.js theme — Authentic Ubuntu 22.04 palette ────────────────────────
+// ─── xterm.js theme — dark palette ──────────────────────────────────────────
 const TERMINAL_THEME = {
-  background:                  "#08090e",
-  foreground:                  "#dde1f0",
-  cursor:                      "#4ade80",
-  cursorAccent:                "#08090e",
-  selectionBackground:         "rgba(233,84,32,0.28)",
-  selectionForeground:         "#ffffff",
+  background: "#08090e",
+  foreground: "#dde1f0",
+  cursor: "#4ade80",
+  cursorAccent: "#08090e",
+  selectionBackground: "rgba(233,84,32,0.28)",
+  selectionForeground: "#ffffff",
   selectionInactiveBackground: "rgba(255,255,255,0.08)",
-  // ANSI 16 — Ubuntu terminal defaults
-  black:         "#0d1117",   brightBlack:   "#4d5566",
-  red:           "#f43f5e",   brightRed:     "#ff6b81",
-  green:         "#4ade80",   brightGreen:   "#69ff94",
-  yellow:        "#fbbf24",   brightYellow:  "#ffe066",
-  blue:          "#58a6ff",   brightBlue:    "#79c0ff",
-  magenta:       "#c084fc",   brightMagenta: "#d6acff",
-  cyan:          "#22d3ee",   brightCyan:    "#87e8fb",
-  white:         "#cdd6f4",   brightWhite:   "#ffffff",
+  black: "#0d1117",
+  brightBlack: "#4d5566",
+  red: "#f43f5e",
+  brightRed: "#ff6b81",
+  green: "#4ade80",
+  brightGreen: "#69ff94",
+  yellow: "#fbbf24",
+  brightYellow: "#ffe066",
+  blue: "#58a6ff",
+  brightBlue: "#79c0ff",
+  magenta: "#c084fc",
+  brightMagenta: "#d6acff",
+  cyan: "#22d3ee",
+  brightCyan: "#87e8fb",
+  white: "#cdd6f4",
+  brightWhite: "#ffffff",
 } as const;
 
-// ─── Boot sequence lines ─────────────────────────────────────────────────────
+// ─── Boot sequence lines (cosmetic overlay) ─────────────────────────────────
 const BOOT_LINES = [
   "[    0.000000] Linux version 5.15.0-linlearn (gcc 11.4.0) #1 SMP PREEMPT",
   "[    0.000000] Command line: tsc=reliable mitigations=off console=ttyS0",
@@ -50,31 +67,45 @@ const BOOT_LINES = [
   "[    0.067918] Ubuntu 22.04.3 LTS linlearn ttyS0",
 ];
 
-// ─── Boot Overlay ────────────────────────────────────────────────────────────
-function BootOverlay({ onComplete }: { onComplete?: () => void }) {
-  const [lines, setLines]       = useState<string[]>([]);
+// ─── Types ──────────────────────────────────────────────────────────────────
+type BootPhase = "booting" | "kernel" | "ready" | "error";
+
+interface WorkerMessage {
+  type: string;
+  payload?: unknown;
+}
+
+// ─── Boot Overlay ───────────────────────────────────────────────────────────
+function BootOverlay({ phase }: { phase: BootPhase }) {
+  const [lines, setLines] = useState<string[]>([]);
   const [progress, setProgress] = useState(0);
-  const [done, setDone]         = useState(false);
 
   useEffect(() => {
     let i = 0;
     const total = BOOT_LINES.length;
+    let timer: ReturnType<typeof setTimeout>;
 
     const tick = () => {
       if (i >= total) {
-        setDone(true);
-        onComplete?.();
+        setProgress(100);
         return;
       }
       setLines((prev) => [...prev, BOOT_LINES[i]]);
       setProgress(Math.round(((i + 1) / total) * 100));
       i++;
-      setTimeout(tick, 70 + Math.random() * 65);
+      timer = setTimeout(tick, 70 + Math.random() * 65);
     };
 
-    const t = setTimeout(tick, 200);
-    return () => clearTimeout(t);
-  }, [onComplete]);
+    timer = setTimeout(tick, 200);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const statusText =
+    phase === "error"
+      ? "Boot failed — check console"
+      : phase === "kernel"
+        ? "Kernel output received…"
+        : "Initializing WebAssembly x86 runtime";
 
   return (
     <motion.div
@@ -85,7 +116,7 @@ function BootOverlay({ onComplete }: { onComplete?: () => void }) {
       className="absolute inset-0 z-10 flex flex-col bg-[#08090e] p-4 font-mono"
       aria-label="VM booting"
     >
-      {/* Boot progress bar at top */}
+      {/* Progress bar */}
       <div className="absolute top-0 left-0 right-0 h-0.5 bg-white/5">
         <motion.div
           className="h-full bg-terminal-500"
@@ -102,55 +133,35 @@ function BootOverlay({ onComplete }: { onComplete?: () => void }) {
             key={idx}
             initial={{ opacity: 0, x: -4 }}
             animate={{ opacity: 1, x: 0 }}
-            transition={{ duration: 0.10 }}
+            transition={{ duration: 0.1 }}
             className="leading-5 text-[11px]"
           >
             <span className="text-terminal-500/35">{line.slice(0, 18)}</span>
             <span className="text-[#9d94bb]/75">{line.slice(18)}</span>
           </motion.div>
         ))}
-        {/* Blinking cursor at end */}
-        {!done && (
+        {phase === "booting" && (
           <span className="inline-block h-3 w-1.5 bg-terminal-500 animate-cursor-blink" />
         )}
       </div>
 
-      {/* Status bar */}
+      {/* Status */}
       <div className="mt-2 pt-2 border-t border-white/[0.06] flex items-center justify-between">
         <div className="flex items-center gap-1.5">
           <span className="dot-loading" />
-          <span className="text-[10px] text-[#635b80] font-mono">Initializing WebAssembly x86 runtime</span>
+          <span className="text-[10px] text-[#635b80] font-mono">
+            {statusText}
+          </span>
         </div>
-        <span className="text-[10px] text-[#635b80] font-mono tabular">{progress}%</span>
+        <span className="text-[10px] text-[#635b80] font-mono tabular">
+          {progress}%
+        </span>
       </div>
     </motion.div>
   );
 }
 
-// ─── V86 config types ────────────────────────────────────────────────────────
-interface V86StarterConfig {
-  wasm_path: string;
-  bios: { url: string };
-  vga_bios: { url: string };
-  bzimage: { url: string; async?: boolean };
-  cmdline: string;
-  autostart: boolean;
-  initial_state?: { buffer: ArrayBuffer };
-}
-interface V86StarterInstance {
-  serial0_send: (data: string) => void;
-  add_listener: (event: string, cb: (char: string) => void) => void;
-  remove_listener: (event: string, cb: (char: string) => void) => void;
-  destroy: () => void;
-}
-interface WindowWithV86 extends Window {
-  V86: new (config: V86StarterConfig) => V86StarterInstance;
-}
-interface CustomTerminal extends Terminal {
-  _v86Disposable?: { dispose: () => void };
-}
-
-// ─── Traffic-light button ────────────────────────────────────────────────────
+// ─── Traffic light button ───────────────────────────────────────────────────
 function TrafficLight({ color, title }: { color: string; title: string }) {
   return (
     <button
@@ -166,135 +177,278 @@ function TrafficLight({ color, title }: { color: string; title: string }) {
   );
 }
 
-// ─── LinuxVM ─────────────────────────────────────────────────────────────────
+// ─── LinuxVM ────────────────────────────────────────────────────────────────
 export function LinuxVM() {
-  const terminalRef    = useRef<HTMLDivElement>(null);
-  const v86ContainerRef = useRef<V86StarterInstance | null>(null);
-  const [booting,    setBooting]    = useState(true);
-  const [bootDone,   setBootDone]   = useState(false);
+  const terminalRef = useRef<HTMLDivElement>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const initRef = useRef(false); // StrictMode guard
+  const [bootPhase, setBootPhase] = useState<BootPhase>("booting");
   const [fullscreen, setFullscreen] = useState(false);
 
+  // ── Terminal clear ──────────────────────────────────────────────────────
+  const xtermRef = useRef<import("xterm").Terminal | null>(null);
   const handleClear = useCallback(() => {
-    // Clear signal propagated through xterm instance on window
-    const w = window as unknown as { __linlearn_term?: CustomTerminal };
-    w.__linlearn_term?.clear();
+    xtermRef.current?.clear();
   }, []);
 
+  // ── Main initialization effect ──────────────────────────────────────────
   useEffect(() => {
-    let active = true;
-    let termInstance: CustomTerminal | null = null;
-    let resizeObserver: ResizeObserver | null = null;
+    // StrictMode guard — prevent double initialization
+    if (initRef.current) return;
+    initRef.current = true;
 
-    const initialize = async () => {
-      const { Terminal } = await import("xterm");
-      const { FitAddon } = await import("xterm-addon-fit");
+    let active = true;
+    let term: import("xterm").Terminal | null = null;
+    let fitAddon: import("xterm-addon-fit").FitAddon | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+    let serialBuffer = ""; // Batched serial output
+    let rafId: number | null = null;
+
+    // Shell prompt detection buffer
+    let promptBuffer = "";
+    let shellReady = false;
+
+    const init = async () => {
+      // ── 1. Dynamic import xterm (avoid SSR) ─────────────────────────────
+      const [{ Terminal }, { FitAddon }] = await Promise.all([
+        import("xterm"),
+        import("xterm-addon-fit"),
+      ]);
 
       if (!active) return;
 
-      termInstance = new Terminal({
-        cursorBlink:  true,
-        cursorStyle:  "block",
-        cursorWidth:  2,
-        theme:        TERMINAL_THEME,
-        fontSize:     14,
-        fontFamily:   "'JetBrains Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace",
-        fontWeight:   "400",
+      // ── 2. Create terminal ──────────────────────────────────────────────
+      term = new Terminal({
+        cursorBlink: true,
+        cursorStyle: "block",
+        cursorWidth: 2,
+        theme: TERMINAL_THEME,
+        fontSize: 14,
+        fontFamily:
+          "'JetBrains Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace",
+        fontWeight: "400",
         fontWeightBold: "600",
-        lineHeight:   1.55,
+        lineHeight: 1.55,
         letterSpacing: 0,
-        convertEol:   true,
-        scrollback:   10000,
+        convertEol: true,
+        scrollback: 10000,
         allowTransparency: true,
         minimumContrastRatio: 4.5,
         smoothScrollDuration: 100,
-      }) as CustomTerminal;
+      });
 
-      const fitAddon = new FitAddon();
-      termInstance.loadAddon(fitAddon);
+      fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
 
       if (terminalRef.current) {
-        termInstance.open(terminalRef.current);
+        term.open(terminalRef.current);
         fitAddon.fit();
       }
 
-      // Expose for external clear
-      (window as unknown as { __linlearn_term?: CustomTerminal }).__linlearn_term = termInstance;
+      xtermRef.current = term;
 
-      // Load v86 script
-      const loadV86 = () =>
-        new Promise<void>((resolve, reject) => {
-          const w = window as unknown as WindowWithV86;
-          if (w.V86) return resolve();
-          const s = document.createElement("script");
-          s.src = window.location.origin + "/v86/libv86.js";
-          s.async = true;
-          s.onload  = () => resolve();
-          s.onerror = (e) => reject(e);
-          document.head.appendChild(s);
-        });
+      // ── 3. Create worker (plain JS from public/) ───────────────────────
+      const workerUrl = window.location.origin + "/v86/v86-worker.js";
+      const worker = new Worker(workerUrl);
+      workerRef.current = worker;
 
-      try {
-        await loadV86();
-        if (!active) return;
-
-        const origin = window.location.origin;
-        const emulator = new (window as unknown as WindowWithV86).V86({
-          wasm_path: `${origin}/v86/v86.wasm`,
-          bios:      { url: `${origin}/v86/bios/seabios.bin` },
-          vga_bios:  { url: `${origin}/v86/bios/vgabios.bin` },
-          bzimage:   { url: `${origin}/v86/images/bzImage`, async: false },
-          cmdline:   "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
-          autostart: true,
-        });
-
-        v86ContainerRef.current = emulator;
-        let isFirstChar = true;
-
-        emulator.add_listener("serial0-output-char", (char: string) => {
-          if (isFirstChar) {
-            isFirstChar = false;
-            setBooting(false);
-            setBootDone(true);
-            termInstance?.clear();
-          }
-          termInstance?.write(char);
-        });
-
-        const dataDisposable = termInstance.onData((data) => {
-          emulator.serial0_send(data);
-        });
-        termInstance._v86Disposable = dataDisposable;
-
-        if (terminalRef.current) {
-          resizeObserver = new ResizeObserver(() => {
-            if (active) fitAddon.fit();
-          });
-          resizeObserver.observe(terminalRef.current);
+      // ── 4. Frame-batched serial output renderer ─────────────────────────
+      // Instead of writing each char individually (causes flicker),
+      // we batch serial output and flush once per animation frame.
+      const flushSerial = () => {
+        if (serialBuffer.length > 0 && term) {
+          term.write(serialBuffer);
+          serialBuffer = "";
         }
-      } catch (err) {
-        console.error("LinuxVM init failed:", err);
-        termInstance?.write(
-          "\r\n\x1b[1;31m[LinLearn] Failed to initialize WebAssembly VM.\x1b[0m\r\n" +
-          "\x1b[90mCheck console for details. Refresh to retry.\x1b[0m\r\n"
-        );
-        setBooting(false);
+        rafId = requestAnimationFrame(flushSerial);
+      };
+      rafId = requestAnimationFrame(flushSerial);
+
+      // ── 5. Worker message handler ───────────────────────────────────────
+      worker.onmessage = (e: MessageEvent<WorkerMessage>) => {
+        if (!active) return;
+        const { type, payload } = e.data;
+
+        switch (type) {
+          case "INIT_SUCCESS":
+            console.log("[LinuxVM] v86 emulator initialized");
+            break;
+
+          case "INIT_FAILURE":
+            console.error("[LinuxVM] v86 init failed:", payload);
+            setBootPhase("error");
+            if (term) {
+              term.write(
+                "\r\n\x1b[1;31m[LinLearn] Failed to initialize v86 VM.\x1b[0m\r\n"
+              );
+              term.write(
+                `\x1b[90m${String(payload)}\x1b[0m\r\n`
+              );
+              term.write(
+                "\x1b[90mCheck that all v86 assets exist in public/v86/\x1b[0m\r\n"
+              );
+            }
+            break;
+
+          case "SERIAL_OUT": {
+            // payload is a byte (number) from serial0-output-byte
+            const byte = payload as number;
+            const char = String.fromCharCode(byte);
+
+            // Buffer for batched rendering
+            serialBuffer += char;
+
+            // ── Shell prompt detection ──────────────────────────────────
+            if (!shellReady) {
+              promptBuffer += char;
+              // Keep only last 80 chars for prompt matching
+              if (promptBuffer.length > 80) {
+                promptBuffer = promptBuffer.slice(-80);
+              }
+              // Detect common shell prompts
+              // Buildroot: "/ # "  or "~ # "
+              // Alpine:    "localhost:~# "
+              // Ubuntu:    "user@host:~$ "
+              // Generic:   ends with "# " or "$ "
+              if (
+                promptBuffer.endsWith("# ") ||
+                promptBuffer.endsWith("$ ") ||
+                promptBuffer.endsWith("~ # ") ||
+                promptBuffer.endsWith("~ $ ") ||
+                promptBuffer.endsWith(":~# ") ||
+                promptBuffer.endsWith(":~$ ")
+              ) {
+                shellReady = true;
+                setBootPhase("ready");
+                console.log("[LinuxVM] Shell prompt detected — VM ready");
+              }
+
+              // Transition from "booting" to "kernel" on first serial output
+              if (promptBuffer.length > 10) {
+                setBootPhase((prev) =>
+                  prev === "booting" ? "kernel" : prev
+                );
+              }
+            }
+            break;
+          }
+
+          case "SAVE_SUCCESS":
+            console.log("[LinuxVM] VM state saved");
+            break;
+
+          case "SAVE_FAILURE":
+            console.warn("[LinuxVM] State save failed:", payload);
+            break;
+
+          case "LOG": {
+            const log = payload as { level: string; msg: string };
+            const fn =
+              log.level === "error"
+                ? console.error
+                : log.level === "warn"
+                  ? console.warn
+                  : console.log;
+            fn("[v86-worker]", log.msg);
+            break;
+          }
+        }
+      };
+
+      worker.onerror = (e) => {
+        console.error("[LinuxVM] Worker error:", e);
+        setBootPhase("error");
+      };
+
+      // ── 6. Connect xterm input → worker serial input ────────────────────
+      const dataDisposable = term.onData((data) => {
+        worker.postMessage({ type: "INPUT", payload: data });
+      });
+
+      // Forward Ctrl+C, Ctrl+Z, Ctrl+D as raw bytes
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.ctrlKey && ev.type === "keydown") {
+          const key = ev.key.toLowerCase();
+          if (key === "c") {
+            worker.postMessage({ type: "INPUT", payload: "\x03" });
+            return false;
+          }
+          if (key === "z") {
+            worker.postMessage({ type: "INPUT", payload: "\x1a" });
+            return false;
+          }
+          if (key === "d") {
+            worker.postMessage({ type: "INPUT", payload: "\x04" });
+            return false;
+          }
+        }
+        return true;
+      });
+
+      // ── 7. Resize observer ──────────────────────────────────────────────
+      if (terminalRef.current) {
+        resizeObserver = new ResizeObserver(() => {
+          if (active && fitAddon) {
+            try {
+              fitAddon.fit();
+            } catch {
+              // Ignore resize errors during teardown
+            }
+          }
+        });
+        resizeObserver.observe(terminalRef.current);
       }
+
+      // ── 8. Send INIT to worker ──────────────────────────────────────────
+      worker.postMessage({
+        type: "INIT",
+        payload: { origin: window.location.origin },
+      });
+
+      // Store disposable for cleanup
+      (term as unknown as { _dataDisposable?: { dispose(): void } })._dataDisposable =
+        dataDisposable;
     };
 
-    initialize();
+    init().catch((err) => {
+      console.error("[LinuxVM] Fatal init error:", err);
+      setBootPhase("error");
+    });
 
+    // ── Cleanup ─────────────────────────────────────────────────────────────
     return () => {
       active = false;
-      resizeObserver?.disconnect();
-      v86ContainerRef.current?.destroy();
-      v86ContainerRef.current = null;
-      if (termInstance) {
-        termInstance._v86Disposable?.dispose();
-        termInstance.dispose();
-      }
-    };
-  }, []);
+      initRef.current = false;
 
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+      }
+
+      resizeObserver?.disconnect();
+
+      // Destroy worker
+      if (workerRef.current) {
+        try {
+          workerRef.current.postMessage({ type: "DESTROY" });
+        } catch {
+          // Worker may already be terminated
+        }
+        workerRef.current = null;
+      }
+
+      // Dispose xterm
+      if (term) {
+        const t = term as unknown as { _dataDisposable?: { dispose(): void } };
+        t._dataDisposable?.dispose();
+        term.dispose();
+        term = null;
+      }
+
+      xtermRef.current = null;
+    };
+  }, []); // Empty deps — initialize once
+
+  // ── Render ──────────────────────────────────────────────────────────────
   return (
     <div
       className={cn(
@@ -306,28 +460,31 @@ export function LinuxVM() {
           : "w-full min-h-[540px]"
       )}
     >
-      {/* ── Window Chrome ─────────────────────────────────────── */}
+      {/* Window Chrome */}
       <div className="flex shrink-0 items-center gap-0 h-9 px-4 bg-[#0d0f14] border-b border-white/[0.05] select-none">
-        {/* Traffic lights */}
         <div className="flex items-center gap-1.5 mr-4">
           <TrafficLight color="bg-[#ff5f57]" title="Close" />
           <TrafficLight color="bg-[#ffbd2e]" title="Minimize" />
           <TrafficLight color="bg-[#28c840]" title="Maximize" />
         </div>
 
-        {/* Tab */}
         <div className="flex items-center gap-2 rounded-md bg-white/[0.05] border border-white/[0.07] px-2.5 py-1">
-          <span className={cn("dot-online", booting && "dot-loading")} />
+          <span
+            className={cn(
+              "dot-online",
+              bootPhase !== "ready" && "dot-loading"
+            )}
+          />
           <span className="text-[11px] font-mono text-[#9d94bb]">
             bash — linlearn v86
           </span>
         </div>
 
         <div className="ml-auto flex items-center gap-1">
-          {/* Boot status */}
-          <AnimatePresence>
-            {booting && (
+          <AnimatePresence mode="wait">
+            {bootPhase === "booting" && (
               <motion.span
+                key="booting"
                 variants={FADE}
                 initial="initial"
                 animate="animate"
@@ -337,8 +494,21 @@ export function LinuxVM() {
                 booting kernel…
               </motion.span>
             )}
-            {bootDone && !booting && (
+            {bootPhase === "kernel" && (
               <motion.span
+                key="kernel"
+                variants={FADE}
+                initial="initial"
+                animate="animate"
+                exit="exit"
+                className="mr-2 text-[10px] font-mono text-blue-400/60 tabular"
+              >
+                kernel running…
+              </motion.span>
+            )}
+            {bootPhase === "ready" && (
+              <motion.span
+                key="ready"
                 variants={FADE}
                 initial="initial"
                 animate="animate"
@@ -347,9 +517,19 @@ export function LinuxVM() {
                 kernel ready
               </motion.span>
             )}
+            {bootPhase === "error" && (
+              <motion.span
+                key="error"
+                variants={FADE}
+                initial="initial"
+                animate="animate"
+                className="mr-2 text-[10px] font-mono text-red-400/60"
+              >
+                boot failed
+              </motion.span>
+            )}
           </AnimatePresence>
 
-          {/* Toolbar actions */}
           <button
             type="button"
             title="Clear terminal"
@@ -366,18 +546,21 @@ export function LinuxVM() {
             className="btn-icon h-6 w-6 text-[#635b80] hover:text-[#9d94bb]"
             aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
           >
-            {fullscreen
-              ? <Minimize2 className="h-3 w-3" />
-              : <Maximize2 className="h-3 w-3" />}
+            {fullscreen ? (
+              <Minimize2 className="h-3 w-3" />
+            ) : (
+              <Maximize2 className="h-3 w-3" />
+            )}
           </button>
         </div>
       </div>
 
-      {/* ── Terminal body ──────────────────────────────────────── */}
+      {/* Terminal body */}
       <div className="relative flex-1 min-h-0 scanlines">
-        {/* Boot overlay */}
         <AnimatePresence>
-          {booting && <BootOverlay key="boot-overlay" />}
+          {bootPhase !== "ready" && bootPhase !== "error" && (
+            <BootOverlay key="boot-overlay" phase={bootPhase} />
+          )}
         </AnimatePresence>
 
         <div

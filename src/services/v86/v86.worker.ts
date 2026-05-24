@@ -48,7 +48,7 @@ self.onmessage = async (e: MessageEvent) => {
             url: origin + "/v86/images/bzImage",
             async: false,
           },
-          cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
+          cmdline: "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
           autostart: true,
         };
 

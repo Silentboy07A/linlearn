@@ -751,11 +751,11 @@ export function TerminalSimulator({
             console.error("Failed to load saved state:", e);
           }
 
-          // Instantiate Web Worker
-          const worker = new Worker(new URL("../services/v86/v86.worker.ts", import.meta.url));
+          // Instantiate Web Worker (using plain JS from public/ to bypass Next.js webpack issues)
+          const workerUrl = window.location.origin + "/v86/v86-worker.js";
+          const worker = new Worker(workerUrl);
           v86EmulatorRef.current = worker;
 
-          let isFirstChar = true;
           let isProvisioned = false;
           let outputBuffer = "";
 
@@ -791,11 +791,6 @@ export function TerminalSimulator({
                 }
 
                 // Standard terminal output bridge
-                if (isFirstChar) {
-                  isFirstChar = false;
-                  setV86Booting(false);
-                  term.clear();
-                }
                 term.write(char);
                 
                 // Silent provisioning checking
@@ -804,8 +799,16 @@ export function TerminalSimulator({
                   if (outputBuffer.length > 64) {
                     outputBuffer = outputBuffer.substring(outputBuffer.length - 64);
                   }
-                  if (outputBuffer.endsWith("~% ") || outputBuffer.endsWith("# ") || outputBuffer.endsWith("~# ")) {
+                  if (
+                    outputBuffer.endsWith("~% ") || 
+                    outputBuffer.endsWith("# ") || 
+                    outputBuffer.endsWith("~# ") || 
+                    outputBuffer.endsWith("$ ") || 
+                    outputBuffer.endsWith("]$ ") || 
+                    outputBuffer.endsWith("]# ")
+                  ) {
                     isProvisioned = true;
+                    setV86Booting(false); // Dismiss boot overlay once shell prompt is ready
                     isCapturingValidationRef.current = true;
                     
                     worker.postMessage({
