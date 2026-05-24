@@ -401,7 +401,10 @@ export function LinuxVM() {
       // ── 8. Send INIT to worker ──────────────────────────────────────────
       worker.postMessage({
         type: "INIT",
-        payload: { origin: window.location.origin },
+        payload: {
+          origin: window.location.origin,
+          version: Date.now().toString(),
+        },
       });
 
       // Store disposable for cleanup

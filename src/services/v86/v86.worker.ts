@@ -172,13 +172,14 @@ self.onmessage = async (e: MessageEvent) => {
 
 async function handleInit(payload: any) {
   const origin = payload.origin;
+  const version = payload.version || Date.now().toString();
   const t0 = Date.now();
 
   setLifecycleState("loading");
-  log("info", `Step 1/6: Loading libv86.js from ${origin}/v86/libv86.js`);
+  log("info", `Step 1/6: Loading libv86.js from ${origin}/v86/libv86.js?v=${version}`);
 
   try {
-    (self as any).importScripts(origin + "/v86/libv86.js");
+    (self as any).importScripts(`${origin}/v86/libv86.js?v=${version}`);
   } catch (err: any) {
     const msg = `Failed to load libv86.js: ${err.message || String(err)}`;
     log("error", msg);
@@ -203,7 +204,7 @@ async function handleInit(payload: any) {
   try {
     // Step 1b: Preload Wasm Runtime
     log("info", "Step 1b/6: Preloading and validating WebAssembly runtime...");
-    const wasmBuffer = await loadAsset(origin + "/v86/v86.wasm", "v86.wasm", { autoAlign: true });
+    const wasmBuffer = await loadAsset(`${origin}/v86/v86.wasm?v=${version}`, "v86.wasm", { autoAlign: true });
     const wasmBlob = new Blob([wasmBuffer], { type: "application/wasm" });
     const wasmBlobUrl = URL.createObjectURL(wasmBlob);
     log("info", "Step 1b/6 completed: WebAssembly runtime loaded.");
@@ -233,13 +234,13 @@ async function handleInit(payload: any) {
       
       // Step 2: System BIOS load
       log("info", "Step 2/6: Loading System BIOS (seabios.bin)");
-      const biosBuffer = await loadAsset(origin + "/v86/bios/seabios.bin", "seabios.bin", { requireUint16Alignment: true });
+      const biosBuffer = await loadAsset(`${origin}/v86/bios/seabios.bin?v=${version}`, "seabios.bin", { requireUint16Alignment: true });
       config.bios = { buffer: biosBuffer };
       log("info", "Step 2/6 completed: System BIOS validated.");
 
       // Step 3: VGA BIOS load
       log("info", "Step 3/6: Loading VGA BIOS (vgabios.bin)");
-      const vgaBiosBuffer = await loadAsset(origin + "/v86/bios/vgabios.bin", "vgabios.bin", { requireUint16Alignment: true });
+      const vgaBiosBuffer = await loadAsset(`${origin}/v86/bios/vgabios.bin?v=${version}`, "vgabios.bin", { requireUint16Alignment: true });
       config.vga_bios = { buffer: vgaBiosBuffer };
       log("info", "Step 3/6 completed: VGA BIOS validated.");
 
@@ -247,14 +248,15 @@ async function handleInit(payload: any) {
       // instantiates Uint16Array and Uint32Array views over its buffer, requiring us
       // to auto-align/pad it to a multiple of 4 bytes at runtime to prevent RangeErrors).
       log("info", "Step 4/6: Loading Linux kernel (bzImage)");
-      const bzImageBuffer = await loadAsset(origin + "/v86/images/bzImage", "bzImage", { autoAlign: true });
+      const bzImageBuffer = await loadAsset(`${origin}/v86/images/bzImage?v=${version}`, "bzImage", { autoAlign: true });
       config.bzimage = { buffer: bzImageBuffer };
       log("info", "Step 4/6 completed: Linux kernel validated.");
 
       // Step 5: Filesystem load (none specified for cold boot, but support it if passed)
       if (payload.initrd_url) {
         log("info", `Step 5/6: Loading ramdisk (initrd) from ${payload.initrd_url}`);
-        const initrdBuffer = await loadAsset(payload.initrd_url, "initrd");
+        const urlSeparator = payload.initrd_url.includes("?") ? "&" : "?";
+        const initrdBuffer = await loadAsset(`${payload.initrd_url}${urlSeparator}v=${version}`, "initrd");
         config.initrd = { buffer: initrdBuffer };
         log("info", "Step 5/6 completed: Ramdisk validated.");
       } else {

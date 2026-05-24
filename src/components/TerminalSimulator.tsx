@@ -886,7 +886,8 @@ export function TerminalSimulator({
             type: "INIT",
             payload: {
               origin: window.location.origin,
-              initial_state: savedState
+              initial_state: savedState,
+              version: Date.now().toString()
             }
           });
 
