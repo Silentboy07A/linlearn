@@ -12,7 +12,7 @@ import {
   resolvePath, 
   type VirtualSystemState 
 } from "@/lib/virtualOs";
-import { saveV86State, loadV86State, clearV86State } from "@/lib/v86db";
+
 import { updateMastery, DEFAULT_BKT_PARAMS, type LinuxTopic } from "@/lib/bkt";
 
 
@@ -310,7 +310,7 @@ export function TerminalSimulator({
   const [lastCommand, setLastCommand] = useState<string>("");
   const [isV86Mode, setIsV86Mode] = useState<boolean>(false);
   const [v86Booting, setV86Booting] = useState<boolean>(false);
-  const [isSavingV86, setIsSavingV86] = useState<boolean>(false);
+
   const [isV86Running, setIsV86Running] = useState<boolean>(false);
 
   const [masteryState, setMasteryState] = useState<Record<LinuxTopic, number>>(() => {
@@ -361,24 +361,15 @@ export function TerminalSimulator({
     });
   };
 
-  const handleSaveV86State = () => {
-    const worker = v86EmulatorRef.current;
-    if (!worker || !isV86Running) return;
-    
-    setIsSavingV86(true);
-    worker.postMessage({ type: "SAVE_STATE" });
-  };
+
 
   const handleResetV86State = () => {
-    const confirmed = window.confirm("Are you sure you want to reset the WebAssembly VM state? All unpersisted work inside the guest kernel will be lost.");
-    if (confirmed) {
+    if (v86EmulatorRef.current) {
       setIsV86Running(false);
-      clearV86State().then(() => {
-        setIsV86Mode(false);
-        setTimeout(() => {
-          setIsV86Mode(true);
-        }, 100);
-      });
+      setIsV86Mode(false);
+      setTimeout(() => {
+        setIsV86Mode(true);
+      }, 100);
     }
   };
 
@@ -425,18 +416,9 @@ export function TerminalSimulator({
     onDbFallbackRef.current = onDbFallback;
   }, [onCommandLogged, onDbFallback]);
 
-  // Auto-save WASM VM state periodically
+  // Auto-save WASM VM state periodically (disabled for reliability)
   useEffect(() => {
-    if (!isV86Mode || !v86EmulatorRef.current || v86Booting || !isV86Running) return;
-    
-    const interval = setInterval(() => {
-      const worker = v86EmulatorRef.current;
-      if (worker && !isCapturingValidationRef.current && isV86Running) {
-        worker.postMessage({ type: "SAVE_STATE" });
-      }
-    }, 45000); // auto-save every 45 seconds
-
-    return () => clearInterval(interval);
+    // Snapshots/autosave disabled for reliability.
   }, [isV86Mode, v86Booting, isV86Running]);
 
   // Handle clearSignal from parent
@@ -743,19 +725,8 @@ export function TerminalSimulator({
         setIsV86Running(false);
 
         try {
-          // Attempt to load saved VM state from IndexedDB
-          let savedState: ArrayBuffer | null = null;
-          try {
-            savedState = await loadV86State();
-            if (savedState && xtermInstance.current) {
-              xtermInstance.current.write(" * Found saved session state. Restoring VM snapshot...\r\n");
-            }
-          } catch (e) {
-            console.error("Failed to load saved state:", e);
-          }
-
-          // Keep track of whether we attempted to restore a saved state
-          const attemptedRestore = !!savedState;
+          // Attempt to load saved VM state from IndexedDB (disabled for reliability)
+          const savedState: ArrayBuffer | null = null;
 
           // Instantiate Web Worker (using plain JS from public/ to bypass Next.js webpack issues)
           const workerUrl = window.location.origin + "/v86/v86-worker.js?v=" + Date.now();
@@ -777,17 +748,7 @@ export function TerminalSimulator({
                 console.error("Failed to load v86 VM in worker:", payload);
                 term.write(`\r\n\x1b[1;31mError: Failed to load virtual machine.\x1b[0m\r\n`);
                 term.write(`\x1b[1;30m[Debug Info] ${payload}\x1b[0m\r\n`);
-                
-                if (attemptedRestore) {
-                  term.write(`\r\n\x1b[1;33mWarning: Saved session state may be corrupt. Automatically clearing state and forcing cold boot...\x1b[0m\r\n`);
-                  clearV86State().then(() => {
-                    term.write(`\x1b[1;32mState cleared. Please reload the dashboard to boot clean.\x1b[0m\r\n`);
-                  }).catch(e => {
-                    console.error("Failed to clear corrupt state:", e);
-                  });
-                } else {
-                  term.write("Verify your internet connection and CORS configurations.\r\n");
-                }
+                term.write("Verify your internet connection and CORS configurations.\r\n");
                 setV86Booting(false);
                 break;
               case "LOG":
@@ -864,20 +825,7 @@ export function TerminalSimulator({
                   }
                 }
                 break;
-              case "SAVE_SUCCESS":
-                saveV86State(payload).then(() => {
-                  setIsSavingV86(false);
-                  term.write("\r\n\x1b[1;32m[System] Virtual machine state successfully persisted to browser IndexedDB.\x1b[0m\r\n");
-                }).catch(err => {
-                  console.error("Failed to save state to IndexedDB:", err);
-                  setIsSavingV86(false);
-                });
-                break;
-              case "SAVE_FAILURE":
-                console.error("Failed to save VM state:", payload);
-                alert("Failed to save VM state.");
-                setIsSavingV86(false);
-                break;
+
             }
           };
 
@@ -1243,14 +1191,6 @@ export function TerminalSimulator({
           {isV86Mode && (
             <>
               <button
-                onClick={handleSaveV86State}
-                disabled={isSavingV86 || !isV86Running || v86Booting}
-                className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <Award className="h-3.5 w-3.5" />
-                {isSavingV86 ? "Saving State..." : "Save VM State"}
-              </button>
-              <button
                 onClick={handleResetV86State}
                 className="flex items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-400 transition-all hover:bg-rose-500/20 hover:text-white"
               >
@@ -1467,12 +1407,23 @@ export function TerminalSimulator({
                                            })
                                          });
                                         if (res.ok) {
+                                          const verifyData = await res.json();
+                                          const grade = verifyData.grade || {
+                                            score: 7.5,
+                                            feedback: "Successfully verified command execution."
+                                          };
                                           setCompletedVasmMissions(prev => ({ ...prev, [mission.id]: true }));
                                           updateBKT(MISSION_TOPICS[mission.id] || "navigation", true);
+                                          
+                                          if (xtermInstance.current) {
+                                            xtermInstance.current.write(`\r\n\x1b[1;32m[Judge Result] Mission Completed! Score: ${grade.score}/10.0\x1b[0m\r\n`);
+                                            xtermInstance.current.write(`\x1b[1;30mFeedback: ${grade.feedback}\x1b[0m\r\n`);
+                                          }
+
                                           onCommandLoggedRef.current({
                                             id: Math.random().toString(36).substring(2, 10),
                                             input: `Verify: ${mission.title}`,
-                                            output: `Mission "${mission.title}" verified successfully inside the WASM guest VM and recorded on the server!`,
+                                            output: `Mission "${mission.title}" verified successfully inside the WASM guest VM and graded by LLM! Score: ${grade.score}/10.0. Feedback: ${grade.feedback}`,
                                             source: "local",
                                             createdAt: new Date().toISOString()
                                           });

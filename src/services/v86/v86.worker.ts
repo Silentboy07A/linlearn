@@ -1,114 +1,24 @@
 // src/services/v86/v86.worker.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-interface V86StarterConfig {
-  wasm_path: string;
-  bios?: { buffer: ArrayBuffer };
-  vga_bios?: { buffer: ArrayBuffer };
-  bzimage?: { buffer: ArrayBuffer };
-  initrd?: { buffer: ArrayBuffer };
-  cmdline?: string;
-  autostart: boolean;
-  initial_state?: { buffer: ArrayBuffer };
-  memory_size?: number;
-  vga_memory_size?: number;
-}
-
-interface V86StarterInstance {
-  serial0_send: (data: string) => void;
-  add_listener: (event: string, cb: (...args: any[]) => void) => void;
-  remove_listener: (event: string, cb: (...args: any[]) => void) => void;
-  destroy: () => void | Promise<void>;
-  stop: () => Promise<void>;
-  restart: () => void;
-  save_state: () => Promise<ArrayBuffer>;
-}
+import { log } from "./logger";
+import { loadAsset } from "./assetLoader";
+import {
+  setLifecycleState,
+  getLifecycleState,
+  canInitialize,
+  canSendInput,
+  setBootingInProgress,
+  isBooting,
+} from "./vmLifecycle";
+import {
+  getEmulator,
+  createEmulator,
+  destroyEmulator,
+  V86StarterConfig,
+} from "./emulatorManager";
 
 interface WindowWithV86 {
-  V86: new (config: V86StarterConfig) => V86StarterInstance;
-}
-
-type EmulatorState = "idle" | "loading" | "initialized" | "booting" | "running" | "failed";
-
-let emulator: V86StarterInstance | null = null;
-let lifecycleState: EmulatorState = "idle";
-
-function log(level: string, msg: string) {
-  const formattedLevel = level.toUpperCase();
-  const prefix = `[v86-worker] [${formattedLevel}]`;
-  let cleanMsg = msg;
-  if (msg.indexOf(prefix) !== 0) {
-    cleanMsg = `${prefix} ${msg}`;
-  }
-  (self as any).postMessage({ type: "LOG", payload: { level: level.toLowerCase(), msg: cleanMsg } });
-}
-
-function setLifecycleState(newState: EmulatorState) {
-  if (lifecycleState !== newState) {
-    const oldState = lifecycleState;
-    lifecycleState = newState;
-    log("debug", `Lifecycle state transitioned: ${oldState} -> ${newState}`);
-    (self as any).postMessage({ type: "STATE_CHANGED", payload: newState });
-  }
-}
-
-async function validateBinaryResponse(response: Response, name: string): Promise<ArrayBuffer> {
-  if (!response.ok) {
-    throw new Error(`Failed to load ${name}: HTTP status ${response.status} ${response.statusText}`);
-  }
-
-  const contentType = response.headers.get("content-type") || "";
-  const ctLower = contentType.toLowerCase();
-  if (ctLower.includes("text/html") || ctLower.includes("application/xhtml+xml") || ctLower.includes("text/xml")) {
-    throw new Error(`Failed to load ${name}: received HTML/XML instead of binary stream (probable 404 page redirect)`);
-  }
-
-  const buffer = await response.arrayBuffer();
-  if (!buffer || !(buffer instanceof ArrayBuffer)) {
-    throw new Error(`Failed to load ${name}: response is not a valid ArrayBuffer`);
-  }
-
-  if (buffer.byteLength === 0) {
-    throw new Error(`Failed to load ${name}: asset is empty (0 bytes)`);
-  }
-
-  return buffer;
-}
-
-async function loadAsset(
-  url: string,
-  name: string,
-  options: { requireUint16Alignment?: boolean; autoAlign?: boolean } = {}
-): Promise<ArrayBuffer> {
-  log("debug", `Fetching asset: ${name} from ${url}`);
-  try {
-    const response = await fetch(url);
-    let buffer = await validateBinaryResponse(response, name);
-    const byteLength = buffer.byteLength;
-
-    // Only apply Uint16Array divisibility validation (divisible by 2) if option is explicitly set
-    if (options.requireUint16Alignment) {
-      if (byteLength % 2 !== 0) {
-        throw new Error(`size (${byteLength}) is not a multiple of 2 (required for Uint16Array parsing)`);
-      }
-    }
-
-    if (options.autoAlign && byteLength % 4 !== 0) {
-      const padBytes = 4 - (byteLength % 4);
-      log("info", `Auto-aligning asset ${name}: padding ${byteLength} bytes with ${padBytes} bytes to make it a multiple of 4.`);
-      console.log(`[v86-worker] [DEBUG] Padding ${name} from ${byteLength} to ${byteLength + padBytes} bytes.`);
-      const alignedBuffer = new ArrayBuffer(byteLength + padBytes);
-      new Uint8Array(alignedBuffer).set(new Uint8Array(buffer));
-      buffer = alignedBuffer;
-    }
-
-    log("info", `Loaded asset: ${name}, size: ${buffer.byteLength} bytes`);
-    return buffer;
-  } catch (err: any) {
-    const errorMsg = `Failed to load ${name}: ${err.message || String(err)}`;
-    log("error", errorMsg);
-    throw new Error(errorMsg);
-  }
+  V86: any;
 }
 
 self.onmessage = async (e: MessageEvent) => {
@@ -117,20 +27,23 @@ self.onmessage = async (e: MessageEvent) => {
 
   switch (type) {
     case "INIT":
-      if (lifecycleState !== "idle" && lifecycleState !== "failed") {
-        log("warn", `Ignored INIT command: Emulator already initialized or loading. Current state: ${lifecycleState}`);
+      if (!canInitialize() || isBooting()) {
+        log("warn", `Ignored INIT: emulator already initializing or running (state: ${getLifecycleState()})`);
         return;
       }
+      setBootingInProgress(true);
       await handleInit(payload);
+      setBootingInProgress(false);
       break;
 
-    case "INPUT":
+    case "INPUT": {
+      const emulator = getEmulator();
       if (!emulator) {
-        log("debug", `Ignored serial input: No active emulator instance. Current state: ${lifecycleState}`);
+        log("debug", `Ignored serial input: No active emulator (state: ${getLifecycleState()})`);
         break;
       }
-      if (lifecycleState !== "initialized" && lifecycleState !== "booting" && lifecycleState !== "running") {
-        log("debug", `Ignored serial input: Emulator is in non-interactive state: ${lifecycleState}`);
+      if (!canSendInput()) {
+        log("debug", `Ignored serial input: VM is in non-interactive state (state: ${getLifecycleState()})`);
         break;
       }
       try {
@@ -139,18 +52,15 @@ self.onmessage = async (e: MessageEvent) => {
         log("error", `Failed to send serial input: ${err.message || String(err)}`);
       }
       break;
+    }
 
     case "SET_RUNNING":
-      if (lifecycleState === "initialized" || lifecycleState === "booting") {
+      if (getLifecycleState() === "booting") {
         setLifecycleState("running");
         log("info", "Emulator successfully transitioned to running state (boot complete)");
       } else {
-        log("warn", `Ignored SET_RUNNING message. Current state: ${lifecycleState}`);
+        log("warn", `Ignored SET_RUNNING: current state: ${getLifecycleState()}`);
       }
-      break;
-
-    case "SAVE_STATE":
-      await handleSaveState();
       break;
 
     case "STOP":
@@ -162,7 +72,7 @@ self.onmessage = async (e: MessageEvent) => {
       break;
 
     case "DESTROY":
-      handleDestroy();
+      await handleDestroy();
       break;
 
     default:
@@ -176,7 +86,7 @@ async function handleInit(payload: any) {
   const t0 = Date.now();
 
   setLifecycleState("loading");
-  log("info", `Step 1/6: Loading libv86.js from ${origin}/v86/libv86.js?v=${version}`);
+  log("info", `Step 1/4: Loading libv86.js from ${origin}/v86/libv86.js?v=${version}`);
 
   try {
     (self as any).importScripts(`${origin}/v86/libv86.js?v=${version}`);
@@ -197,143 +107,56 @@ async function handleInit(payload: any) {
     return;
   }
 
-  log("info", `Step 1/6 completed: libv86.js loaded in ${Date.now() - t0}ms`);
-
-  const isRestore = !!(payload.initial_state && payload.initial_state.byteLength > 1024);
+  log("info", `Step 1/4 completed: libv86.js loaded in ${Date.now() - t0}ms`);
 
   try {
-    // Step 1b: Preload Wasm Runtime
-    log("info", "Step 1b/6: Preloading and validating WebAssembly runtime...");
-    const wasmBuffer = await loadAsset(`${origin}/v86/v86.wasm?v=${version}`, "v86.wasm", { autoAlign: true });
+    // Step 2: Preload Wasm Runtime
+    log("info", "Step 2/4: Preloading and validating WebAssembly runtime...");
+    const wasmBuffer = await loadAsset(`${origin}/v86/v86.wasm?v=${version}`, "v86.wasm");
     const wasmBlob = new Blob([wasmBuffer], { type: "application/wasm" });
     const wasmBlobUrl = URL.createObjectURL(wasmBlob);
-    log("info", "Step 1b/6 completed: WebAssembly runtime loaded.");
+    log("info", "Step 2/4 completed: WebAssembly runtime loaded.");
 
-    // Basic config required for both cold boot and snapshot restore
+    // Step 3: Load Boot Binaries (BIOS, VGA BIOS, Kernel)
+    log("info", "Step 3/4: Loading BIOS & Kernel binaries...");
+
+    log("info", "Loading System BIOS (seabios.bin)");
+    const biosBuffer = await loadAsset(`${origin}/v86/bios/seabios.bin?v=${version}`, "seabios.bin");
+
+    log("info", "Loading VGA BIOS (vgabios.bin)");
+    const vgaBiosBuffer = await loadAsset(`${origin}/v86/bios/vgabios.bin?v=${version}`, "vgabios.bin");
+
+    log("info", "Loading Linux kernel (bzImage)");
+    const bzImageBuffer = await loadAsset(`${origin}/v86/images/bzImage?v=${version}`, "bzImage");
+
     const config: V86StarterConfig = {
       wasm_path: wasmBlobUrl,
-      memory_size: payload.memory_size || 64 * 1024 * 1024, // 64 MB
+      bios: { buffer: biosBuffer },
+      vga_bios: { buffer: vgaBiosBuffer },
+      bzimage: { buffer: bzImageBuffer },
       autostart: true,
+      cmdline: payload.cmdline || "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
+      memory_size: payload.memory_size || 64 * 1024 * 1024,
     };
 
-    if (isRestore) {
-      log("info", `Restoring saved state snapshot (${Math.round(payload.initial_state.byteLength / 1024)} KB)`);
+    // Step 4: Create emulator
+    log("info", "Step 4/4: Creating v86 emulator instance...");
+    await createEmulator(config, win);
 
-      // Perform signature check on saved state before applying it
-      const view = new DataView(payload.initial_state);
-      const magic = view.getInt32(0, true);
-      if (magic !== -2039052682) {
-        throw new Error(`Saved state magic bytes mismatch: ${magic} (expected -2039052682)`);
-      }
-
-      config.initial_state = { buffer: payload.initial_state };
-      log("info", "Snapshot signature verified successfully.");
-    } else {
-      log("info", "Cold booting Linux VM — validating boot binaries...");
-      
-      // Step 2: System BIOS load
-      log("info", "Step 2/6: Loading System BIOS (seabios.bin)");
-      const biosBuffer = await loadAsset(`${origin}/v86/bios/seabios.bin?v=${version}`, "seabios.bin", { requireUint16Alignment: true });
-      config.bios = { buffer: biosBuffer };
-      log("info", "Step 2/6 completed: System BIOS validated.");
-
-      // Step 3: VGA BIOS load
-      log("info", "Step 3/6: Loading VGA BIOS (vgabios.bin)");
-      const vgaBiosBuffer = await loadAsset(`${origin}/v86/bios/vgabios.bin?v=${version}`, "vgabios.bin", { requireUint16Alignment: true });
-      config.vga_bios = { buffer: vgaBiosBuffer };
-      log("info", "Step 3/6 completed: VGA BIOS validated.");
-
-      // Step 4: Kernel load (bzImage itself does not require even size, but libv86.js
-      // instantiates Uint16Array and Uint32Array views over its buffer, requiring us
-      // to auto-align/pad it to a multiple of 4 bytes at runtime to prevent RangeErrors).
-      log("info", "Step 4/6: Loading Linux kernel (bzImage)");
-      const bzImageBuffer = await loadAsset(`${origin}/v86/images/bzImage?v=${version}`, "bzImage", { autoAlign: true });
-      config.bzimage = { buffer: bzImageBuffer };
-      log("info", "Step 4/6 completed: Linux kernel validated.");
-
-      // Step 5: Filesystem load (none specified for cold boot, but support it if passed)
-      if (payload.initrd_url) {
-        log("info", `Step 5/6: Loading ramdisk (initrd) from ${payload.initrd_url}`);
-        const urlSeparator = payload.initrd_url.includes("?") ? "&" : "?";
-        const initrdBuffer = await loadAsset(`${payload.initrd_url}${urlSeparator}v=${version}`, "initrd");
-        config.initrd = { buffer: initrdBuffer };
-        log("info", "Step 5/6 completed: Ramdisk validated.");
-      } else {
-        log("info", "Step 5/6: Skipping external filesystem/ramdisk loading (none specified).");
-      }
-
-      config.cmdline = payload.cmdline ||
-        "tsc=reliable mitigations=off random.trust_cpu=on " +
-        "console=ttyS0";
-    }
-
-    // Step 6: Create emulator
-    log("info", "Step 6/6: Creating v86 emulator instance...");
-    if (emulator) {
-      log("warn", "Pre-existing emulator instance found during init. Destroying it first.");
-      try {
-        await emulator.destroy();
-      } catch {
-        // ignore
-      }
-      emulator = null;
-    }
-
-    console.log(`[v86-worker] [DEBUG] Initializing V86 with bzimage buffer length: ${config.bzimage ? config.bzimage.buffer.byteLength : "N/A"}`);
-    emulator = new win.V86(config);
-
-    // Bridge serial0 output back to main thread
-    emulator.add_listener("serial0-output-byte", (byte: number) => {
-      (self as any).postMessage({ type: "SERIAL_OUT", payload: byte });
-    });
-
-    setLifecycleState("initialized");
     (self as any).postMessage({ type: "INIT_SUCCESS" });
     log("info", "v86 emulator successfully created. Transitioned to booting guest...");
     setLifecycleState("booting");
   } catch (err: any) {
     setLifecycleState("failed");
-    emulator = null;
+    await destroyEmulator();
     const initErr = `Emulator initialization failed: ${err.message || String(err)}`;
     log("error", initErr);
     (self as any).postMessage({ type: "INIT_FAILURE", payload: initErr });
   }
 }
 
-async function handleSaveState() {
-  if (!emulator) {
-    log("debug", `Save state request ignored: No active emulator instance (state: ${lifecycleState})`);
-    return;
-  }
-
-  if (lifecycleState !== "running") {
-    log("debug", `Save state request ignored: Emulator is not running (state: ${lifecycleState})`);
-    return;
-  }
-
-  log("info", "Saving VM state snapshot...");
-  try {
-    emulator.save_state()
-      .then((state: ArrayBuffer) => {
-        if (!state || !(state instanceof ArrayBuffer)) {
-          throw new Error("Invalid state buffer returned by emulator");
-        }
-        (self as any).postMessage({ type: "SAVE_SUCCESS", payload: state }, [state]);
-        log("info", "VM state snapshot successfully saved.");
-      })
-      .catch((err: any) => {
-        const errStr = String(err.message || err);
-        log("error", `Save state API failed: ${errStr}`);
-        (self as any).postMessage({ type: "SAVE_FAILURE", payload: errStr });
-      });
-  } catch (err: any) {
-    const errStr = String(err.message || err);
-    log("error", `Exception thrown in save_state: ${errStr}`);
-    (self as any).postMessage({ type: "SAVE_FAILURE", payload: errStr });
-  }
-}
-
 async function handleStop() {
+  const emulator = getEmulator();
   if (!emulator) {
     log("debug", "Stop request ignored: No active emulator instance.");
     return;
@@ -348,6 +171,7 @@ async function handleStop() {
 }
 
 function handleRestart() {
+  const emulator = getEmulator();
   if (!emulator) {
     log("debug", "Restart request ignored: No active emulator instance.");
     return;
@@ -362,17 +186,9 @@ function handleRestart() {
   }
 }
 
-function handleDestroy() {
+async function handleDestroy() {
   log("info", "Destroying emulator worker context...");
-  setLifecycleState("idle");
-  if (emulator) {
-    try {
-      emulator.destroy();
-      log("info", "Emulator instance destroyed successfully.");
-    } catch (err: any) {
-      log("warn", `Destroy error (non-fatal): ${err.message || String(err)}`);
-    }
-    emulator = null;
-  }
+  setLifecycleState("destroyed");
+  await destroyEmulator();
   self.close();
 }
