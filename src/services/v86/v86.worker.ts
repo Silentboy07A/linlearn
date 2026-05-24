@@ -242,9 +242,11 @@ async function handleInit(payload: any) {
       config.vga_bios = { buffer: vgaBiosBuffer };
       log("info", "Step 3/6 completed: VGA BIOS validated.");
 
-      // Step 4: Kernel load (bzImage does NOT need divisibility by 2)
+      // Step 4: Kernel load (bzImage itself does not require even size, but libv86.js
+      // instantiates Uint16Array and Uint32Array views over its buffer, requiring us
+      // to auto-align/pad it to a multiple of 4 bytes at runtime to prevent RangeErrors).
       log("info", "Step 4/6: Loading Linux kernel (bzImage)");
-      const bzImageBuffer = await loadAsset(origin + "/v86/images/bzImage", "bzImage");
+      const bzImageBuffer = await loadAsset(origin + "/v86/images/bzImage", "bzImage", { autoAlign: true });
       config.bzimage = { buffer: bzImageBuffer };
       log("info", "Step 4/6 completed: Linux kernel validated.");
 
