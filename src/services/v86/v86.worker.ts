@@ -54,22 +54,22 @@ function setLifecycleState(newState: EmulatorState) {
 
 async function validateBinaryResponse(response: Response, name: string): Promise<ArrayBuffer> {
   if (!response.ok) {
-    throw new Error(`HTTP status ${response.status} ${response.statusText}`);
+    throw new Error(`Failed to load ${name}: HTTP status ${response.status} ${response.statusText}`);
   }
 
   const contentType = response.headers.get("content-type") || "";
   const ctLower = contentType.toLowerCase();
   if (ctLower.includes("text/html") || ctLower.includes("application/xhtml+xml") || ctLower.includes("text/xml")) {
-    throw new Error("received HTML/XML instead of binary stream (probable 404 page redirect)");
+    throw new Error(`Failed to load ${name}: received HTML/XML instead of binary stream (probable 404 page redirect)`);
   }
 
   const buffer = await response.arrayBuffer();
   if (!buffer || !(buffer instanceof ArrayBuffer)) {
-    throw new Error("response is not a valid ArrayBuffer");
+    throw new Error(`Failed to load ${name}: response is not a valid ArrayBuffer`);
   }
 
   if (buffer.byteLength === 0) {
-    throw new Error("asset is empty (0 bytes)");
+    throw new Error(`Failed to load ${name}: asset is empty (0 bytes)`);
   }
 
   return buffer;
@@ -270,7 +270,7 @@ async function handleInit(payload: any) {
       log("warn", "Pre-existing emulator instance found during init. Destroying it first.");
       try {
         await emulator.destroy();
-      } catch (e) {
+      } catch {
         // ignore
       }
       emulator = null;
