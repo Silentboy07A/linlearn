@@ -35,6 +35,29 @@ function log(level, msg) {
 var lifecycleState = "idle";
 var isBootingInProgress = false;
 
+// Serial byte buffering variables
+var serialSendBuffer = [];
+var serialTimeoutId = null;
+var utf8Decoder = typeof TextDecoder !== "undefined" ? new TextDecoder("utf-8") : null;
+
+function flushSerialBuffer() {
+  if (serialSendBuffer.length > 0) {
+    if (utf8Decoder) {
+      var uint8 = new Uint8Array(serialSendBuffer);
+      var str = utf8Decoder.decode(uint8, { stream: true });
+      self.postMessage({ type: "SERIAL_OUT", payload: str });
+    } else {
+      var str = "";
+      for (var i = 0; i < serialSendBuffer.length; i++) {
+        str += String.fromCharCode(serialSendBuffer[i]);
+      }
+      self.postMessage({ type: "SERIAL_OUT", payload: str });
+    }
+    serialSendBuffer = [];
+  }
+  serialTimeoutId = null;
+}
+
 /**
  * Update the emulator lifecycle state and notify the host.
  * @param {EmulatorState} newState
@@ -146,9 +169,17 @@ async function createEmulator(config, win) {
 
     emulator = new win.V86(finalConfig);
 
-    // Bridge serial output
+    // Bridge serial output with batch buffering
     emulator.add_listener("serial0-output-byte", function (byte) {
-      self.postMessage({ type: "SERIAL_OUT", payload: byte });
+      serialSendBuffer.push(byte);
+      if (serialSendBuffer.length >= 1024) {
+        if (serialTimeoutId) {
+          clearTimeout(serialTimeoutId);
+        }
+        flushSerialBuffer();
+      } else if (!serialTimeoutId) {
+        serialTimeoutId = setTimeout(flushSerialBuffer, 10);
+      }
     });
 
     log("info", "v86 emulator successfully created.");
@@ -205,11 +236,11 @@ self.onmessage = async function (e) {
         log("debug", "Ignored serial input: No active emulator (state: " + lifecycleState + ")");
         break;
       }
-      if (!canSendInput()) {
-        log("debug", "Ignored serial input: VM is in non-interactive state (state: " + lifecycleState + ")");
+      if (typeof payload !== "string") {
+        log("warn", "Ignored non-string serial input payload");
         break;
       }
-      log("debug", "Routing serial input of length " + (payload ? payload.length : 0) + " to emulator");
+      log("debug", "Routing serial input of length " + payload.length + " to emulator");
       try {
         emulator.serial0_send(payload);
       } catch (err) {

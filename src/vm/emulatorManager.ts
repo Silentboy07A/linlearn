@@ -6,6 +6,7 @@ import { ResourceLimitsValidator } from "./resourceLimits";
 import { VMSessionConfig, VMState } from "../lib/types";
 import { Logger } from "../lib/logger";
 import { VMInitializationError } from "../lib/errors";
+import { GUEST_INSPECT_SCRIPT } from "./inspect";
 
 export class EmulatorManager {
   private static activeInstance: EmulatorManager | null = null;
@@ -27,6 +28,7 @@ export class EmulatorManager {
   private saveStateResolver: ((buffer: ArrayBuffer) => void) | null = null;
   private saveStateRejecter: ((err: any) => void) | null = null;
   private watchdogTimer: NodeJS.Timeout | null = null;
+  private serialHistory: string = "";
 
   constructor(config: Partial<VMSessionConfig> = {}) {
     this.bridge = new WorkerBridge();
@@ -104,6 +106,10 @@ export class EmulatorManager {
               }
             }
             const char = typeof payload === "number" ? String.fromCharCode(payload) : String(payload);
+            this.serialHistory += char;
+            if (this.serialHistory.length > 20000) {
+              this.serialHistory = this.serialHistory.substring(this.serialHistory.length - 20000);
+            }
             if (this.onSerialOutput) {
               this.onSerialOutput(char);
             }
@@ -180,6 +186,14 @@ export class EmulatorManager {
     this.onStateChange = null;
   }
 
+  public getSerialHistory(): string {
+    return this.serialHistory;
+  }
+
+  public clearSerialHistory(): void {
+    this.serialHistory = "";
+  }
+
   public async saveState(): Promise<ArrayBuffer> {
     const currentState = this.lifecycle.getState().state;
     if (currentState !== "running") {
@@ -204,9 +218,8 @@ export class EmulatorManager {
   }
 
   public sendInput(data: string): void {
-    const stateName = this.lifecycle.getState().state;
-    if (stateName !== "running") {
-      Logger.warn("VM", `Refusing to send user keyboard input: VM is in non-running state: ${stateName}`);
+    if (!this.lifecycle.isAlive()) {
+      Logger.warn("VM", "Refusing to send user keyboard input: VM is not alive");
       return;
     }
     this.bridge.post("INPUT", data);
@@ -246,8 +259,13 @@ export class EmulatorManager {
       if (currentState === "loading" || currentState === "booting") {
         Logger.warn("VM", `[WATCHDOG] VM boot stalled in state: ${currentState}. Recovering...`);
         this.transitionState("running");
+        
+        // Execute recovery script to revive shell and stty settings
+        const recoveryScript = `\n\x03\x03\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nsu - user\nexport PS1='user@linlearn:\\w\\$ '\necho "PROVISIONING_COMPLETE"\n`;
+        this.sendProgrammaticInput(recoveryScript);
+
         if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Boot took too long. Forcing interactive mode...\x1b[0m\r\n");
+          this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Boot took too long. Restoring shell and forcing interactive mode...\x1b[0m\r\n");
         }
       }
     }, 45000); // 45 seconds for kernel boot
@@ -261,12 +279,16 @@ export class EmulatorManager {
       if (currentState === "provisioning") {
         Logger.warn("VM", `[WATCHDOG] VM provisioning stalled. Recovering...`);
         this.transitionState("running");
+        
+        // Execute recovery script to revive shell and stty settings
+        const recoveryScript = `\n\x03\x03\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nsu - user\nexport PS1='user@linlearn:\\w\\$ '\necho "PROVISIONING_COMPLETE"\n`;
+        this.sendProgrammaticInput(recoveryScript);
+
         if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Provisioning took too long. Forcing interactive mode...\x1b[0m\r\n");
+          this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Provisioning took too long. Restoring shell and forcing interactive mode...\x1b[0m\r\n");
         }
       }
     }, 15000); // 15 seconds for provisioning commands
-
   }
 
   private stopWatchdog(): void {

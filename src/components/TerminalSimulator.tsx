@@ -424,6 +424,8 @@ export function TerminalSimulator({
         if (validationResolverRef.current) {
           isCapturingValidationRef.current = false;
           validationResolverRef.current = null;
+          // Force-send stty echo to recover terminal in guest
+          emulator.sendInput("\nstty echo\n");
           resolve(null);
         }
       }, 6000);
@@ -718,6 +720,8 @@ export function TerminalSimulator({
       term.loadAddon(fitAddon);
 
       if (terminalRef.current) {
+        // Prevent duplicate terminal container leak
+        terminalRef.current.innerHTML = "";
         term.open(terminalRef.current);
         fitAddon.fit();
 
@@ -754,7 +758,23 @@ export function TerminalSimulator({
 
         let isProvisioned = false;
         let isProvisioning = false;
-        let outputBuffer = "";
+
+        // Frame-batched serial output rendering for butter smooth performance
+        let serialBuffer = "";
+        let rafId: number | null = null;
+
+        const flushSerial = () => {
+          if (!isMounted) return;
+          if (serialBuffer.length > 0 && term) {
+            term.write(serialBuffer);
+            serialBuffer = "";
+          }
+          rafId = requestAnimationFrame(flushSerial);
+        };
+        rafId = requestAnimationFrame(flushSerial);
+
+        // Store rafId on custom terminal properties to cancel it on unmount
+        (term as any)._rafId = rafId;
 
         const onSerial = (char: string) => {
           if (!isMounted) return;
@@ -779,12 +799,12 @@ export function TerminalSimulator({
 
           // Standard terminal bridge (unless we are provisioning silently)
           if (!isProvisioning) {
-            term.write(char);
+            serialBuffer += char;
           }
 
           // State checking for guest provisioning
           if (!isProvisioned) {
-            outputBuffer += char;
+            let outputBuffer = lastOutputRef.current;
             if (outputBuffer.length > 256) {
               outputBuffer = outputBuffer.substring(outputBuffer.length - 256);
             }
@@ -818,8 +838,10 @@ export function TerminalSimulator({
               term.write(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
               term.write("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
               
-              // Focus terminal automatically when ready
-              term.focus();
+              // Focus terminal automatically with a small delay to ensure canvas is ready
+              setTimeout(() => {
+                if (isMounted) term.focus();
+              }, 150);
             }
           }
         };
@@ -836,7 +858,9 @@ export function TerminalSimulator({
             isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(true);
-            term.focus();
+            setTimeout(() => {
+              if (isMounted) term.focus();
+            }, 150);
           } else if (newState === "provisioning") {
             isProvisioned = false;
             isProvisioning = true;
@@ -853,8 +877,8 @@ export function TerminalSimulator({
         if (isReattached) {
           term.write(" * Reattaching to active VM session...\r\n");
           emulator.reattach(onSerial, onState);
-          // Print terminal history
-          term.write(lastOutputRef.current);
+          // Print persistent terminal history from emulatorManager instead of the stale lastOutputRef
+          term.write(emulator.getSerialHistory());
           
           // Re-sync local flags from emulator state
           const currentVmState = emulator.getLifecycleState().state;
@@ -864,7 +888,9 @@ export function TerminalSimulator({
             isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(true);
-            term.focus();
+            setTimeout(() => {
+              if (isMounted) term.focus();
+            }, 150);
           } else if (currentVmState === "provisioning") {
             isProvisioned = false;
             isProvisioning = true;
@@ -880,7 +906,11 @@ export function TerminalSimulator({
           try {
             // 1. Fetch saved state snapshot
             const savedState = await persistenceManager.loadState("default_session");
-            if (!isMounted) return;
+            if (!isMounted) {
+              term.dispose();
+              if (rafId !== null) cancelAnimationFrame(rafId);
+              return;
+            }
 
             if (savedState) {
               term.write(" * Found saved snapshot. Restoring VM state...\r\n");
@@ -893,7 +923,11 @@ export function TerminalSimulator({
             // 2. Start VM
             try {
               await emulator.start(window.location.origin, onSerial, onState, savedState || undefined);
-              if (!isMounted) return;
+              if (!isMounted) {
+                term.dispose();
+                if (rafId !== null) cancelAnimationFrame(rafId);
+                return;
+              }
               
               if (savedState) {
                 isProvisioned = true;
@@ -901,23 +935,37 @@ export function TerminalSimulator({
                 setV86Booting(false);
                 setIsV86Running(true);
                 term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
-                term.focus();
+                setTimeout(() => {
+                  if (isMounted) term.focus();
+                }, 150);
               }
             } catch (bootErr) {
-              if (!isMounted) return;
+              if (!isMounted) {
+                term.dispose();
+                if (rafId !== null) cancelAnimationFrame(rafId);
+                return;
+              }
               if (savedState) {
                 term.write("\r\n\x1b[1;33m[VM] Snapshot restoration failed. Clearing corrupted state and performing cold boot...\x1b[0m\r\n");
                 await persistenceManager.clearState("default_session");
                 setHasSavedState(false);
                 // Fallback to cold boot
                 await emulator.start(window.location.origin, onSerial, onState, undefined);
-                if (!isMounted) return;
+                if (!isMounted) {
+                  term.dispose();
+                  if (rafId !== null) cancelAnimationFrame(rafId);
+                  return;
+                }
               } else {
                 throw bootErr;
               }
             }
           } catch (err: unknown) {
-            if (!isMounted) return;
+            if (!isMounted) {
+              term.dispose();
+              if (rafId !== null) cancelAnimationFrame(rafId);
+              return;
+            }
             const errMsg = err instanceof Error ? err.message : String(err);
             console.error("Failed to load v86 VM:", err);
             term.write(`\r\n\x1b[1;31mError: Failed to load VM. ${errMsg}\x1b[0m\r\n`);
@@ -931,7 +979,8 @@ export function TerminalSimulator({
           if (isCapturingValidationRef.current) {
             return;
           }
-          if (emulator.getLifecycleState().state !== "running") {
+          const vmState = emulator.getLifecycleState().state;
+          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
             return;
           }
 
@@ -967,7 +1016,11 @@ export function TerminalSimulator({
         });
 
         term.attachCustomKeyEventHandler((ev) => {
-          if (isCapturingValidationRef.current || emulator.getLifecycleState().state !== "running") {
+          if (isCapturingValidationRef.current) {
+            return false;
+          }
+          const vmState = emulator.getLifecycleState().state;
+          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
             return false;
           }
           if (ev.ctrlKey && ev.type === "keydown") {
@@ -1261,6 +1314,9 @@ export function TerminalSimulator({
         }
         if (customTerm._v86Disposable) {
           customTerm._v86Disposable.dispose();
+        }
+        if ((term as any)._rafId) {
+          cancelAnimationFrame((term as any)._rafId);
         }
         if (term.element) {
           if (customTerm._handleFocus) {
