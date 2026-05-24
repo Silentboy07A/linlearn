@@ -212,8 +212,7 @@ async function handleInit(payload: any) {
     // Basic config required for both cold boot and snapshot restore
     const config: V86StarterConfig = {
       wasm_path: wasmBlobUrl,
-      memory_size: payload.memory_size || 128 * 1024 * 1024, // 128 MB
-      vga_memory_size: payload.vga_memory_size || 2 * 1024 * 1024, // 2 MB
+      memory_size: payload.memory_size || 64 * 1024 * 1024, // 64 MB
       autostart: true,
     };
 
@@ -264,7 +263,6 @@ async function handleInit(payload: any) {
       }
 
       config.cmdline = payload.cmdline ||
-        "rw init=/sbin/init root=/dev/ram0 " +
         "tsc=reliable mitigations=off random.trust_cpu=on " +
         "console=ttyS0";
     }
