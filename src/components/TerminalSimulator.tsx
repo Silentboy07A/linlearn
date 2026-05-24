@@ -311,6 +311,7 @@ export function TerminalSimulator({
   const [isV86Mode, setIsV86Mode] = useState<boolean>(false);
   const [v86Booting, setV86Booting] = useState<boolean>(false);
   const [isSavingV86, setIsSavingV86] = useState<boolean>(false);
+  const [isV86Running, setIsV86Running] = useState<boolean>(false);
 
   const [masteryState, setMasteryState] = useState<Record<LinuxTopic, number>>(() => {
     return {
@@ -362,7 +363,7 @@ export function TerminalSimulator({
 
   const handleSaveV86State = () => {
     const worker = v86EmulatorRef.current;
-    if (!worker) return;
+    if (!worker || !isV86Running) return;
     
     setIsSavingV86(true);
     worker.postMessage({ type: "SAVE_STATE" });
@@ -371,6 +372,7 @@ export function TerminalSimulator({
   const handleResetV86State = () => {
     const confirmed = window.confirm("Are you sure you want to reset the WebAssembly VM state? All unpersisted work inside the guest kernel will be lost.");
     if (confirmed) {
+      setIsV86Running(false);
       clearV86State().then(() => {
         setIsV86Mode(false);
         setTimeout(() => {
@@ -425,17 +427,17 @@ export function TerminalSimulator({
 
   // Auto-save WASM VM state periodically
   useEffect(() => {
-    if (!isV86Mode || !v86EmulatorRef.current || v86Booting) return;
+    if (!isV86Mode || !v86EmulatorRef.current || v86Booting || !isV86Running) return;
     
     const interval = setInterval(() => {
       const worker = v86EmulatorRef.current;
-      if (worker && !isCapturingValidationRef.current) {
+      if (worker && !isCapturingValidationRef.current && isV86Running) {
         worker.postMessage({ type: "SAVE_STATE" });
       }
     }, 45000); // auto-save every 45 seconds
 
     return () => clearInterval(interval);
-  }, [isV86Mode, v86Booting]);
+  }, [isV86Mode, v86Booting, isV86Running]);
 
   // Handle clearSignal from parent
   useEffect(() => {
@@ -738,6 +740,7 @@ export function TerminalSimulator({
         term.write(" * Booting real Linux kernel in the browser sandbox...\r\n\r\n");
         
         setV86Booting(true);
+        setIsV86Running(false);
 
         try {
           // Attempt to load saved VM state from IndexedDB
@@ -801,7 +804,7 @@ export function TerminalSimulator({
                 }
                 break;
               case "SERIAL_OUT":
-                const char = payload;
+                const char = typeof payload === "number" ? String.fromCharCode(payload) : (payload as string);
                 
                 // Bridge outputs to PTY validation checker if active
                 if (isCapturingValidationRef.current && validationResolverRef.current) {
@@ -835,6 +838,8 @@ export function TerminalSimulator({
                   ) {
                     isProvisioned = true;
                     setV86Booting(false); // Dismiss boot overlay once shell prompt is ready
+                    setIsV86Running(true);
+                    worker.postMessage({ type: "SET_RUNNING" });
                     isCapturingValidationRef.current = true;
                     
                     worker.postMessage({
@@ -1197,6 +1202,7 @@ export function TerminalSimulator({
         }
         term.dispose();
       }
+      setIsV86Running(false);
       if (v86EmulatorRef.current) {
         try {
           v86EmulatorRef.current.postMessage({ type: "DESTROY" });
@@ -1237,8 +1243,8 @@ export function TerminalSimulator({
             <>
               <button
                 onClick={handleSaveV86State}
-                disabled={isSavingV86}
-                className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20 hover:text-white disabled:opacity-50"
+                disabled={isSavingV86 || !isV86Running || v86Booting}
+                className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Award className="h-3.5 w-3.5" />
                 {isSavingV86 ? "Saving State..." : "Save VM State"}

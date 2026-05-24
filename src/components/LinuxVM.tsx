@@ -291,9 +291,7 @@ export function LinuxVM() {
             break;
 
           case "SERIAL_OUT": {
-            // payload is a byte (number) from serial0-output-byte
-            const byte = payload as number;
-            const char = String.fromCharCode(byte);
+            const char = typeof payload === "number" ? String.fromCharCode(payload) : (payload as string);
 
             // Buffer for batched rendering
             serialBuffer += char;
@@ -320,6 +318,7 @@ export function LinuxVM() {
               ) {
                 shellReady = true;
                 setBootPhase("ready");
+                worker.postMessage({ type: "SET_RUNNING" });
                 console.log("[LinuxVM] Shell prompt detected — VM ready");
               }
 
