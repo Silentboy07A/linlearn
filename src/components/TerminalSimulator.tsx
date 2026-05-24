@@ -14,8 +14,11 @@ import {
 } from "@/lib/virtualOs";
 
 import { updateMastery, DEFAULT_BKT_PARAMS, type LinuxTopic } from "@/lib/bkt";
-
-
+import { EmulatorManager } from "@/vm/emulatorManager";
+import { PersistenceManager } from "@/persistence/manager";
+import { GUEST_INSPECT_SCRIPT } from "@/vm/inspect";
+import { parseGuestState, GuestState } from "@/missions/validator";
+import { getMissionsByCategory, type MissionCategory } from "@/missions/config";
 
 interface CustomTerminal extends Terminal {
   _simDisposable?: { dispose: () => void };
@@ -36,20 +39,7 @@ const themeColors = {
   white: { background: "#06070a", foreground: "#f3f4f6", cursor: "#f3f4f6" },
 };
 
-const WASM_MISSION_CHECKS: Record<string, string> = {
-  pwd_ls: "true",
-  mkdir_proj: "[ -d Projects ] || [ -d /root/Projects ] || [ -d /home/user/Projects ]",
-  touch_config: "[ -f Projects/config.txt ] || [ -f /root/Projects/config.txt ] || [ -f /home/user/Projects/config.txt ]",
-  nginx: "[ -f /etc/nginx/nginx.conf ] && ! grep -q 'syntax_error_here' /etc/nginx/nginx.conf", 
-  logs: "[ -f /var/log/nginx/access.log ] && grep -q '192.168.1.100' /var/log/nginx/access.log",
-  htop: "which htop || [ -f /usr/bin/htop ] || [ -f /usr/local/bin/htop ]",
-  permissions: "[ -x Projects/deploy.sh ] || [ -x /root/Projects/deploy.sh ] || [ -x /home/user/Projects/deploy.sh ] || [ -x deploy.sh ]",
-  lock_config: "([ -f Projects/config.txt ] && [ ! -w Projects/config.txt ]) || ([ -f /root/Projects/config.txt ] && [ ! -w /root/Projects/config.txt ]) || ([ -f /home/user/Projects/config.txt ] && [ ! -w /home/user/Projects/config.txt ])",
-  audit_dangerous: "true",
-  sysinfo: "true",
-  services: "true",
-  processes: "true"
-};
+// Local checks replaced by server-side deterministic rule verification engine
 
 const MISSION_TOPICS: Record<string, LinuxTopic> = {
   pwd_ls: "navigation",
@@ -337,7 +327,14 @@ export function TerminalSimulator({
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
-  const v86EmulatorRef = useRef<Worker | null>(null);
+  const v86EmulatorRef = useRef<EmulatorManager | null>(null);
+  const persistenceManagerRef = useRef<PersistenceManager>(new PersistenceManager());
+  const [isPersistenceSaving, setIsPersistenceSaving] = useState<boolean>(false);
+  const [hasSavedState, setHasSavedState] = useState<boolean>(false);
+  const bootTimeRef = useRef<number | null>(null);
+  const lastCommandRef = useRef<string>("");
+  const lastOutputRef = useRef<string>("");
+
   const validationResolverRef = useRef<((val: boolean) => void) | null>(null);
   const validationBufferRef = useRef("");
   
@@ -363,9 +360,18 @@ export function TerminalSimulator({
 
 
 
-  const handleResetV86State = () => {
-    if (v86EmulatorRef.current) {
+  const handleResetV86State = async () => {
+    if (window.confirm("Are you sure you want to reset the Virtual Machine? This will delete all saved snapshots and restore a clean environment.")) {
       setIsV86Running(false);
+      setV86Booting(true);
+      
+      // Cancel autosave loops
+      persistenceManagerRef.current.cancelPendingSaves();
+      
+      // Clear IndexedDB snapshot
+      await persistenceManagerRef.current.clearState("default_session");
+      setHasSavedState(false);
+
       setIsV86Mode(false);
       setTimeout(() => {
         setIsV86Mode(true);
@@ -373,33 +379,41 @@ export function TerminalSimulator({
     }
   };
 
-  const runV86Validation = (command: string): Promise<boolean> => {
+  const runV86Validation = (): Promise<GuestState | null> => {
     return new Promise((resolve) => {
-      const worker = v86EmulatorRef.current;
-      if (!worker) {
-        resolve(false);
+      const emulator = v86EmulatorRef.current;
+      if (!emulator) {
+        resolve(null);
         return;
       }
 
       isCapturingValidationRef.current = true;
       validationBufferRef.current = "";
-      validationResolverRef.current = resolve;
+      validationResolverRef.current = (done) => {
+        if (done) {
+          try {
+            const parsed = parseGuestState(validationBufferRef.current);
+            resolve(parsed);
+          } catch (e) {
+            console.error("Failed to parse guest state:", e);
+            resolve(null);
+          }
+        } else {
+          resolve(null);
+        }
+      };
 
-      const sentinelStart = "VAL_START_SENTINEL";
-      const sentinelEnd = "VAL_END_SENTINEL";
+      // Send silent inspection command sequence
+      emulator.sendInput("\nstty -echo\n/usr/bin/linlearn-inspect\nstty echo\n");
 
-      worker.postMessage({
-        type: "INPUT",
-        payload: `\nclear\necho "${sentinelStart}" && if ${command}; then echo "VAL_SUCCESS"; else echo "VAL_FAILURE"; fi && echo "${sentinelEnd}"\n`
-      });
-
+      // 6 second timeout guard
       setTimeout(() => {
-        if (validationResolverRef.current === resolve) {
+        if (validationResolverRef.current) {
           isCapturingValidationRef.current = false;
           validationResolverRef.current = null;
-          resolve(false);
+          resolve(null);
         }
-      }, 4000);
+      }, 6000);
     });
   };
   
@@ -480,40 +494,21 @@ export function TerminalSimulator({
   // Missions completion checks
   const missions = useMemo(() => {
     if (isV86Mode) {
-      const getWasmMission = (id: string, title: string, desc: string, hint: string) => ({
-        id,
-        title,
-        desc,
-        hint,
-        completed: !!completedVasmMissions[id]
-      });
-
-      if (learningMode === "Beginner") {
-        return [
-          getWasmMission("pwd_ls", "Explore Directories", "Execute 'pwd' and 'ls' to identify active path mappings.", "pwd && ls"),
-          getWasmMission("mkdir_proj", "Create Work Directory", "Create a new sub-folder directory at /home/user/Projects.", "mkdir -p /home/user/Projects"),
-          getWasmMission("touch_config", "Create Configuration File", "Initialize an empty file at /home/user/Projects/config.txt.", "touch /home/user/Projects/config.txt")
-        ];
-      }
-      if (learningMode === "DevOps") {
-        return [
-          getWasmMission("nginx", "Fix Broken Nginx Config", "The Nginx configuration file /etc/nginx/nginx.conf has a syntax error. Edit it and delete the line containing 'syntax_error_here'.", "vi /etc/nginx/nginx.conf"),
-          getWasmMission("logs", "Investigate Access Logs", "Inspect the Nginx access log file at /var/log/nginx/access.log to trace client hits.", "cat /var/log/nginx/access.log"),
-          getWasmMission("htop", "Verify htop Installation", "Verify if the htop system monitoring binary is successfully located in the system path.", "which htop")
-        ];
-      }
-      if (learningMode === "Security") {
-        return [
-          getWasmMission("permissions", "Create Executable Script", "Create an executable script at Projects/deploy.sh.", "touch Projects/deploy.sh && chmod +x Projects/deploy.sh"),
-          getWasmMission("lock_config", "Lock Config Permissions", "Set Projects/config.txt to be read-only (remove all write permissions).", "chmod 400 Projects/config.txt"),
-          getWasmMission("audit_dangerous", "Audit Sandbox Safeguards", "Test security safeguards by attempting to execute a dangerous or destructive command.", "rm -rf /")
-        ];
-      }
-      return [
-        getWasmMission("sysinfo", "Query System Info", "Query virtual hostname and current user login context.", "whoami && uname -a"),
-        getWasmMission("services", "Review systemd Status", "Inspect active service configurations on the system.", "systemctl status nginx.service"),
-        getWasmMission("processes", "Inspect Process Tree", "Query standard process listing tables.", "ps aux")
-      ];
+      const categoryMap: Record<string, string> = {
+        "Beginner": "Beginner",
+        "DevOps": "DevOps",
+        "Security": "Security",
+        "Interview Prep": "Interview"
+      };
+      const cat = (categoryMap[learningMode] || "Beginner") as MissionCategory;
+      const list = getMissionsByCategory(cat);
+      return list.map(m => ({
+        id: m.id,
+        title: m.title,
+        desc: m.desc,
+        hint: m.hint,
+        completed: !!completedVasmMissions[m.id]
+      }));
     }
 
     const history = osState.history;
@@ -675,6 +670,7 @@ export function TerminalSimulator({
 
   // Initialize xterm.js instance
   useEffect(() => {
+    const persistenceManager = persistenceManagerRef.current;
     let isMounted = true;
     let term: Terminal;
     let fitAddon: FitAddon;
@@ -718,162 +714,174 @@ export function TerminalSimulator({
       if (isV86Mode) {
         // --- WASM v86 VM Mode ---
         term.write("\x1b[1;36mInitializing v86 WebAssembly x86 Virtual Machine...\x1b[0m\r\n");
-        term.write(" * Fetching minimal Buildroot Linux disk image (~10MB)...\r\n");
-        term.write(" * Booting real Linux kernel in the browser sandbox...\r\n\r\n");
+        term.write(" * Checking for saved state snapshot in local storage...\r\n");
         
         setV86Booting(true);
         setIsV86Running(false);
 
+        const emulator = new EmulatorManager();
+        v86EmulatorRef.current = emulator;
+
+        let isProvisioned = false;
+        let isProvisioning = false;
+        let outputBuffer = "";
+
+        const onSerial = (char: string) => {
+          if (!isMounted) return;
+
+          // Maintain rolling logs of command output
+          lastOutputRef.current += char;
+          if (lastOutputRef.current.length > 5000) {
+            lastOutputRef.current = lastOutputRef.current.substring(lastOutputRef.current.length - 5000);
+          }
+
+          // Intercept output during silent validation
+          if (isCapturingValidationRef.current && validationResolverRef.current) {
+            validationBufferRef.current += char;
+            if (validationBufferRef.current.includes("INSPECT_END")) {
+              const resolve = validationResolverRef.current;
+              validationResolverRef.current = null;
+              isCapturingValidationRef.current = false;
+              resolve(true); // Signal inspect done
+            }
+            return;
+          }
+
+          // Standard terminal bridge (unless we are provisioning silently)
+          if (!isProvisioning) {
+            term.write(char);
+          }
+
+          // State checking for guest provisioning
+          if (!isProvisioned) {
+            outputBuffer += char;
+            if (outputBuffer.length > 128) {
+              outputBuffer = outputBuffer.substring(outputBuffer.length - 128);
+            }
+
+            // Detect prompt patterns
+            const hasRootPrompt = outputBuffer.endsWith("~% ") || outputBuffer.endsWith("# ") || outputBuffer.endsWith("~# ");
+            const hasUserPrompt = outputBuffer.endsWith("user@linlearn:~$ ") || outputBuffer.endsWith("user@linlearn:~$");
+
+            if (hasRootPrompt && !isProvisioning) {
+              // Initiate silent environment provisioning
+              isProvisioning = true;
+              // Clear screen first so root setup commands are totally hidden
+              term.write("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
+              
+              // Send silent provisioning string
+              emulator.sendInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\necho 'export HOME=/home/user' > /home/user/.profile\necho 'export PS1="user@linlearn:\\\\w\\\\$ "' >> /home/user/.profile\necho 'cd /home/user' >> /home/user/.profile\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nsu - user\nstty echo\nclear\n`);
+            } else if (hasUserPrompt) {
+              // User prompt matched: provisioning successfully complete!
+              isProvisioning = false;
+              isProvisioned = true;
+              setV86Booting(false);
+              setIsV86Running(true);
+              
+              const bootTime = emulator.getLifecycleState().bootTimeMs || 0;
+              bootTimeRef.current = bootTime;
+
+              term.write("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
+              term.write(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
+              term.write(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
+              term.write("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
+            }
+          }
+        };
+
+        const onState = (newState: string) => {
+          if (!isMounted) return;
+          if (newState === "failed") {
+            term.write(`\r\n\x1b[1;31mError: Failed to boot guest virtual machine.\x1b[0m\r\n`);
+            setV86Booting(false);
+          }
+        };
+
         try {
-          // Attempt to load saved VM state from IndexedDB (disabled for reliability)
-          const savedState: ArrayBuffer | null = null;
-
-          // Instantiate Web Worker (using plain JS from public/ to bypass Next.js webpack issues)
-          const workerUrl = window.location.origin + "/v86/v86-worker.js?v=" + Date.now();
-          const worker = new Worker(workerUrl);
-          v86EmulatorRef.current = worker;
-
-          let isProvisioned = false;
-          let outputBuffer = "";
-
-          worker.onmessage = (e: MessageEvent) => {
-            const { type, payload } = e.data;
-            if (!isMounted) return;
-
-            switch (type) {
-              case "INIT_SUCCESS":
-                // VM initialized successfully
-                break;
-              case "INIT_FAILURE":
-                console.error("Failed to load v86 VM in worker:", payload);
-                term.write(`\r\n\x1b[1;31mError: Failed to load virtual machine.\x1b[0m\r\n`);
-                term.write(`\x1b[1;30m[Debug Info] ${payload}\x1b[0m\r\n`);
-                term.write("Verify your internet connection and CORS configurations.\r\n");
-                setV86Booting(false);
-                break;
-              case "LOG":
-                {
-                  const logData = payload as { level: string; msg: string };
-                  const logPrefix = `[v86-worker] [${logData.level.toUpperCase()}]`;
-                  if (logData.level === "error") {
-                    console.error(logPrefix, logData.msg);
-                  } else if (logData.level === "warn") {
-                    console.warn(logPrefix, logData.msg);
-                  } else {
-                    console.log(logPrefix, logData.msg);
-                  }
-                }
-                break;
-              case "SERIAL_OUT":
-                const char = typeof payload === "number" ? String.fromCharCode(payload) : (payload as string);
-                
-                // Bridge outputs to PTY validation checker if active
-                if (isCapturingValidationRef.current && validationResolverRef.current) {
-                  validationBufferRef.current += char;
-                  if (validationBufferRef.current.includes("VAL_END_SENTINEL")) {
-                    const success = validationBufferRef.current.includes("VAL_SUCCESS");
-                    isCapturingValidationRef.current = false;
-                    const resolve = validationResolverRef.current;
-                    validationResolverRef.current = null;
-                    resolve(success);
-                  }
-                  return;
-                }
-
-                // Standard terminal output bridge
-                term.write(char);
-                
-                // Silent provisioning checking
-                if (!isProvisioned) {
-                  outputBuffer += char;
-                  if (outputBuffer.length > 64) {
-                    outputBuffer = outputBuffer.substring(outputBuffer.length - 64);
-                  }
-                  if (
-                    outputBuffer.endsWith("~% ") || 
-                    outputBuffer.endsWith("# ") || 
-                    outputBuffer.endsWith("~# ") || 
-                    outputBuffer.endsWith("$ ") || 
-                    outputBuffer.endsWith("]$ ") || 
-                    outputBuffer.endsWith("]# ")
-                  ) {
-                    isProvisioned = true;
-                    setV86Booting(false); // Dismiss boot overlay once shell prompt is ready
-                    setIsV86Running(true);
-                    worker.postMessage({ type: "SET_RUNNING" });
-                    isCapturingValidationRef.current = true;
-                    
-                    worker.postMessage({
-                      type: "INPUT",
-                      payload: "mkdir -p /etc/nginx && echo 'server { listen 80; root /var/www/html; syntax_error_here; }' > /etc/nginx/nginx.conf\n"
-                    });
-                    worker.postMessage({
-                      type: "INPUT",
-                      payload: "mkdir -p /var/log/nginx && echo '192.168.1.100 - - [23/May/2026:10:40:02 +0530] \"GET / HTTP/1.1\" 200 3126' > /var/log/nginx/access.log\n"
-                    });
-                    worker.postMessage({
-                      type: "INPUT",
-                      payload: "mkdir -p Projects\n"
-                    });
-                    
-                    setTimeout(() => {
-                      worker.postMessage({ type: "INPUT", payload: "clear\n" });
-                      setTimeout(() => {
-                        isCapturingValidationRef.current = false;
-                      }, 200);
-                    }, 1000);
-                  }
-                }
-                break;
-
+          // 1. Fetch saved state snapshot
+          persistenceManagerRef.current.loadState("default_session").then(async (savedState) => {
+            if (savedState) {
+              term.write(" * Found saved snapshot. Restoring VM state...\r\n");
+              setHasSavedState(true);
+            } else {
+              term.write(" * No snapshot found. Performing cold boot...\r\n");
+              setHasSavedState(false);
             }
-          };
 
-          // Send initialization payload to worker
-          worker.postMessage({
-            type: "INIT",
-            payload: {
-              origin: window.location.origin,
-              initial_state: savedState,
-              version: Date.now().toString()
+            // 2. Start VM
+            await emulator.start(window.location.origin, onSerial, onState, savedState || undefined);
+            
+            if (savedState) {
+              // Restored state is immediately provisioned and interactive!
+              isProvisioned = true;
+              isProvisioning = false;
+              setV86Booting(false);
+              setIsV86Running(true);
+              term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
             }
           });
 
-          // Connect user input from xterm.js back to guest serial console in worker
+          // 3. Setup client key handler to bridge typed commands
+          let currentLine = "";
           const dataDisposable = term.onData((data) => {
-            worker.postMessage({ type: "INPUT", payload: data });
+            // Keep a local log of user's command typed (for KKM semantic checks)
+            if (data === "\r" || data === "\n") {
+              if (currentLine.trim()) {
+                lastCommandRef.current = currentLine.trim();
+                
+                // Trigger auto-save debounced snapshot loop!
+                persistenceManagerRef.current.triggerAutosave("default_session", async () => {
+                  if (v86EmulatorRef.current) {
+                    setIsPersistenceSaving(true);
+                    try {
+                      const rawSnapshot = await v86EmulatorRef.current.saveState();
+                      setHasSavedState(true);
+                      return rawSnapshot;
+                    } catch (e) {
+                      console.error("Autosave snapshot failed:", e);
+                      return null;
+                    } finally {
+                      setIsPersistenceSaving(false);
+                    }
+                  }
+                  return null;
+                });
+              }
+              currentLine = "";
+            } else if (data === "\x7f" || data === "\b") {
+              currentLine = currentLine.slice(0, -1);
+            } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+              currentLine += data;
+            }
+            emulator.sendInput(data);
           });
 
-          // Attach custom key event handler for signal intercepts
           term.attachCustomKeyEventHandler((ev) => {
             if (ev.ctrlKey && ev.type === "keydown") {
               const code = ev.key.toLowerCase();
               if (code === "c") {
-                worker.postMessage({ type: "INPUT", payload: "\x03" });
+                emulator.sendInput("\x03");
                 return false;
               }
               if (code === "z") {
-                worker.postMessage({ type: "INPUT", payload: "\x1a" });
+                emulator.sendInput("\x1a");
                 return false;
               }
               if (code === "d") {
-                worker.postMessage({ type: "INPUT", payload: "\x04" });
+                emulator.sendInput("\x04");
                 return false;
               }
             }
             return true;
           });
 
-          // Save references to cleanly dispose
           const customTerm = term as unknown as CustomTerminal;
           customTerm._v86Disposable = dataDisposable;
 
-        } catch (err) {
+        } catch (err: unknown) {
+          const errMsg = err instanceof Error ? err.message : String(err);
           console.error("Failed to load v86 VM:", err);
-          const errorMsg = err instanceof Error ? err.message : String(err);
-          term.write("\r\n\x1b[1;31mError: Failed to fetch WebAssembly virtual machine libraries.\x1b[0m\r\n");
-          term.write(`\x1b[1;30m[Debug Info] ${errorMsg}\x1b[0m\r\n`);
-          term.write("Verify your internet connection and CORS configurations.\r\n");
+          term.write(`\r\n\x1b[1;31mError: Failed to load VM. ${errMsg}\x1b[0m\r\n`);
           setV86Booting(false);
         }
 
@@ -1153,13 +1161,10 @@ export function TerminalSimulator({
       }
       setIsV86Running(false);
       if (v86EmulatorRef.current) {
-        try {
-          v86EmulatorRef.current.postMessage({ type: "DESTROY" });
-        } catch (e) {
-          console.error("Failed to destroy v86 worker:", e);
-        }
+        v86EmulatorRef.current.stop();
         v86EmulatorRef.current = null;
       }
+      persistenceManager.cancelPendingSaves();
     };
   }, [prefs.theme, prefs.fontSize, isV86Mode]);
 
@@ -1223,7 +1228,7 @@ export function TerminalSimulator({
               <div className="h-3 w-3 rounded-full bg-amber-500/80" />
               <div className="h-3 w-3 rounded-full bg-emerald-500/80" />
               <span className="ml-2 text-xs font-semibold text-gray-400 font-mono select-none">
-                {isV86Mode ? "root@linlearn (WASM VM)" : `user@linlearn: ${osState.cwd} (virtual OS)`}
+                {isV86Mode ? "user@linlearn: ~" : `user@linlearn: ${osState.cwd} (virtual OS)`}
               </span>
             </div>
             <div className="flex items-center gap-2 text-xs font-mono text-gray-500">
@@ -1245,6 +1250,32 @@ export function TerminalSimulator({
               className="w-full flex-1 overflow-hidden" 
               style={{ minHeight: "480px" }}
             />
+            {isV86Mode && (
+              <div className="flex items-center justify-between bg-black/40 border-t border-white/5 px-4 py-2 text-xs font-mono text-gray-500 rounded-b-lg">
+                <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-1.5">
+                    <span className={`h-2 w-2 rounded-full ${isV86Running ? "bg-emerald-500 animate-pulse" : "bg-amber-500"}`} />
+                    <span>Status: {v86Booting ? "Booting" : isV86Running ? "Running" : "Stopped"}</span>
+                  </div>
+                  {bootTimeRef.current !== null && (
+                    <div>Boot: {(bootTimeRef.current / 1000).toFixed(1)}s</div>
+                  )}
+                  <div>RAM: 64MB</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {isPersistenceSaving ? (
+                    <>
+                      <RefreshCw className="h-3 w-3 animate-spin text-emerald-400" />
+                      <span className="text-emerald-400">Saving Snapshot...</span>
+                    </>
+                  ) : hasSavedState ? (
+                    <span className="text-emerald-500/80">Snapshot Synced (IndexedDB)</span>
+                  ) : (
+                    <span className="text-gray-600">No Snapshot Saved</span>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -1380,65 +1411,87 @@ export function TerminalSimulator({
                                   disabled={validatingMissions[mission.id]}
                                   onClick={async () => {
                                     setValidatingMissions(prev => ({ ...prev, [mission.id]: true }));
-                                    const success = await runV86Validation(WASM_MISSION_CHECKS[mission.id]);
-                                    if (success) {
-                                      try {
-                                         // 1. Fetch challenge nonce from server
-                                         const challengeRes = await fetch("/api/validate/challenge");
-                                         if (!challengeRes.ok) {
-                                           throw new Error("Failed to retrieve challenge nonce from server.");
-                                         }
-                                         const { nonce, expires, signature } = await challengeRes.json();
+                                    try {
+                                      const guestState = await runV86Validation();
+                                      if (guestState) {
+                                        // 1. Fetch challenge nonce from server
+                                        const challengeRes = await fetch("/api/validate/challenge");
+                                        if (!challengeRes.ok) {
+                                          throw new Error("Failed to retrieve challenge nonce from server.");
+                                        }
+                                        const { nonce, expires, signature } = await challengeRes.json();
 
-                                         // 2. Compute the state HMAC on the client
-                                         const clientHash = await computeHMAC(nonce, `${mission.id}:true`);
+                                        // 2. Compute the state HMAC on the client
+                                        const clientHash = await computeHMAC(nonce, `${mission.id}:true`);
 
-                                         // 3. Post verification payload with challenge details
-                                         const res = await fetch("/api/validate", {
-                                           method: "POST",
-                                           headers: { "Content-Type": "application/json" },
-                                           body: JSON.stringify({
-                                             missionId: mission.id,
-                                             success: true,
-                                             nonce,
-                                             expires,
-                                             signature,
-                                             clientHash
-                                           })
-                                         });
+                                        // 3. Post verification payload with challenge details
+                                        const res = await fetch("/api/validate", {
+                                          method: "POST",
+                                          headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify({
+                                            missionId: mission.id,
+                                            success: true,
+                                            guestState,
+                                            command: lastCommandRef.current || mission.hint,
+                                            output: lastOutputRef.current.substring(lastOutputRef.current.length - 1000), // pass last 1000 chars output
+                                            nonce,
+                                            expires,
+                                            signature,
+                                            clientHash
+                                          })
+                                        });
+
                                         if (res.ok) {
                                           const verifyData = await res.json();
-                                          const grade = verifyData.grade || {
-                                            score: 7.5,
-                                            feedback: "Successfully verified command execution."
-                                          };
-                                          setCompletedVasmMissions(prev => ({ ...prev, [mission.id]: true }));
-                                          updateBKT(MISSION_TOPICS[mission.id] || "navigation", true);
-                                          
-                                          if (xtermInstance.current) {
-                                            xtermInstance.current.write(`\r\n\x1b[1;32m[Judge Result] Mission Completed! Score: ${grade.score}/10.0\x1b[0m\r\n`);
-                                            xtermInstance.current.write(`\x1b[1;30mFeedback: ${grade.feedback}\x1b[0m\r\n`);
+                                          if (verifyData.verified) {
+                                            const grade = verifyData.grade || {
+                                              score: 7.5,
+                                              feedback: "Successfully verified command execution."
+                                            };
+                                            setCompletedVasmMissions(prev => ({ ...prev, [mission.id]: true }));
+                                            
+                                            const missionTopic = MISSION_TOPICS[mission.id] || "navigation";
+                                            updateBKT(missionTopic, true);
+                                            
+                                            if (xtermInstance.current) {
+                                              xtermInstance.current.write(`\r\n\x1b[1;32m[Judge Result] Mission Completed! Score: ${grade.score}/10.0\x1b[0m\r\n`);
+                                              xtermInstance.current.write(`\x1b[1;30mFeedback: ${grade.feedback}\x1b[0m\r\n`);
+                                            }
+                                            
+                                            onCommandLoggedRef.current({
+                                              id: Math.random().toString(36).substring(2, 10),
+                                              input: `Verify: ${mission.title}`,
+                                              output: `Mission "${mission.title}" verified successfully inside the WASM guest VM and graded by LLM! Score: ${grade.score}/10.0. Feedback: ${grade.feedback}`,
+                                              source: "local",
+                                              createdAt: new Date().toISOString()
+                                            });
+                                          } else {
+                                            const errorMsg = verifyData.error || "Verification failed.";
+                                            if (xtermInstance.current) {
+                                              xtermInstance.current.write(`\r\n\x1b[1;31m[Judge Result] Mission Failed: ${errorMsg}\x1b[0m\r\n`);
+                                            }
+                                            alert(`Verification failed: ${errorMsg}`);
+                                            const missionTopic = MISSION_TOPICS[mission.id] || "navigation";
+                                            updateBKT(missionTopic, false);
                                           }
-
-                                          onCommandLoggedRef.current({
-                                            id: Math.random().toString(36).substring(2, 10),
-                                            input: `Verify: ${mission.title}`,
-                                            output: `Mission "${mission.title}" verified successfully inside the WASM guest VM and graded by LLM! Score: ${grade.score}/10.0. Feedback: ${grade.feedback}`,
-                                            source: "local",
-                                            createdAt: new Date().toISOString()
-                                          });
                                         } else {
-                                          alert("Failed to submit verification to server. Make sure you are signed in.");
+                                          const verifyData = await res.json().catch(() => ({}));
+                                          const errorMsg = verifyData.error || "Server validation failed.";
+                                          if (xtermInstance.current) {
+                                            xtermInstance.current.write(`\r\n\x1b[1;31m[Error] ${errorMsg}\x1b[0m\r\n`);
+                                          }
+                                          alert(`Server error: ${errorMsg}`);
                                         }
-                                      } catch (err) {
-                                        console.error("Failed to submit validation:", err);
-                                        alert("Server communication error. Please try again.");
+                                      } else {
+                                        alert("Could not collect guest VM state. Make sure the VM is running and interactive.");
                                       }
-                                    } else {
-                                      updateBKT(MISSION_TOPICS[mission.id] || "navigation", false);
-                                      alert(`Verification failed for "${mission.title}". Make sure you completed the objective correctly inside the guest VM.`);
+                                    } catch (err: unknown) {
+                                      const errMsg = err instanceof Error ? err.message : String(err);
+                                      console.error("Failed to submit validation:", err);
+                                      alert(`Server communication error: ${errMsg}`);
+                                    } finally {
+                                      setValidatingMissions(prev => ({ ...prev, [mission.id]: false }));
                                     }
-                                    setValidatingMissions(prev => ({ ...prev, [mission.id]: false }));
                                   }}
                                   className="w-full py-1 text-[10px] uppercase font-bold text-center border rounded transition-all bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/25 disabled:opacity-50"
                                 >

@@ -5,6 +5,8 @@ import { XP_REWARDS } from "@/lib/xp";
 import { rateLimit } from "@/lib/rate-limit";
 import { verifyChallenge, verifyStateHash } from "@/lib/challenge";
 import { callLlamaJson } from "@/lib/llama";
+import { getMissionById } from "@/missions/config";
+import { validateMissionRules } from "@/missions/validator";
 
 interface EvaluationResult {
   correct: boolean;
@@ -25,7 +27,7 @@ export async function POST(req: NextRequest) {
   if (limitResponse) return limitResponse;
 
   try {
-    const { missionId, success, nonce, expires, signature, clientHash } = await req.json();
+    const { missionId, success, guestState, command, output, nonce, expires, signature, clientHash } = await req.json();
     if (!missionId) {
       return NextResponse.json({ error: "Mission ID required" }, { status: 400 });
     }
@@ -52,7 +54,33 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Integrity check failed: validation state mismatch" }, { status: 400 });
     }
 
-    // Call KKM LLM Judge to semantically evaluate the completion
+    // Retrieve mission configuration
+    const mission = getMissionById(missionId);
+    if (!mission) {
+      return NextResponse.json({ error: "Mission configuration not found" }, { status: 404 });
+    }
+
+    // 3. Deterministic rule validation
+    if (guestState) {
+      const ruleResult = validateMissionRules(guestState, mission);
+      if (!ruleResult.passed) {
+        return NextResponse.json({
+          verified: false,
+          error: `Deterministic check failed: ${ruleResult.reason}`,
+          grade: {
+            correct: false,
+            safe: true,
+            task_completed: false,
+            score: 3.2,
+            feedback: `Validation failed: ${ruleResult.reason}`,
+            mistakes: [ruleResult.reason || "Rule verification failed"],
+            suggestions: ["Double check your directory structure, file permissions, or config parameters and retry."]
+          }
+        });
+      }
+    }
+
+    // 4. KKM LLM Judge semantic verification
     const systemPrompt = `You are a senior Linux system tutor acting as an LLM judge.
 Evaluate the user's completed mission status.
 Ensure output matches this JSON schema exactly:
@@ -68,6 +96,11 @@ Ensure output matches this JSON schema exactly:
 Only output valid raw JSON. No markdown backticks.`;
 
     const userPrompt = `Evaluate mission completion for missionId: "${missionId}".
+Mission title: "${mission.title}"
+Mission description: "${mission.desc}"
+Expected behavior: "${mission.expectedBehavior}"
+User command executed: "${command || "N/A"}"
+Command output: "${output || "N/A"}"
 Execution Result: Success state verified by OS verification checks.`;
 
     let grade: EvaluationResult;
@@ -86,7 +119,7 @@ Execution Result: Success state verified by OS verification checks.`;
       };
     }
 
-    // Compress scores according to guidelines (map 10 to ~7, 1 to ~3; perfect to ~7.8, failed to ~3.2)
+    // Compress scores according to guidelines (map 10 to ~7.8, 1 to ~3.2)
     if (grade.score > 8.0) {
       grade.score = 7.8;
     } else if (grade.score < 4.0) {
@@ -102,7 +135,7 @@ Execution Result: Success state verified by OS verification checks.`;
     await auth.supabase.from("command_history").insert({
       user_id: auth.user!.id,
       query: `Verify Mission: ${missionId}`,
-      command: `verify_mission ${missionId}`,
+      command: command || `verify_mission ${missionId}`,
       explanation: `Successfully completed challenge: ${missionId}. Feedback: ${grade.feedback} (Score: ${grade.score})`,
       risk_level: "Low",
     });

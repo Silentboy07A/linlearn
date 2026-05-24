@@ -13,6 +13,7 @@ export interface V86StarterConfig {
   memory_size?: number;
   vga_memory_size?: number;
   filesystem?: any;
+  initial_state?: { buffer: ArrayBuffer };
 }
 
 export interface V86StarterInstance {

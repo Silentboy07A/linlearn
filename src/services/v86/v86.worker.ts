@@ -63,6 +63,25 @@ self.onmessage = async (e: MessageEvent) => {
       }
       break;
 
+    case "SAVE_STATE": {
+      const emulator = getEmulator();
+      if (!emulator) {
+        log("error", "Cannot save state: emulator not initialized.");
+        (self as any).postMessage({ type: "SAVE_STATE_FAILURE", payload: "Emulator not initialized" });
+        break;
+      }
+      try {
+        log("info", "Taking guest VM memory snapshot...");
+        const state = await emulator.save_state();
+        (self as any).postMessage({ type: "SAVE_STATE_SUCCESS", payload: state }, [state]);
+        log("info", "Guest VM snapshot taken successfully.");
+      } catch (err: any) {
+        log("error", `Failed to save VM state: ${err.message || String(err)}`);
+        (self as any).postMessage({ type: "SAVE_STATE_FAILURE", payload: err.message || String(err) });
+      }
+      break;
+    }
+
     case "STOP":
       await handleStop();
       break;
@@ -126,14 +145,20 @@ async function handleInit(payload: any) {
     log("info", "Loading VGA BIOS (vgabios.bin)");
     const vgaBiosBuffer = await loadAsset(`${origin}/v86/bios/vgabios.bin?v=${version}`, "vgabios.bin");
 
-    log("info", "Loading Linux kernel (bzImage)");
-    const bzImageBuffer = await loadAsset(`${origin}/v86/images/bzImage?v=${version}`, "bzImage", { autoAlign: true });
+    let bzImageBuffer: ArrayBuffer | null = null;
+    if (!payload.initial_state) {
+      log("info", "Loading Linux kernel (bzImage)");
+      bzImageBuffer = await loadAsset(`${origin}/v86/images/bzImage?v=${version}`, "bzImage", { autoAlign: true });
+    } else {
+      log("info", "Skipping kernel download: Restoring directly from snapshot.");
+    }
 
     const config: V86StarterConfig = {
       wasm_path: wasmBlobUrl,
       bios: { buffer: biosBuffer },
       vga_bios: { buffer: vgaBiosBuffer },
-      bzimage: { buffer: bzImageBuffer },
+      bzimage: bzImageBuffer ? { buffer: bzImageBuffer } : undefined,
+      initial_state: payload.initial_state ? { buffer: payload.initial_state } : undefined,
       filesystem: {},
       autostart: true,
       cmdline: payload.cmdline || "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",

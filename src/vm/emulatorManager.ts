@@ -14,6 +14,9 @@ export class EmulatorManager {
   private onSerialOutput: ((data: string) => void) | null = null;
   private onStateChange: ((state: string) => void) | null = null;
 
+  private saveStateResolver: ((buffer: ArrayBuffer) => void) | null = null;
+  private saveStateRejecter: ((err: any) => void) | null = null;
+
   constructor(config: Partial<VMSessionConfig> = {}) {
     this.bridge = new WorkerBridge();
     this.lifecycle = new VMLifecycleManager();
@@ -23,7 +26,8 @@ export class EmulatorManager {
   public async start(
     origin: string,
     onSerial: (data: string) => void,
-    onState: (state: string) => void
+    onState: (state: string) => void,
+    initialState?: ArrayBuffer
   ): Promise<void> {
     if (this.lifecycle.isAlive()) {
       Logger.warn("VM", "VM already running. Destroying it before starting new session.");
@@ -50,8 +54,19 @@ export class EmulatorManager {
       this.bridge.initialize(workerUrl, (type, payload) => {
         switch (type) {
           case "INIT_SUCCESS":
-            this.lifecycle.transitionTo("booting");
-            if (this.onStateChange) this.onStateChange("booting");
+            if (initialState) {
+              // Direct transition to running for instant restoration
+              this.lifecycle.transitionTo("running");
+              if (this.onStateChange) this.onStateChange("running");
+              clearTimeout(timeout);
+              if (!resolved) {
+                resolved = true;
+                resolve();
+              }
+            } else {
+              this.lifecycle.transitionTo("booting");
+              if (this.onStateChange) this.onStateChange("booting");
+            }
             break;
 
           case "INIT_FAILURE":
@@ -77,6 +92,24 @@ export class EmulatorManager {
             const char = typeof payload === "number" ? String.fromCharCode(payload) : String(payload);
             if (this.onSerialOutput) {
               this.onSerialOutput(char);
+            }
+            break;
+
+          case "SAVE_STATE_SUCCESS":
+            if (this.saveStateResolver) {
+              const res = this.saveStateResolver;
+              this.saveStateResolver = null;
+              this.saveStateRejecter = null;
+              res(payload as ArrayBuffer);
+            }
+            break;
+
+          case "SAVE_STATE_FAILURE":
+            if (this.saveStateRejecter) {
+              const rej = this.saveStateRejecter;
+              this.saveStateResolver = null;
+              this.saveStateRejecter = null;
+              rej(new Error(String(payload)));
             }
             break;
 
@@ -108,7 +141,31 @@ export class EmulatorManager {
         memory_size: this.config.memoryLimitBytes,
         vga_memory_size: this.config.vgaMemoryLimitBytes,
         version: Date.now().toString(),
+        initial_state: initialState,
       });
+    });
+  }
+
+  public async saveState(): Promise<ArrayBuffer> {
+    const currentState = this.lifecycle.getState().state;
+    if (currentState !== "running") {
+      throw new Error(`Cannot save state while VM is in state: ${currentState}`);
+    }
+
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      this.saveStateResolver = resolve;
+      this.saveStateRejecter = reject;
+
+      this.bridge.post("SAVE_STATE");
+
+      // 10 second timeout for saving state buffer
+      setTimeout(() => {
+        if (this.saveStateRejecter === reject) {
+          this.saveStateResolver = null;
+          this.saveStateRejecter = null;
+          reject(new Error("VM snapshot save operation timed out."));
+        }
+      }, 10000);
     });
   }
 
@@ -127,5 +184,11 @@ export class EmulatorManager {
     this.bridge.terminate();
     this.onSerialOutput = null;
     this.onStateChange = null;
+    this.saveStateResolver = null;
+    this.saveStateRejecter = null;
+  }
+
+  public getLifecycleState() {
+    return this.lifecycle.getState();
   }
 }

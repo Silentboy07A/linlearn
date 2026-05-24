@@ -250,6 +250,23 @@ self.onmessage = async function (e) {
       }
       break;
 
+    case "SAVE_STATE":
+      if (!emulator) {
+        log("error", "Cannot save state: emulator not initialized.");
+        self.postMessage({ type: "SAVE_STATE_FAILURE", payload: "Emulator not initialized" });
+        break;
+      }
+      try {
+        log("info", "Taking guest VM memory snapshot...");
+        var state = await emulator.save_state();
+        self.postMessage({ type: "SAVE_STATE_SUCCESS", payload: state }, [state]);
+        log("info", "Guest VM snapshot taken successfully.");
+      } catch (err) {
+        log("error", "Failed to save VM state: " + (err.message || String(err)));
+        self.postMessage({ type: "SAVE_STATE_FAILURE", payload: err.message || String(err) });
+      }
+      break;
+
     case "DESTROY":
       log("info", "Destroying emulator worker context...");
       setLifecycleState("destroyed");
@@ -311,14 +328,20 @@ async function handleInit(payload) {
     log("info", "Loading VGA BIOS (vgabios.bin)");
     var vgaBiosBuffer = await loadAsset(origin + "/v86/bios/vgabios.bin?v=" + version, "vgabios.bin");
 
-    log("info", "Loading Linux kernel (bzImage)");
-    var bzImageBuffer = await loadAsset(origin + "/v86/images/bzImage?v=" + version, "bzImage", { autoAlign: true });
+    var bzImageBuffer = null;
+    if (!payload.initial_state) {
+      log("info", "Loading Linux kernel (bzImage)");
+      bzImageBuffer = await loadAsset(origin + "/v86/images/bzImage?v=" + version, "bzImage", { autoAlign: true });
+    } else {
+      log("info", "Skipping kernel download: Restoring directly from snapshot.");
+    }
 
     var config = {
       wasm_path: wasmBlobUrl,
       bios: { buffer: biosBuffer },
       vga_bios: { buffer: vgaBiosBuffer },
-      bzimage: { buffer: bzImageBuffer },
+      bzimage: bzImageBuffer ? { buffer: bzImageBuffer } : undefined,
+      initial_state: payload.initial_state ? { buffer: payload.initial_state } : undefined,
       filesystem: {},
       autostart: true,
       cmdline: payload.cmdline || "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
