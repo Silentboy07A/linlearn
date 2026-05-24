@@ -88,16 +88,27 @@ async function validateBinaryResponse(response, name) {
 }
 
 /**
- * Validates and retrieves an asset cleanly without any padding/alignment.
+ * Validates and retrieves an asset cleanly, optionally checking for alignment or padding it.
  * @param {string} url
  * @param {string} name
+ * @param {object} [options]
+ * @param {boolean} [options.autoAlign] - If true, pads the buffer to a multiple of 4 bytes if not aligned.
  * @returns {Promise<ArrayBuffer>}
  */
-async function loadAsset(url, name) {
+async function loadAsset(url, name, options = {}) {
   log("debug", "Fetching asset: " + name + " from " + url);
   try {
     var response = await fetch(url);
     var buffer = await validateBinaryResponse(response, name);
+    
+    if (options.autoAlign && buffer.byteLength % 4 !== 0) {
+      var padBytes = 4 - (buffer.byteLength % 4);
+      log("info", "Auto-aligning asset " + name + ": padding " + buffer.byteLength + " bytes with " + padBytes + " bytes to make it a multiple of 4.");
+      var alignedBuffer = new ArrayBuffer(buffer.byteLength + padBytes);
+      new Uint8Array(alignedBuffer).set(new Uint8Array(buffer));
+      buffer = alignedBuffer;
+    }
+
     log("info", "Loaded asset: " + name + ", size: " + buffer.byteLength + " bytes");
     return buffer;
   } catch (err) {
@@ -301,7 +312,7 @@ async function handleInit(payload) {
     var vgaBiosBuffer = await loadAsset(origin + "/v86/bios/vgabios.bin?v=" + version, "vgabios.bin");
 
     log("info", "Loading Linux kernel (bzImage)");
-    var bzImageBuffer = await loadAsset(origin + "/v86/images/bzImage?v=" + version, "bzImage");
+    var bzImageBuffer = await loadAsset(origin + "/v86/images/bzImage?v=" + version, "bzImage", { autoAlign: true });
 
     var config = {
       wasm_path: wasmBlobUrl,
@@ -317,7 +328,6 @@ async function handleInit(payload) {
     log("info", "Step 4/4: Creating v86 emulator instance...");
     await createEmulator(config, self);
 
-    setLifecycleState("initialized");
     self.postMessage({ type: "INIT_SUCCESS" });
     log("info", "v86 emulator successfully created. Transitioned to booting guest...");
     setLifecycleState("booting");

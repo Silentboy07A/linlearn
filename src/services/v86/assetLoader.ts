@@ -24,11 +24,24 @@ export async function validateBinaryResponse(response: Response, name: string): 
   return buffer;
 }
 
-export async function loadAsset(url: string, name: string): Promise<ArrayBuffer> {
+export async function loadAsset(
+  url: string,
+  name: string,
+  options: { autoAlign?: boolean } = {}
+): Promise<ArrayBuffer> {
   log("debug", `Fetching asset: ${name} from ${url}`);
   try {
     const response = await fetch(url);
-    const buffer = await validateBinaryResponse(response, name);
+    let buffer = await validateBinaryResponse(response, name);
+
+    if (options.autoAlign && buffer.byteLength % 4 !== 0) {
+      const padBytes = 4 - (buffer.byteLength % 4);
+      log("info", `Auto-aligning asset ${name}: padding ${buffer.byteLength} bytes with ${padBytes} bytes to make it a multiple of 4.`);
+      const alignedBuffer = new ArrayBuffer(buffer.byteLength + padBytes);
+      new Uint8Array(alignedBuffer).set(new Uint8Array(buffer));
+      buffer = alignedBuffer;
+    }
+
     log("info", `Loaded asset: ${name}, size: ${buffer.byteLength} bytes`);
     return buffer;
   } catch (err: unknown) {

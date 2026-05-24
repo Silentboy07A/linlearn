@@ -127,7 +127,7 @@ async function handleInit(payload: any) {
     const vgaBiosBuffer = await loadAsset(`${origin}/v86/bios/vgabios.bin?v=${version}`, "vgabios.bin");
 
     log("info", "Loading Linux kernel (bzImage)");
-    const bzImageBuffer = await loadAsset(`${origin}/v86/images/bzImage?v=${version}`, "bzImage");
+    const bzImageBuffer = await loadAsset(`${origin}/v86/images/bzImage?v=${version}`, "bzImage", { autoAlign: true });
 
     const config: V86StarterConfig = {
       wasm_path: wasmBlobUrl,
