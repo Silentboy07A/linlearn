@@ -10,7 +10,10 @@
 "use strict";
 
 /** @type {object|null} */
+/** @type {object|null} */
 var emulator = null;
+/** @type {boolean} */
+var isInitialized = false;
 
 /**
  * Post a log message back to the main thread for diagnostics.
@@ -35,7 +38,7 @@ self.onmessage = function (e) {
       break;
 
     case "INPUT":
-      if (emulator) {
+      if (emulator && isInitialized) {
         emulator.serial0_send(payload);
       }
       break;
@@ -86,17 +89,11 @@ function handleInit(payload) {
   log("info", "Worker: Creating v86 emulator instance...");
 
   try {
+    // Basic config required for both cold boot and snapshot restore
     var config = {
       wasm_path: origin + "/v86/v86.wasm",
       memory_size: 128 * 1024 * 1024, // 128 MB
       vga_memory_size: 2 * 1024 * 1024, // 2 MB
-      bios: { url: origin + "/v86/bios/seabios.bin" },
-      vga_bios: { url: origin + "/v86/bios/vgabios.bin" },
-      bzimage: { url: origin + "/v86/images/bzImage", async: false },
-      cmdline:
-        "rw init=/sbin/init root=/dev/ram0 " +
-        "tsc=reliable mitigations=off random.trust_cpu=on " +
-        "console=ttyS0",
       autostart: true,
     };
 
@@ -109,6 +106,15 @@ function handleInit(payload) {
           " KB)"
       );
       config.initial_state = { buffer: payload.initial_state };
+    } else {
+      log("info", "Worker: Cold booting Linux VM (downloading kernel + BIOS)");
+      config.bios = { url: origin + "/v86/bios/seabios.bin" };
+      config.vga_bios = { url: origin + "/v86/bios/vgabios.bin" };
+      config.bzimage = { url: origin + "/v86/images/bzImage", async: false };
+      config.cmdline =
+        "rw init=/sbin/init root=/dev/ram0 " +
+        "tsc=reliable mitigations=off random.trust_cpu=on " +
+        "console=ttyS0";
     }
 
     emulator = new V86(config);
@@ -120,9 +126,12 @@ function handleInit(payload) {
     });
 
     // Notify main thread that init succeeded
+    isInitialized = true;
     self.postMessage({ type: "INIT_SUCCESS" });
     log("info", "Worker: v86 emulator created and started");
   } catch (err) {
+    isInitialized = false;
+    emulator = null;
     var initErr =
       "Emulator creation failed: " + (err.message || String(err));
     log("error", initErr);
@@ -134,23 +143,28 @@ function handleInit(payload) {
  * Save VM state and send buffer back to main thread via Transferable.
  */
 function handleSaveState() {
-  if (!emulator) {
+  if (!emulator || !isInitialized) {
     self.postMessage({
       type: "SAVE_FAILURE",
-      payload: "No emulator instance",
+      payload: "No emulator instance or emulator not fully initialized",
     });
     return;
   }
 
   try {
-    emulator.save_state(function (err, state) {
-      if (err) {
-        self.postMessage({ type: "SAVE_FAILURE", payload: String(err) });
-      } else {
+    // N.prototype.save_state is async in libv86.js and returns a Promise.
+    emulator.save_state()
+      .then(function (state) {
+        if (!state || !(state instanceof ArrayBuffer)) {
+          throw new Error("Invalid state buffer returned by emulator");
+        }
         // Transfer the ArrayBuffer (zero-copy) to main thread
         self.postMessage({ type: "SAVE_SUCCESS", payload: state }, [state]);
-      }
-    });
+      })
+      .catch(function (err) {
+        log("error", "Save state failed: " + String(err));
+        self.postMessage({ type: "SAVE_FAILURE", payload: String(err) });
+      });
   } catch (err) {
     self.postMessage({
       type: "SAVE_FAILURE",
@@ -164,6 +178,7 @@ function handleSaveState() {
  */
 function handleDestroy() {
   log("info", "Worker: Destroying emulator...");
+  isInitialized = false;
   if (emulator) {
     try {
       emulator.destroy();

@@ -751,6 +751,9 @@ export function TerminalSimulator({
             console.error("Failed to load saved state:", e);
           }
 
+          // Keep track of whether we attempted to restore a saved state
+          const attemptedRestore = !!savedState;
+
           // Instantiate Web Worker (using plain JS from public/ to bypass Next.js webpack issues)
           const workerUrl = window.location.origin + "/v86/v86-worker.js";
           const worker = new Worker(workerUrl);
@@ -769,10 +772,33 @@ export function TerminalSimulator({
                 break;
               case "INIT_FAILURE":
                 console.error("Failed to load v86 VM in worker:", payload);
-                term.write(`\r\n\x1b[1;31mError: Failed to fetch WebAssembly virtual machine libraries.\x1b[0m\r\n`);
+                term.write(`\r\n\x1b[1;31mError: Failed to load virtual machine.\x1b[0m\r\n`);
                 term.write(`\x1b[1;30m[Debug Info] ${payload}\x1b[0m\r\n`);
-                term.write("Verify your internet connection and CORS configurations.\r\n");
+                
+                if (attemptedRestore) {
+                  term.write(`\r\n\x1b[1;33mWarning: Saved session state may be corrupt. Automatically clearing state and forcing cold boot...\x1b[0m\r\n`);
+                  clearV86State().then(() => {
+                    term.write(`\x1b[1;32mState cleared. Please reload the dashboard to boot clean.\x1b[0m\r\n`);
+                  }).catch(e => {
+                    console.error("Failed to clear corrupt state:", e);
+                  });
+                } else {
+                  term.write("Verify your internet connection and CORS configurations.\r\n");
+                }
                 setV86Booting(false);
+                break;
+              case "LOG":
+                {
+                  const logData = payload as { level: string; msg: string };
+                  const logPrefix = `[v86-worker] [${logData.level.toUpperCase()}]`;
+                  if (logData.level === "error") {
+                    console.error(logPrefix, logData.msg);
+                  } else if (logData.level === "warn") {
+                    console.warn(logPrefix, logData.msg);
+                  } else {
+                    console.log(logPrefix, logData.msg);
+                  }
+                }
                 break;
               case "SERIAL_OUT":
                 const char = payload;

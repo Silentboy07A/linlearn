@@ -79,9 +79,45 @@ function isValidState(buffer: unknown): buffer is ArrayBuffer {
   if (!(buffer instanceof ArrayBuffer)) return false;
   if (buffer.byteLength < MIN_VALID_STATE_SIZE) return false;
 
-  // v86 state buffers should be at least several KB.
-  // A 5-byte or 0-byte buffer is definitely corrupt.
-  return true;
+  try {
+    const view = new DataView(buffer);
+    // v86 state format uses little-endian fields at the start of the ArrayBuffer:
+    // Offset 0: Magic number (Int32: -2039052682 or Uint32: 2255914614 / 0x86737466)
+    // Offset 4: State version (Int32: 6)
+    // Offset 8: Total length of serialized state (Int32: must equal buffer.byteLength)
+    // Offset 12: JSON descriptor metadata string length (Int32: must be positive and fit in remaining space)
+    
+    const magic = view.getInt32(0, true);
+    if (magic !== -2039052682) {
+      console.warn("[v86db] Validation failed: Magic number mismatch:", magic);
+      return false;
+    }
+
+    const version = view.getInt32(4, true);
+    if (version !== 6) {
+      console.warn("[v86db] Validation failed: State version mismatch:", version);
+      return false;
+    }
+
+    const totalLength = view.getInt32(8, true);
+    if (totalLength !== buffer.byteLength) {
+      console.warn(
+        `[v86db] Validation failed: State length mismatch. Header says ${totalLength}, actual buffer is ${buffer.byteLength}`
+      );
+      return false;
+    }
+
+    const jsonLength = view.getInt32(12, true);
+    if (jsonLength <= 0 || jsonLength > buffer.byteLength - 16) {
+      console.warn("[v86db] Validation failed: Invalid metadata JSON length:", jsonLength);
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    console.error("[v86db] Validation failed with exception:", e);
+    return false;
+  }
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
