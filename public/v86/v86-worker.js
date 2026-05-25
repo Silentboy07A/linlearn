@@ -390,8 +390,13 @@ async function handleInit(payload) {
     await createEmulator(config, self);
 
     self.postMessage({ type: "INIT_SUCCESS" });
-    log("info", "v86 emulator successfully created. Transitioned to booting guest...");
-    setLifecycleState("booting");
+    if (payload.initial_state) {
+      log("info", "v86 emulator successfully restored from snapshot. Transitioning to running...");
+      setLifecycleState("running");
+    } else {
+      log("info", "v86 emulator successfully created. Transitioned to booting guest...");
+      setLifecycleState("booting");
+    }
   } catch (err) {
     setLifecycleState("failed");
     await destroyEmulator();

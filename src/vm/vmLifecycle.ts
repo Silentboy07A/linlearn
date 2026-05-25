@@ -27,7 +27,8 @@ export class VMLifecycleManager {
 
     const allowed = VMLifecycleManager.VALID_TRANSITIONS[oldState]?.has(newState);
     if (!allowed) {
-      Logger.warn("VM", `Lifecycle transition constraint warning: ${oldState} -> ${newState} is not standard`);
+      Logger.error("VM", `Lifecycle transition constraint violation: ${oldState} -> ${newState} is blocked.`);
+      throw new Error(`Invalid VM Lifecycle Transition: ${oldState} -> ${newState}`);
     }
 
     this.currentState.state = newState;

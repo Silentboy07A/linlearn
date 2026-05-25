@@ -761,6 +761,7 @@ export function TerminalSimulator({
 
         // Frame-batched serial output rendering for butter smooth performance
         let serialBuffer = "";
+        let provisioningSearchBuffer = "";
         let rafId: number | null = null;
 
         const flushSerial = () => {
@@ -804,14 +805,14 @@ export function TerminalSimulator({
 
           // State checking for guest provisioning
           if (!isProvisioned) {
-            let outputBuffer = lastOutputRef.current;
-            if (outputBuffer.length > 256) {
-              outputBuffer = outputBuffer.substring(outputBuffer.length - 256);
+            provisioningSearchBuffer += char;
+            if (provisioningSearchBuffer.length > 256) {
+              provisioningSearchBuffer = provisioningSearchBuffer.substring(provisioningSearchBuffer.length - 256);
             }
 
             // Detect prompt/sentinel patterns
-            const hasRootPrompt = outputBuffer.endsWith("~% ") || outputBuffer.endsWith("# ") || outputBuffer.endsWith("~# ");
-            const hasUserSentinel = outputBuffer.includes("PROVISIONING_COMPLETE");
+            const hasRootPrompt = provisioningSearchBuffer.endsWith("~% ") || provisioningSearchBuffer.endsWith("# ") || provisioningSearchBuffer.endsWith("~# ");
+            const hasUserSentinel = provisioningSearchBuffer.includes("PROVISIONING_COMPLETE");
 
             if (hasRootPrompt && !isProvisioning) {
               // Initiate silent environment provisioning
@@ -824,6 +825,7 @@ export function TerminalSimulator({
               emulator.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\ncat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\$(pwd | sed "s|^\$HOME|~|")\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
             } else if (hasUserSentinel) {
               // User prompt sentinel matched: provisioning successfully complete!
+              provisioningSearchBuffer = "";
               isProvisioning = false;
               isProvisioned = true;
               emulator.transitionState("running");
@@ -918,6 +920,8 @@ export function TerminalSimulator({
             } else {
               term.write(" * No snapshot found. Performing cold boot...\r\n");
               setHasSavedState(false);
+              lastOutputRef.current = "";
+              emulator.clearSerialHistory();
             }
 
             // 2. Start VM

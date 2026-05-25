@@ -36,20 +36,29 @@ export class EmulatorManager {
     this.config = ResourceLimitsValidator.validate(config);
   }
 
+  private isStarting = false;
+
   public async start(
     origin: string,
     onSerial: (data: string) => void,
     onState: (state: string) => void,
     initialState?: ArrayBuffer
   ): Promise<void> {
+    if (this.isStarting) {
+      Logger.warn("VM", "VM is already starting. Ignoring redundant start call.");
+      return;
+    }
+
     if (this.lifecycle.isAlive()) {
       Logger.warn("VM", "VM already running. Destroying it before starting new session.");
       await this.stop();
     }
 
-    this.onSerialOutput = onSerial;
-    this.onStateChange = onState;
-    this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes);
+    this.isStarting = true;
+    try {
+      this.onSerialOutput = onSerial;
+      this.onStateChange = onState;
+      this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes);
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
@@ -167,6 +176,9 @@ export class EmulatorManager {
         initial_state: initialState,
       });
     });
+    } finally {
+      this.isStarting = false;
+    }
   }
 
   public reattach(
@@ -235,7 +247,12 @@ export class EmulatorManager {
   }
 
   public transitionState(newState: VMState["state"]): void {
-    this.lifecycle.transitionTo(newState);
+    try {
+      this.lifecycle.transitionTo(newState);
+    } catch (e) {
+      Logger.warn("VM", `Ignored invalid state transition to ${newState}: ${e}`);
+      return;
+    }
     if (this.onStateChange) this.onStateChange(newState);
 
     // Synchronize state with worker
