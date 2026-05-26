@@ -1,5 +1,4 @@
 // src/services/v86/emulatorManager.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { log } from "./logger";
 
 export interface V86StarterConfig {
@@ -12,18 +11,26 @@ export interface V86StarterConfig {
   autostart: boolean;
   memory_size?: number;
   vga_memory_size?: number;
-  filesystem?: any;
+  filesystem?: unknown;
   initial_state?: { buffer: ArrayBuffer };
 }
 
 export interface V86StarterInstance {
   serial0_send: (data: string) => void;
-  add_listener: (event: string, cb: (...args: any[]) => void) => void;
-  remove_listener: (event: string, cb: (...args: any[]) => void) => void;
+  add_listener: (event: string, cb: (...args: unknown[]) => void) => void;
+  remove_listener: (event: string, cb: (...args: unknown[]) => void) => void;
   destroy: () => void | Promise<void>;
   stop: () => Promise<void>;
   restart: () => void;
   save_state: () => Promise<ArrayBuffer>;
+}
+
+export interface WindowWithV86 {
+  V86: new (config: V86StarterConfig) => V86StarterInstance;
+}
+
+interface DedicatedWorkerGlobal {
+  postMessage(message: unknown, transfer?: Transferable[]): void;
 }
 
 let emulator: V86StarterInstance | null = null;
@@ -32,7 +39,12 @@ export function getEmulator(): V86StarterInstance | null {
   return emulator;
 }
 
-export async function createEmulator(config: V86StarterConfig, win: any) {
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+export async function createEmulator(config: V86StarterConfig, win: WindowWithV86) {
   if (emulator) {
     log("warn", "Pre-existing emulator instance found. Destroying it first to avoid memory leaks.");
     await destroyEmulator();
@@ -52,14 +64,14 @@ export async function createEmulator(config: V86StarterConfig, win: any) {
     const inst = new win.V86(finalConfig);
     emulator = inst;
 
-    inst.add_listener("serial0-output-byte", (byte: number) => {
-      (self as any).postMessage({ type: "SERIAL_OUT", payload: byte });
+    inst.add_listener("serial0-output-byte", (byte: unknown) => {
+      (self as unknown as DedicatedWorkerGlobal).postMessage({ type: "SERIAL_OUT", payload: byte });
     });
 
     log("info", "v86 emulator successfully created.");
-  } catch (err: any) {
+  } catch (err: unknown) {
     emulator = null;
-    const msg = `Failed to create emulator instance: ${err.message || String(err)}`;
+    const msg = `Failed to create emulator instance: ${getErrorMessage(err)}`;
     log("error", msg);
     throw new Error(msg);
   }
@@ -71,8 +83,8 @@ export async function destroyEmulator() {
     try {
       await emulator.destroy();
       log("info", "Emulator instance destroyed successfully.");
-    } catch (err: any) {
-      log("warn", `Error while destroying emulator (non-fatal): ${err.message || String(err)}`);
+    } catch (err: unknown) {
+      log("warn", `Error while destroying emulator (non-fatal): ${getErrorMessage(err)}`);
     }
     emulator = null;
   }

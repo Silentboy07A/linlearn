@@ -1,8 +1,11 @@
 // src/services/v86/vmLifecycle.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { log } from "./logger";
 
 export type EmulatorState = "idle" | "loading" | "booting" | "provisioning" | "running" | "stopping" | "stopped" | "error";
+
+interface DedicatedWorkerGlobal {
+  postMessage(message: unknown, transfer?: Transferable[]): void;
+}
 
 let lifecycleState: EmulatorState = "idle";
 let isBootingInProgress = false;
@@ -61,7 +64,7 @@ export function setLifecycleState(
 
   // Only broadcast to main thread if not a silent (echo-breaking) call
   if (!silent) {
-    (self as any).postMessage({ type: "STATE_CHANGED", payload: newState });
+    (self as unknown as DedicatedWorkerGlobal).postMessage({ type: "STATE_CHANGED", payload: newState });
   }
   return true;
 }

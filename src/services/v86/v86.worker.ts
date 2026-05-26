@@ -1,5 +1,4 @@
 // src/services/v86/v86.worker.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { log } from "./logger";
 import { loadAsset } from "./assetLoader";
 import {
@@ -9,27 +8,68 @@ import {
   canSendInput,
   setBootingInProgress,
   isBooting,
+  EmulatorState,
 } from "./vmLifecycle";
 import {
   getEmulator,
   createEmulator,
   destroyEmulator,
   V86StarterConfig,
+  V86StarterInstance,
 } from "./emulatorManager";
 
+interface DedicatedWorkerGlobal {
+  postMessage(message: unknown, transfer?: Transferable[]): void;
+  importScripts(...urls: string[]): void;
+  close(): void;
+}
+
+const workerCtx = self as unknown as DedicatedWorkerGlobal;
+
 interface WindowWithV86 {
-  V86: any;
+  V86: new (config: V86StarterConfig) => V86StarterInstance;
+}
+
+type WorkerMessageType =
+  | "INIT"
+  | "INPUT"
+  | "SET_STATE"
+  | "SET_RUNNING"
+  | "SET_PROVISIONING"
+  | "SAVE_STATE"
+  | "STOP"
+  | "RESTART"
+  | "DESTROY";
+
+interface WorkerMessage {
+  type: WorkerMessageType;
+  payload?: unknown;
+}
+
+interface InitPayload {
+  origin: string;
+  version?: string;
+  initial_state?: ArrayBuffer;
+  cmdline?: string;
+  memory_size?: number;
+  vga_memory_size?: number;
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
 
 // ─── Mutex lock for init serialization ──────────────────────────────────────
 let initLock: Promise<void> | null = null;
 
-self.onmessage = async (e: MessageEvent) => {
+self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   if (!e.data) return;
   const { type, payload } = e.data;
 
   switch (type) {
-    case "INIT":
+    case "INIT": {
+      const initPayload = payload as InitPayload;
       if (!canInitialize() || isBooting()) {
         log("warn", `Ignored INIT: emulator already initializing or running (state: ${getLifecycleState()})`);
         return;
@@ -40,12 +80,13 @@ self.onmessage = async (e: MessageEvent) => {
         return;
       }
       setBootingInProgress(true);
-      initLock = handleInit(payload).finally(() => {
+      initLock = handleInit(initPayload).finally(() => {
         initLock = null;
         setBootingInProgress(false);
       });
       await initLock;
       break;
+    }
 
     case "INPUT": {
       const emulator = getEmulator();
@@ -57,19 +98,22 @@ self.onmessage = async (e: MessageEvent) => {
         log("debug", `Ignored serial input: VM is in non-interactive state (state: ${getLifecycleState()})`);
         break;
       }
-      log("debug", `Routing serial input of length ${payload ? payload.length : 0} to emulator`);
+      const inputPayload = payload as string;
+      log("debug", `Routing serial input of length ${inputPayload ? inputPayload.length : 0} to emulator`);
       try {
-        emulator.serial0_send(payload);
-      } catch (err: any) {
-        log("error", `Failed to send serial input: ${err.message || String(err)}`);
+        emulator.serial0_send(inputPayload);
+      } catch (err: unknown) {
+        log("error", `Failed to send serial input: ${getErrorMessage(err)}`);
       }
       break;
     }
 
-    case "SET_STATE":
+    case "SET_STATE": {
       // Incoming state sync from main thread — use silent=true to break echo loop
-      setLifecycleState(payload, "SET_STATE from main thread", true);
+      const statePayload = payload as EmulatorState;
+      setLifecycleState(statePayload, "SET_STATE from main thread", true);
       break;
+    }
 
     case "SET_RUNNING":
       if (getLifecycleState() === "booting") {
@@ -93,17 +137,18 @@ self.onmessage = async (e: MessageEvent) => {
       const emulator = getEmulator();
       if (!emulator) {
         log("error", "Cannot save state: emulator not initialized.");
-        (self as any).postMessage({ type: "SAVE_STATE_FAILURE", payload: "Emulator not initialized" });
+        workerCtx.postMessage({ type: "SAVE_STATE_FAILURE", payload: "Emulator not initialized" });
         break;
       }
       try {
         log("info", "Taking guest VM memory snapshot...");
         const state = await emulator.save_state();
-        (self as any).postMessage({ type: "SAVE_STATE_SUCCESS", payload: state }, [state]);
+        workerCtx.postMessage({ type: "SAVE_STATE_SUCCESS", payload: state }, [state]);
         log("info", "Guest VM snapshot taken successfully.");
-      } catch (err: any) {
-        log("error", `Failed to save VM state: ${err.message || String(err)}`);
-        (self as any).postMessage({ type: "SAVE_STATE_FAILURE", payload: err.message || String(err) });
+      } catch (err: unknown) {
+        const errMsg = getErrorMessage(err);
+        log("error", `Failed to save VM state: ${errMsg}`);
+        workerCtx.postMessage({ type: "SAVE_STATE_FAILURE", payload: errMsg });
       }
       break;
     }
@@ -125,7 +170,7 @@ self.onmessage = async (e: MessageEvent) => {
   }
 };
 
-async function handleInit(payload: any) {
+async function handleInit(payload: InitPayload) {
   const origin = payload.origin;
   const version = payload.version || Date.now().toString();
   const t0 = Date.now();
@@ -134,12 +179,12 @@ async function handleInit(payload: any) {
   log("info", `Step 1/4: Loading libv86.js from ${origin}/v86/libv86.js?v=${version}`);
 
   try {
-    (self as any).importScripts(`${origin}/v86/libv86.js?v=${version}`);
-  } catch (err: any) {
-    const msg = `Failed to load libv86.js: ${err.message || String(err)}`;
+    workerCtx.importScripts(`${origin}/v86/libv86.js?v=${version}`);
+  } catch (err: unknown) {
+    const msg = `Failed to load libv86.js: ${getErrorMessage(err)}`;
     log("error", msg);
     setLifecycleState("error", "handleInit: libv86 load failed");
-    (self as any).postMessage({ type: "INIT_FAILURE", payload: msg });
+    workerCtx.postMessage({ type: "INIT_FAILURE", payload: msg });
     return;
   }
 
@@ -148,7 +193,7 @@ async function handleInit(payload: any) {
     const errMsg = "V86 constructor not found after importScripts";
     log("error", errMsg);
     setLifecycleState("error", "handleInit: V86 constructor missing");
-    (self as any).postMessage({ type: "INIT_FAILURE", payload: errMsg });
+    workerCtx.postMessage({ type: "INIT_FAILURE", payload: errMsg });
     return;
   }
 
@@ -196,15 +241,15 @@ async function handleInit(payload: any) {
     log("info", "Step 4/4: Creating v86 emulator instance...");
     await createEmulator(config, win);
 
-    (self as any).postMessage({ type: "INIT_SUCCESS" });
+    workerCtx.postMessage({ type: "INIT_SUCCESS" });
     log("info", "v86 emulator successfully created. Transitioned to booting guest...");
     setLifecycleState("booting", "handleInit: emulator created");
-  } catch (err: any) {
+  } catch (err: unknown) {
     setLifecycleState("error", "handleInit: emulator creation failed");
     await destroyEmulator();
-    const initErr = `Emulator initialization failed: ${err.message || String(err)}`;
+    const initErr = `Emulator initialization failed: ${getErrorMessage(err)}`;
     log("error", initErr);
-    (self as any).postMessage({ type: "INIT_FAILURE", payload: initErr });
+    workerCtx.postMessage({ type: "INIT_FAILURE", payload: initErr });
   }
 }
 
@@ -228,8 +273,8 @@ async function handleStop() {
     await emulator.stop();
     setLifecycleState("stopped", "handleStop: emulator stopped");
     log("info", "Guest emulator stopped successfully.");
-  } catch (err: any) {
-    log("error", `Failed to stop emulator: ${err.message || String(err)}`);
+  } catch (err: unknown) {
+    log("error", `Failed to stop emulator: ${getErrorMessage(err)}`);
     setLifecycleState("error", "handleStop: stop failed");
   }
 }
@@ -249,8 +294,8 @@ async function handleRestart() {
     setLifecycleState("stopping", "handleRestart: stopping before restart");
     try {
       await emulator.stop();
-    } catch (err: any) {
-      log("warn", `Error stopping emulator during restart: ${err.message || String(err)}`);
+    } catch (err: unknown) {
+      log("warn", `Error stopping emulator during restart: ${getErrorMessage(err)}`);
     }
     setLifecycleState("stopped", "handleRestart: stopped");
   }
@@ -267,8 +312,8 @@ async function handleRestart() {
     emulator.restart();
     setLifecycleState("booting", "handleRestart: emulator restarted");
     log("info", "Guest emulator restarted successfully.");
-  } catch (err: any) {
-    log("error", `Failed to restart emulator: ${err.message || String(err)}`);
+  } catch (err: unknown) {
+    log("error", `Failed to restart emulator: ${getErrorMessage(err)}`);
     setLifecycleState("error", "handleRestart: restart failed");
   }
 }
@@ -282,5 +327,5 @@ async function handleDestroy() {
   }
   setLifecycleState("stopped", "handleDestroy");
   await destroyEmulator();
-  self.close();
+  workerCtx.close();
 }
