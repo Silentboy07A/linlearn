@@ -270,6 +270,12 @@ self.onmessage = async function (e) {
       }
       break;
 
+    case "PING": {
+      var cpuRunning = emulator ? (typeof emulator.is_cpu_running === "function" ? emulator.is_cpu_running() : true) : false;
+      self.postMessage({ type: "PONG", payload: { cpu_running: cpuRunning } });
+      break;
+    }
+
     case "STOP":
       if (emulator) {
         log("info", "Stopping/pausing guest emulator...");

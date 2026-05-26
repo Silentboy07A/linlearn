@@ -6,6 +6,7 @@ import { VMSessionConfig, VMStateName, VMSnapshotMetadata } from "../lib/types";
 import { Logger } from "../lib/logger";
 import { VMInitializationError } from "../lib/errors";
 import { GUEST_INSPECT_SCRIPT } from "./inspect";
+import { TerminalHealthMonitor } from "./healthMonitor";
 
 export class EmulatorManager {
   private static activeInstance: EmulatorManager | null = null;
@@ -32,10 +33,7 @@ export class EmulatorManager {
   private wasRestoredFromSnapshot = false;
 
   private lastInputTimestamp = Date.now();
-  private healthCheckInterval: NodeJS.Timeout | null = null;
-  private healthCheckTimeout: NodeJS.Timeout | null = null;
-  private isCheckingHealth = false;
-  private healthPingMatched = false;
+  private healthMonitor: TerminalHealthMonitor | null = null;
 
   // ─── Initialization mutex ─────────────────────────────────────────────────
   private initPromise: Promise<void> | null = null;
@@ -143,15 +141,17 @@ export class EmulatorManager {
             if (this.serialHistory.length > 20000) {
               this.serialHistory = this.serialHistory.substring(this.serialHistory.length - 20000);
             }
-
-            // Check health ping match
-            if (this.isCheckingHealth && this.serialHistory.includes("# HEALTH_PING")) {
-              this.healthPingMatched = true;
-              this.serialHistory = this.serialHistory.replace("# HEALTH_PING", "# HEALTH_OK");
-            }
-
             if (this.onSerialOutput) {
               this.onSerialOutput(char);
+            }
+            break;
+
+          case "PONG":
+            {
+              const pongPayload = payload as { cpu_running: boolean };
+              if (this.healthMonitor) {
+                this.healthMonitor.handlePong(pongPayload.cpu_running);
+              }
             }
             break;
 
@@ -270,7 +270,13 @@ export class EmulatorManager {
     }
     this.lastInputTimestamp = Date.now();
     Logger.info("VM", `sendInput: routing character sequence to bridge: ${JSON.stringify(data)}`);
-    this.bridge.post("INPUT", data);
+    try {
+      this.bridge.post("INPUT", data);
+    } catch (err: unknown) {
+      if (this.healthMonitor) {
+        this.healthMonitor.reportSerialError(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
   }
 
   public sendProgrammaticInput(data: string): void {
@@ -434,86 +440,30 @@ export class EmulatorManager {
   }
 
   private startHealthMonitoring(): void {
-    this.stopHealthMonitoring();
-    Logger.info("VM", "Starting periodic shell health monitoring (every 20s)...");
-    this.healthCheckInterval = setInterval(() => {
-      this.checkShellHealth();
-    }, 20000);
+    if (!this.healthMonitor) {
+      this.healthMonitor = new TerminalHealthMonitor(
+        (type, payload) => this.bridge.post(type, payload),
+        () => this.recoverShell()
+      );
+    }
+    this.healthMonitor.start();
   }
 
   private stopHealthMonitoring(): void {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-      this.healthCheckInterval = null;
+    if (this.healthMonitor) {
+      this.healthMonitor.stop();
     }
-    if (this.healthCheckTimeout) {
-      clearTimeout(this.healthCheckTimeout);
-      this.healthCheckTimeout = null;
-    }
-    this.isCheckingHealth = false;
-  }
-
-  private async checkShellHealth(): Promise<void> {
-    if (this.lifecycle.getState().state !== "running" || this.isCheckingHealth) {
-      return;
-    }
-
-    // If user input occurred in the last 15s, assume shell is healthy
-    if (Date.now() - this.lastInputTimestamp < 15000) {
-      return;
-    }
-
-    this.isCheckingHealth = true;
-    this.healthPingMatched = false;
-    Logger.debug("VM", "[HEALTH] Sending silent health ping to check tty activity...");
-
-    // Send silent comment ping
-    this.sendProgrammaticInput("\n# HEALTH_PING\n");
-
-    this.healthCheckTimeout = setTimeout(async () => {
-      this.healthCheckTimeout = null;
-      if (!this.healthPingMatched) {
-        Logger.warn("VM", "[HEALTH] Health ping did NOT echo back! Shell is unresponsive. Initiating recovery...");
-        await this.recoverShell();
-      } else {
-        Logger.debug("VM", "[HEALTH] Health ping echoed back. Shell is healthy.");
-        this.isCheckingHealth = false;
-      }
-    }, 3000);
   }
 
   public async recoverShell(): Promise<void> {
-    Logger.warn("VM", "[HEALTH] Attempting soft recovery (Ctrl+C, Ctrl+D, Enter)...");
-    this.sendProgrammaticInput("\x03\x04\n");
-
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    if (this.healthPingMatched) {
-      Logger.info("VM", "[HEALTH] Soft recovery succeeded.");
-      this.isCheckingHealth = false;
-      return;
-    }
-
-    Logger.warn("VM", "[HEALTH] Soft recovery failed. Trying hard tty environment recovery...");
-    this.sendProgrammaticInput("\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\nsu - user\n");
-
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
-    if (this.healthPingMatched) {
-      Logger.info("VM", "[HEALTH] Hard tty environment recovery succeeded.");
-      this.isCheckingHealth = false;
-      return;
-    }
-
-    Logger.error("VM", "[HEALTH] Shell remains unresponsive. Initiating VM hard reboot fallback...");
-    this.isCheckingHealth = false;
+    Logger.error("VM", "[HEALTH] Terminal session is unresponsive. Initiating VM hard reboot fallback...");
     
     // Call stop and start to perform a full cold boot & restore files from backup
     const activeOnSerial = this.onSerialOutput;
     const activeOnState = this.onStateChange;
     if (activeOnSerial && activeOnState) {
       if (this.onSerialOutput) {
-        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Guest shell is completely frozen. Rebooting virtual machine...\x1b[0m\r\n");
+        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Guest virtual machine is unresponsive. Rebooting virtual machine...\x1b[0m\r\n");
       }
       await this.stop();
       // Wait a moment before restarting

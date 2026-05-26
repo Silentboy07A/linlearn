@@ -23,6 +23,7 @@ export interface V86StarterInstance {
   stop: () => Promise<void>;
   restart: () => void;
   save_state: () => Promise<ArrayBuffer>;
+  is_cpu_running?: () => boolean;
 }
 
 export interface WindowWithV86 {

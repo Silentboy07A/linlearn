@@ -39,7 +39,8 @@ type WorkerMessageType =
   | "SAVE_STATE"
   | "STOP"
   | "RESTART"
-  | "DESTROY";
+  | "DESTROY"
+  | "PING";
 
 interface WorkerMessage {
   type: WorkerMessageType;
@@ -133,6 +134,13 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
         log("warn", `Ignored SET_PROVISIONING: current state: ${getLifecycleState()}`);
       }
       break;
+
+    case "PING": {
+      const emulator = getEmulator();
+      const cpuRunning = emulator ? (emulator.is_cpu_running ? emulator.is_cpu_running() : true) : false;
+      workerCtx.postMessage({ type: "PONG", payload: { cpu_running: cpuRunning } });
+      break;
+    }
 
     case "SAVE_STATE": {
       const emulator = getEmulator();

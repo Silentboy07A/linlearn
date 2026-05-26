@@ -976,19 +976,7 @@ export function TerminalSimulator({
             setV86Booting(false);
             setIsV86Running(true);
 
-            if (emulator.wasRestored && emulator.wasRestored()) {
-              console.log("[xterm DEBUG] VM was restored from snapshot. Writing welcome message and sending prompt revival keystrokes.");
-              term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
-              emulator.clearWasRestored();
-              
-              // Revive prompt and input connection
-              setTimeout(() => {
-                if (isMounted) {
-                  console.log("[xterm DEBUG] Restored from snapshot. Reviving prompt...");
-                  emulator.sendInput("\x03\n");
-                }
-              }, 100);
-            }
+
 
             setTimeout(() => {
               localForceFocus();
@@ -1018,8 +1006,6 @@ export function TerminalSimulator({
         if (isReattached) {
           term.write(" * Reattaching to active VM session...\r\n");
           emulator.reattach(onSerial, onState);
-          // Print persistent terminal history from emulatorManager instead of the stale lastOutputRef
-          term.write(emulator.getSerialHistory());
           
           // Re-sync local flags from emulator state
           const currentVmState = emulator.getLifecycleState().state;
