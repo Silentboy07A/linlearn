@@ -10,29 +10,51 @@ export class VMLifecycleManager {
   };
 
   private bootStartTimestamp: number | null = null;
+  private lastTransitionTimestamp: number = 0;
+
+  private static readonly DEBOUNCE_MS = 50;
 
   private static readonly VALID_TRANSITIONS: Record<VMState["state"], Set<VMState["state"]>> = {
     idle: new Set<VMState["state"]>(["loading", "stopped"]),
     loading: new Set<VMState["state"]>(["booting", "error", "stopped"]),
     booting: new Set<VMState["state"]>(["provisioning", "running", "error", "stopped"]),
     provisioning: new Set<VMState["state"]>(["running", "error", "stopped"]),
-    running: new Set<VMState["state"]>(["stopped", "error"]),
+    running: new Set<VMState["state"]>(["stopping", "stopped", "error"]),
+    stopping: new Set<VMState["state"]>(["stopped", "error"]),
     stopped: new Set<VMState["state"]>(["idle", "loading"]),
     error: new Set<VMState["state"]>(["idle", "loading", "stopped"]),
   };
 
-  public transitionTo(newState: VMState["state"], ramBytes?: number): void {
+  /**
+   * Attempt a validated lifecycle transition.
+   * @param newState   Target state
+   * @param ramBytes   Optional RAM usage update
+   * @param source     Human-readable source for structured logging
+   * @throws Error if the transition is not allowed by the FSM
+   */
+  public transitionTo(newState: VMState["state"], ramBytes?: number, source?: string): void {
     const oldState = this.currentState.state;
     if (oldState === newState) return;
 
     const allowed = VMLifecycleManager.VALID_TRANSITIONS[oldState]?.has(newState);
+
+    // Structured transition log
+    Logger.vmTransition(oldState, newState, !!allowed, source);
+
     if (!allowed) {
-      Logger.error("VM", `Lifecycle transition constraint violation: ${oldState} -> ${newState} is blocked.`);
       throw new Error(`Invalid VM Lifecycle Transition: ${oldState} -> ${newState}`);
     }
 
+    // Debounce: warn on rapid transitions but still allow them
+    const now = Date.now();
+    if (now - this.lastTransitionTimestamp < VMLifecycleManager.DEBOUNCE_MS) {
+      Logger.debug("VM", `Rapid transition detected: ${oldState} -> ${newState} within ${VMLifecycleManager.DEBOUNCE_MS}ms`);
+    }
+
     this.currentState.state = newState;
-    this.currentState.lastActiveTimestamp = Date.now();
+    this.currentState.lastActiveTimestamp = now;
+    this.lastTransitionTimestamp = now;
+
     if (ramBytes !== undefined) {
       this.currentState.ramUsageBytes = ramBytes;
     }
@@ -43,8 +65,6 @@ export class VMLifecycleManager {
       this.currentState.bootTimeMs = Date.now() - this.bootStartTimestamp;
       this.bootStartTimestamp = null;
     }
-
-    Logger.vmLifecycle(`VM Lifecycle transition: ${oldState} -> ${newState}`, this.currentState);
   }
 
   public getState(): VMState {

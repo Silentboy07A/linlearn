@@ -30,13 +30,15 @@ export class EmulatorManager {
   private watchdogTimer: NodeJS.Timeout | null = null;
   private serialHistory: string = "";
 
+  // ─── Initialization mutex ─────────────────────────────────────────────────
+  private initPromise: Promise<void> | null = null;
+  private initAbortController: AbortController | null = null;
+
   constructor(config: Partial<VMSessionConfig> = {}) {
     this.bridge = new WorkerBridge();
     this.lifecycle = new VMLifecycleManager();
     this.config = ResourceLimitsValidator.validate(config);
   }
-
-  private isStarting = false;
 
   public async start(
     origin: string,
@@ -44,7 +46,8 @@ export class EmulatorManager {
     onState: (state: string) => void,
     initialState?: ArrayBuffer
   ): Promise<void> {
-    if (this.isStarting) {
+    // Mutex: prevent concurrent start() calls
+    if (this.initPromise) {
       Logger.warn("VM", "VM is already starting. Ignoring redundant start call.");
       return;
     }
@@ -54,11 +57,28 @@ export class EmulatorManager {
       await this.stop();
     }
 
-    this.isStarting = true;
+    this.initAbortController = new AbortController();
+    const abortSignal = this.initAbortController.signal;
+
+    this.initPromise = this._doStart(origin, onSerial, onState, initialState, abortSignal);
     try {
-      this.onSerialOutput = onSerial;
-      this.onStateChange = onState;
-      this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes);
+      await this.initPromise;
+    } finally {
+      this.initPromise = null;
+      this.initAbortController = null;
+    }
+  }
+
+  private async _doStart(
+    origin: string,
+    onSerial: (data: string) => void,
+    onState: (state: string) => void,
+    initialState: ArrayBuffer | undefined,
+    abortSignal: AbortSignal
+  ): Promise<void> {
+    this.onSerialOutput = onSerial;
+    this.onStateChange = onState;
+    this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes, "EmulatorManager.start");
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
@@ -68,11 +88,16 @@ export class EmulatorManager {
     }
 
     return new Promise((resolve, reject) => {
+      if (abortSignal.aborted) {
+        reject(new VMInitializationError("Start aborted"));
+        return;
+      }
+
       let resolved = false;
 
       const timeout = setTimeout(() => {
         if (!resolved) {
-          this.transitionState("error");
+          this.transitionState("error", "boot timeout");
           this.bridge.terminate();
           this.stopWatchdog();
           reject(new VMInitializationError(`Boot timeout exceeded: ${this.config.timeoutMs}ms`));
@@ -80,24 +105,25 @@ export class EmulatorManager {
       }, this.config.timeoutMs);
 
       this.bridge.initialize(workerUrl, (type, payload) => {
+        if (abortSignal.aborted) return;
+
         switch (type) {
           case "INIT_SUCCESS":
             if (initialState) {
               // Direct transition to running for instant restoration
-              this.transitionState("running");
+              this.transitionState("running", "INIT_SUCCESS (snapshot restore)");
               clearTimeout(timeout);
               if (!resolved) {
                 resolved = true;
                 resolve();
               }
-            } else {
-              this.transitionState("booting");
             }
+            // For cold boot, don't transition here — worker will send STATE_CHANGED("booting")
             break;
 
           case "INIT_FAILURE":
             clearTimeout(timeout);
-            this.transitionState("error");
+            this.transitionState("error", "INIT_FAILURE");
             if (!resolved) {
               resolved = true;
               reject(new VMInitializationError(String(payload)));
@@ -157,12 +183,13 @@ export class EmulatorManager {
 
           case "STATE_CHANGED":
             {
+              // Worker is the source of truth — accept its state without echoing back
               const newState = payload as any;
-              // Translate state names from worker to client if different
               let mappedState: VMState["state"] = newState;
               if (newState === "failed") mappedState = "error";
               if (newState === "destroyed") mappedState = "stopped";
-              this.transitionState(mappedState);
+              // Use fromWorker=true to suppress the echo back to worker
+              this.transitionState(mappedState, "worker STATE_CHANGED", true);
             }
             break;
         }
@@ -176,9 +203,6 @@ export class EmulatorManager {
         initial_state: initialState,
       });
     });
-    } finally {
-      this.isStarting = false;
-    }
   }
 
   public reattach(
@@ -246,26 +270,53 @@ export class EmulatorManager {
     this.bridge.post("INPUT", data);
   }
 
-  public transitionState(newState: VMState["state"]): void {
+  /**
+   * Transition the main-thread lifecycle state.
+   * @param newState   Target state
+   * @param source     Where this transition originated
+   * @param fromWorker If true, skip echoing state back to worker (breaks feedback loop)
+   */
+  public transitionState(newState: VMState["state"], source?: string, fromWorker: boolean = false): void {
     try {
-      this.lifecycle.transitionTo(newState);
+      this.lifecycle.transitionTo(newState, undefined, source);
     } catch (e) {
       Logger.warn("VM", `Ignored invalid state transition to ${newState}: ${e}`);
       return;
     }
     if (this.onStateChange) this.onStateChange(newState);
 
-    // Synchronize state with worker
-    let workerState: string = newState;
-    if (newState === "stopped") workerState = "destroyed";
-    if (newState === "error") workerState = "failed";
-    this.bridge.post("SET_STATE", workerState);
+    // Only sync state back to worker if this transition did NOT originate from the worker
+    // This is the key fix that breaks the echo loop:
+    //   Worker STATE_CHANGED -> main transitionState(fromWorker=true) -> NO echo back
+    //   Local transitionState(fromWorker=false) -> sync to worker
+    if (!fromWorker) {
+      let workerState: string = newState;
+      if (newState === "stopped") workerState = "destroyed";
+      if (newState === "error") workerState = "failed";
+      this.bridge.post("SET_STATE", workerState);
+    }
 
     if (newState === "provisioning") {
       this.startProvisioningWatchdog();
     } else if (newState === "running" || newState === "stopped" || newState === "error") {
       this.stopWatchdog();
     }
+  }
+
+  /**
+   * Request the worker to transition to provisioning state.
+   * This keeps the worker as the single source of truth.
+   */
+  public requestProvisioningTransition(): void {
+    this.bridge.post("SET_PROVISIONING");
+  }
+
+  /**
+   * Request the worker to transition to running state.
+   * This keeps the worker as the single source of truth.
+   */
+  public requestRunningTransition(): void {
+    this.bridge.post("SET_RUNNING");
   }
 
   private startWatchdog(): void {
@@ -275,7 +326,7 @@ export class EmulatorManager {
       const currentState = this.lifecycle.getState().state;
       if (currentState === "loading" || currentState === "booting") {
         Logger.warn("VM", `[WATCHDOG] VM boot stalled in state: ${currentState}. Recovering...`);
-        this.transitionState("running");
+        this.transitionState("running", "watchdog recovery");
         
         // Execute recovery script to revive shell and stty settings
         const recoveryScript = `\n\x03\x03\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nsu - user\nexport PS1='user@linlearn:\\w\\$ '\necho "PROVISIONING_COMPLETE"\n`;
@@ -295,7 +346,7 @@ export class EmulatorManager {
       const currentState = this.lifecycle.getState().state;
       if (currentState === "provisioning") {
         Logger.warn("VM", `[WATCHDOG] VM provisioning stalled. Recovering...`);
-        this.transitionState("running");
+        this.transitionState("running", "provisioning watchdog recovery");
         
         // Execute recovery script to revive shell and stty settings
         const recoveryScript = `\n\x03\x03\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nsu - user\nexport PS1='user@linlearn:\\w\\$ '\necho "PROVISIONING_COMPLETE"\n`;
@@ -317,8 +368,14 @@ export class EmulatorManager {
 
   public async stop(): Promise<void> {
     Logger.info("VM", "Stopping guest VM session...");
+
+    // Abort any in-progress start
+    if (this.initAbortController) {
+      this.initAbortController.abort();
+    }
+
     this.stopWatchdog();
-    this.transitionState("stopped");
+    this.transitionState("stopped", "EmulatorManager.stop");
     this.bridge.terminate();
     this.onSerialOutput = null;
     this.onStateChange = null;

@@ -9,6 +9,7 @@ import {
   canSendInput,
   setBootingInProgress,
   isBooting,
+  resetLifecycleState,
 } from "./vmLifecycle";
 import {
   getEmulator,
@@ -21,6 +22,9 @@ interface WindowWithV86 {
   V86: any;
 }
 
+// ─── Mutex lock for init serialization ──────────────────────────────────────
+let initLock: Promise<void> | null = null;
+
 self.onmessage = async (e: MessageEvent) => {
   if (!e.data) return;
   const { type, payload } = e.data;
@@ -31,9 +35,17 @@ self.onmessage = async (e: MessageEvent) => {
         log("warn", `Ignored INIT: emulator already initializing or running (state: ${getLifecycleState()})`);
         return;
       }
+      // Mutex: prevent concurrent INIT calls
+      if (initLock) {
+        log("warn", `Ignored INIT: another initialization is already in progress`);
+        return;
+      }
       setBootingInProgress(true);
-      await handleInit(payload);
-      setBootingInProgress(false);
+      initLock = handleInit(payload).finally(() => {
+        initLock = null;
+        setBootingInProgress(false);
+      });
+      await initLock;
       break;
 
     case "INPUT": {
@@ -56,15 +68,25 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     case "SET_STATE":
-      setLifecycleState(payload);
+      // Incoming state sync from main thread — use silent=true to break echo loop
+      setLifecycleState(payload, "SET_STATE from main thread", true);
       break;
 
     case "SET_RUNNING":
       if (getLifecycleState() === "booting") {
-        setLifecycleState("running");
+        setLifecycleState("running", "SET_RUNNING (boot complete)");
         log("info", "Emulator successfully transitioned to running state (boot complete)");
       } else {
         log("warn", `Ignored SET_RUNNING: current state: ${getLifecycleState()}`);
+      }
+      break;
+
+    case "SET_PROVISIONING":
+      if (getLifecycleState() === "booting") {
+        setLifecycleState("provisioning", "SET_PROVISIONING");
+        log("info", "Emulator transitioned to provisioning state");
+      } else {
+        log("warn", `Ignored SET_PROVISIONING: current state: ${getLifecycleState()}`);
       }
       break;
 
@@ -92,7 +114,7 @@ self.onmessage = async (e: MessageEvent) => {
       break;
 
     case "RESTART":
-      handleRestart();
+      await handleRestart();
       break;
 
     case "DESTROY":
@@ -109,7 +131,7 @@ async function handleInit(payload: any) {
   const version = payload.version || Date.now().toString();
   const t0 = Date.now();
 
-  setLifecycleState("loading");
+  setLifecycleState("loading", "handleInit");
   log("info", `Step 1/4: Loading libv86.js from ${origin}/v86/libv86.js?v=${version}`);
 
   try {
@@ -117,7 +139,7 @@ async function handleInit(payload: any) {
   } catch (err: any) {
     const msg = `Failed to load libv86.js: ${err.message || String(err)}`;
     log("error", msg);
-    setLifecycleState("error");
+    setLifecycleState("error", "handleInit: libv86 load failed");
     (self as any).postMessage({ type: "INIT_FAILURE", payload: msg });
     return;
   }
@@ -126,7 +148,7 @@ async function handleInit(payload: any) {
   if (!win.V86) {
     const errMsg = "V86 constructor not found after importScripts";
     log("error", errMsg);
-    setLifecycleState("error");
+    setLifecycleState("error", "handleInit: V86 constructor missing");
     (self as any).postMessage({ type: "INIT_FAILURE", payload: errMsg });
     return;
   }
@@ -177,9 +199,9 @@ async function handleInit(payload: any) {
 
     (self as any).postMessage({ type: "INIT_SUCCESS" });
     log("info", "v86 emulator successfully created. Transitioned to booting guest...");
-    setLifecycleState("booting");
+    setLifecycleState("booting", "handleInit: emulator created");
   } catch (err: any) {
-    setLifecycleState("error");
+    setLifecycleState("error", "handleInit: emulator creation failed");
     await destroyEmulator();
     const initErr = `Emulator initialization failed: ${err.message || String(err)}`;
     log("error", initErr);
@@ -193,34 +215,73 @@ async function handleStop() {
     log("debug", "Stop request ignored: No active emulator instance.");
     return;
   }
+
+  const currentState = getLifecycleState();
+  if (currentState !== "running" && currentState !== "booting" && currentState !== "provisioning") {
+    log("debug", `Stop request ignored: VM is in state ${currentState}`);
+    return;
+  }
+
+  // Graceful shutdown: running -> stopping -> stopped
+  setLifecycleState("stopping", "handleStop");
   log("info", "Stopping/pausing guest emulator...");
   try {
     await emulator.stop();
+    setLifecycleState("stopped", "handleStop: emulator stopped");
     log("info", "Guest emulator stopped successfully.");
   } catch (err: any) {
     log("error", `Failed to stop emulator: ${err.message || String(err)}`);
+    setLifecycleState("error", "handleStop: stop failed");
   }
 }
 
-function handleRestart() {
+async function handleRestart() {
   const emulator = getEmulator();
   if (!emulator) {
     log("debug", "Restart request ignored: No active emulator instance.");
     return;
   }
-  log("info", "Restarting guest emulator...");
+
+  const currentState = getLifecycleState();
+  log("info", `Restart requested. Current state: ${currentState}`);
+
+  // Must go through proper shutdown first: running -> stopping -> stopped -> booting
+  if (currentState === "running" || currentState === "booting" || currentState === "provisioning") {
+    setLifecycleState("stopping", "handleRestart: stopping before restart");
+    try {
+      await emulator.stop();
+    } catch (err: any) {
+      log("warn", `Error stopping emulator during restart: ${err.message || String(err)}`);
+    }
+    setLifecycleState("stopped", "handleRestart: stopped");
+  }
+
+  // Now transition stopped -> loading -> booting via restart
+  if (getLifecycleState() !== "stopped" && getLifecycleState() !== "error") {
+    log("warn", `Cannot restart from state: ${getLifecycleState()}`);
+    return;
+  }
+
   try {
+    // Transition to loading first (stopped -> loading is valid)
+    setLifecycleState("loading", "handleRestart: restarting");
     emulator.restart();
-    setLifecycleState("booting");
+    setLifecycleState("booting", "handleRestart: emulator restarted");
     log("info", "Guest emulator restarted successfully.");
   } catch (err: any) {
     log("error", `Failed to restart emulator: ${err.message || String(err)}`);
+    setLifecycleState("error", "handleRestart: restart failed");
   }
 }
 
 async function handleDestroy() {
   log("info", "Destroying emulator worker context...");
-  setLifecycleState("stopped");
+  const currentState = getLifecycleState();
+  // Ensure we go through stopping if currently alive
+  if (currentState === "running" || currentState === "booting" || currentState === "provisioning") {
+    setLifecycleState("stopping", "handleDestroy: stopping first");
+  }
+  setLifecycleState("stopped", "handleDestroy");
   await destroyEmulator();
   self.close();
 }

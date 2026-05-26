@@ -385,10 +385,9 @@ export function TerminalSimulator({
       setHasSavedState(false);
       lastOutputRef.current = ""; // Clear command history rolling log!
 
-      setIsV86Mode(false);
-      setTimeout(() => {
-        setIsV86Mode(true);
-      }, 100);
+      // Use counter-based re-init instead of toggling isV86Mode off/on
+      // which causes a dangerous unmount+remount race condition
+      setTermResetCounter(prev => prev + 1);
     }
   };
 
@@ -816,8 +815,9 @@ export function TerminalSimulator({
 
             if (hasRootPrompt && !isProvisioning) {
               // Initiate silent environment provisioning
+              // Delegate transition to worker as single source of truth
               isProvisioning = true;
-              emulator.transitionState("provisioning");
+              emulator.requestProvisioningTransition();
               // Clear screen first so root setup commands are totally hidden
               term.write("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
               
@@ -825,12 +825,13 @@ export function TerminalSimulator({
               emulator.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\ncat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\$(pwd | sed "s|^\$HOME|~|")\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
             } else if (hasUserSentinel) {
               // User prompt sentinel matched: provisioning successfully complete!
+              // Delegate transition to worker as single source of truth
               provisioningSearchBuffer = "";
               isProvisioning = false;
               isProvisioned = true;
-              emulator.transitionState("running");
-              setV86Booting(false);
-              setIsV86Running(true);
+              emulator.requestRunningTransition();
+              // Note: setV86Booting/setIsV86Running will be set by the onState callback
+              // when the worker confirms the transition via STATE_CHANGED
               
               const bootTime = emulator.getLifecycleState().bootTimeMs || 0;
               bootTimeRef.current = bootTime;
@@ -867,6 +868,15 @@ export function TerminalSimulator({
             isProvisioned = false;
             isProvisioning = true;
             setV86Booting(true);
+            setIsV86Running(false);
+          } else if (newState === "stopping") {
+            // Graceful shutdown in progress — show as not running
+            setV86Booting(false);
+            setIsV86Running(false);
+          } else if (newState === "stopped") {
+            isProvisioned = false;
+            isProvisioning = false;
+            setV86Booting(false);
             setIsV86Running(false);
           } else if (newState === "booting" || newState === "loading") {
             isProvisioned = false;
@@ -1428,7 +1438,7 @@ export function TerminalSimulator({
           
           {/* Terminal Canvas Container */}
           <div className="p-2 min-h-[500px] flex-1 flex flex-col justify-stretch relative">
-            {isV86Mode && (vmStateName === "loading" || vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "idle") && (
+            {isV86Mode && (vmStateName === "loading" || vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "idle" || vmStateName === "stopping") && (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#06070a]/90 gap-3">
                 <RefreshCw className="h-8 w-8 text-[#E95420] animate-spin" />
                 <span className="text-sm font-mono text-gray-400">
@@ -1457,6 +1467,7 @@ export function TerminalSimulator({
                     <span className={`h-2 w-2 rounded-full ${
                       vmStateName === "running" ? "bg-emerald-500 animate-pulse" : 
                       (vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "loading") ? "bg-amber-500 animate-pulse" : 
+                      vmStateName === "stopping" ? "bg-orange-500 animate-pulse" :
                       vmStateName === "error" ? "bg-rose-500 animate-pulse" : "bg-gray-500"
                     }`} />
                     <span>Status: <span className="uppercase text-[10px] font-bold px-1.5 py-0.5 rounded bg-white/5">{vmStateName}</span></span>

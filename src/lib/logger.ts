@@ -43,6 +43,16 @@ export class Logger {
     this.info("VM", msg, meta);
   }
 
+  public static vmTransition(from: string, to: string, allowed: boolean, source?: string) {
+    const status = allowed ? "ALLOWED" : "BLOCKED";
+    const meta = { from, to, status, source: source || "unknown", ts: Date.now() };
+    if (allowed) {
+      this.info("VM", `[TRANSITION] ${from} -> ${to} [${status}] (source: ${meta.source})`, meta);
+    } else {
+      this.warn("VM", `[TRANSITION] ${from} -> ${to} [${status}] (source: ${meta.source})`, meta);
+    }
+  }
+
   public static evaluationAudit(missionId: string, command: string, success: boolean, score: number) {
     this.info("EVALUATION", `[AUDIT] Mission: ${missionId} | Command: "${command}" | Success: ${success} | Score: ${score}`);
   }
