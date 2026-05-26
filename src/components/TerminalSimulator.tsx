@@ -714,6 +714,7 @@ export function TerminalSimulator({
         fontFamily: "JetBrains Mono, Ubuntu Mono, Courier New, monospace",
         convertEol: true,
         rows: 25,
+        disableStdin: false, // Explicitly enable stdin input capture
       });
 
       fitAddon = new FitAddon();
@@ -725,8 +726,14 @@ export function TerminalSimulator({
         term.open(terminalRef.current);
         fitAddon.fit();
 
-        const handleFocus = () => setIsFocused(true);
-        const handleBlur = () => setIsFocused(false);
+        const handleFocus = () => {
+          console.log("[xterm DEBUG] Focus event detected on term.element");
+          setIsFocused(true);
+        };
+        const handleBlur = () => {
+          console.log("[xterm DEBUG] Blur event detected on term.element");
+          setIsFocused(false);
+        };
 
         if (term.element) {
           term.element.addEventListener("focus", handleFocus);
@@ -737,6 +744,17 @@ export function TerminalSimulator({
         customTerm._handleFocus = handleFocus;
         customTerm._handleBlur = handleBlur;
       }
+
+      const localForceFocus = () => {
+        if (!isMounted) return;
+        console.log("[xterm DEBUG] Forcing local terminal focus on term and helper textarea...");
+        term.focus();
+        const textarea = terminalRef.current?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+        if (textarea) {
+          console.log("[xterm DEBUG] Directly focusing helper textarea element.");
+          textarea.focus();
+        }
+      };
 
       xtermInstance.current = term;
 
@@ -844,7 +862,7 @@ export function TerminalSimulator({
               
               // Focus terminal automatically with a small delay to ensure canvas is ready
               setTimeout(() => {
-                if (isMounted) term.focus();
+                localForceFocus();
               }, 150);
             }
           }
@@ -862,9 +880,24 @@ export function TerminalSimulator({
             isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(true);
+
+            if (emulator.wasRestored && emulator.wasRestored()) {
+              console.log("[xterm DEBUG] VM was restored from snapshot. Writing welcome message and sending prompt revival keystrokes.");
+              term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
+              emulator.clearWasRestored();
+              
+              // Revive prompt and input connection
+              setTimeout(() => {
+                if (isMounted) {
+                  console.log("[xterm DEBUG] Restored from snapshot. Reviving prompt...");
+                  emulator.sendInput("\x03\n");
+                }
+              }, 100);
+            }
+
             setTimeout(() => {
-              if (isMounted) term.focus();
-            }, 150);
+              localForceFocus();
+            }, 200);
           } else if (newState === "provisioning") {
             isProvisioned = false;
             isProvisioning = true;
@@ -902,7 +935,7 @@ export function TerminalSimulator({
             setV86Booting(false);
             setIsV86Running(true);
             setTimeout(() => {
-              if (isMounted) term.focus();
+              localForceFocus();
             }, 150);
           } else if (currentVmState === "provisioning") {
             isProvisioned = false;
@@ -944,16 +977,8 @@ export function TerminalSimulator({
                 return;
               }
               
-              if (savedState) {
-                isProvisioned = true;
-                isProvisioning = false;
-                setV86Booting(false);
-                setIsV86Running(true);
-                term.write("\r\n\x1b[1;32m[VM] State restored successfully. Welcome back!\x1b[0m\r\n\r\n");
-                setTimeout(() => {
-                  if (isMounted) term.focus();
-                }, 150);
-              }
+              // Handled by onState(running) on the active reattached component instance
+              // to support strict mode double-mounting cleanly without race conditions.
             } catch (bootErr) {
               if (!isMounted) {
                 term.dispose();
@@ -991,11 +1016,14 @@ export function TerminalSimulator({
         // 3. Setup client key handler to bridge typed commands
         let currentLine = "";
         const dataDisposable = term.onData((data) => {
+          console.log("[xterm DEBUG] onData event:", { data, charCodes: Array.from(data).map(c => c.charCodeAt(0)) });
           if (isCapturingValidationRef.current) {
+            console.log("[xterm DEBUG] onData skipped: validation in progress");
             return;
           }
           const vmState = emulator.getLifecycleState().state;
           if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
+            console.warn("[xterm DEBUG] onData ignored: VM not in interactive state:", vmState);
             return;
           }
 
@@ -1031,11 +1059,13 @@ export function TerminalSimulator({
         });
 
         term.attachCustomKeyEventHandler((ev) => {
+          console.log("[xterm DEBUG] attachCustomKeyEventHandler event:", ev.type, ev.key, "keyCode:", ev.keyCode);
           if (isCapturingValidationRef.current) {
             return false;
           }
           const vmState = emulator.getLifecycleState().state;
           if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
+            console.warn("[xterm DEBUG] attachCustomKeyEventHandler rejected: VM not in interactive state:", vmState);
             return false;
           }
           if (ev.ctrlKey && ev.type === "keydown") {
@@ -1413,7 +1443,13 @@ export function TerminalSimulator({
         <div 
           onClick={() => {
             if (xtermInstance.current) {
+              console.log("[xterm DEBUG] Container click detected. Forcing focus...");
               xtermInstance.current.focus();
+              const textarea = terminalRef.current?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+              if (textarea) {
+                console.log("[xterm DEBUG] Directly focusing helper textarea element on click.");
+                textarea.focus();
+              }
             }
           }}
           className={`lg:col-span-7 flex flex-col rounded-xl border transition-all duration-200 bg-[#06070a] overflow-hidden shadow-2xl cursor-text ${

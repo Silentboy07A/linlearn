@@ -29,6 +29,8 @@ export class EmulatorManager {
   private watchdogTimer: NodeJS.Timeout | null = null;
   private serialHistory: string = "";
 
+  private wasRestoredFromSnapshot = false;
+
   // ─── Initialization mutex ─────────────────────────────────────────────────
   private initPromise: Promise<void> | null = null;
   private initAbortController: AbortController | null = null;
@@ -77,6 +79,7 @@ export class EmulatorManager {
   ): Promise<void> {
     this.onSerialOutput = onSerial;
     this.onStateChange = onState;
+    this.wasRestoredFromSnapshot = !!initialState;
     this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes, "EmulatorManager.start");
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
@@ -266,6 +269,7 @@ export class EmulatorManager {
       Logger.warn("VM", "Refusing to send user keyboard input: VM is not alive");
       return;
     }
+    Logger.info("VM", `sendInput: routing character sequence to bridge: ${JSON.stringify(data)}`);
     this.bridge.post("INPUT", data);
   }
 
@@ -275,6 +279,7 @@ export class EmulatorManager {
       Logger.warn("VM", `Refusing to send programmatic serial input: VM is in non-interactive state: ${stateName}`);
       return;
     }
+    Logger.info("VM", `sendProgrammaticInput: routing character sequence to bridge: ${JSON.stringify(data.length > 50 ? data.substring(0, 50) + "..." : data)}`);
     this.bridge.post("INPUT", data);
   }
 
@@ -413,5 +418,13 @@ export class EmulatorManager {
 
   public getLifecycleState() {
     return this.lifecycle.getState();
+  }
+
+  public wasRestored(): boolean {
+    return this.wasRestoredFromSnapshot;
+  }
+
+  public clearWasRestored(): void {
+    this.wasRestoredFromSnapshot = false;
   }
 }

@@ -91,17 +91,18 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
     case "INPUT": {
       const emulator = getEmulator();
       if (!emulator) {
-        log("debug", `Ignored serial input: No active emulator (state: ${getLifecycleState()})`);
+        log("warn", `Ignored serial input: No active emulator (state: ${getLifecycleState()})`);
         break;
       }
       if (!canSendInput()) {
-        log("debug", `Ignored serial input: VM is in non-interactive state (state: ${getLifecycleState()})`);
+        log("warn", `Ignored serial input: VM is in non-interactive state (state: ${getLifecycleState()})`);
         break;
       }
       const inputPayload = payload as string;
-      log("debug", `Routing serial input of length ${inputPayload ? inputPayload.length : 0} to emulator`);
+      log("info", `Routing serial input of length ${inputPayload ? inputPayload.length : 0} payload: ${JSON.stringify(inputPayload)} to emulator`);
       try {
         emulator.serial0_send(inputPayload);
+        log("info", "Successfully sent serial input to emulator.");
       } catch (err: unknown) {
         log("error", `Failed to send serial input: ${getErrorMessage(err)}`);
       }
