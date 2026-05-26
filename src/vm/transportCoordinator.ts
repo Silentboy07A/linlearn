@@ -1,7 +1,33 @@
 // src/vm/transportCoordinator.ts
 import { Logger } from "../lib/logger";
-import { WorkerBridge, WorkerBridgeState } from "./workerBridge";
+import { WorkerBridge, WorkerBridgeState, WorkerBridgeError } from "./workerBridge";
 import { SerialWriteQueue } from "./serialQueue";
+
+export interface RecoveryContext {
+  reason: string;
+  expectedTeardown: boolean;
+  bridgeGeneration: number;
+}
+
+export class LifecycleErrorClassifier {
+  public static isFatal(error: unknown): boolean {
+    if (error instanceof WorkerBridgeError) {
+      return error.isFatal;
+    }
+    if (error instanceof Error) {
+      const msg = error.message.toLowerCase();
+      if (
+        msg.includes("terminating") ||
+        msg.includes("terminated") ||
+        msg.includes("teardown") ||
+        msg.includes("intentional stop")
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
 
 export interface BridgeTelemetry {
   generationCount: number;
@@ -9,6 +35,9 @@ export interface BridgeTelemetry {
   recreationTimesMs: { timestamp: number; duration: number }[];
   staleReferenceDetections: number;
   recoveryEscalationHistory: { timestamp: number; stage: string }[];
+  suppressedTeardownExceptions: number;
+  staleAsyncInvalidations: number;
+  recoveryTransitions: { timestamp: number; transition: string }[];
 }
 
 export interface BridgeGeneration {
@@ -29,7 +58,10 @@ export class BridgeGenerationManager {
     terminationReasons: [],
     recreationTimesMs: [],
     staleReferenceDetections: 0,
-    recoveryEscalationHistory: []
+    recoveryEscalationHistory: [],
+    suppressedTeardownExceptions: 0,
+    staleAsyncInvalidations: 0,
+    recoveryTransitions: []
   };
 
   public createNextGeneration(bridge: WorkerBridge, token: string): BridgeGeneration {
@@ -114,6 +146,24 @@ export class BridgeGenerationManager {
     }
   }
 
+  public recordSuppressedTeardownException(): void {
+    this.telemetry.suppressedTeardownExceptions++;
+  }
+
+  public recordStaleAsyncInvalidation(): void {
+    this.telemetry.staleAsyncInvalidations++;
+  }
+
+  public recordRecoveryTransition(transition: string): void {
+    this.telemetry.recoveryTransitions.push({
+      timestamp: Date.now(),
+      transition
+    });
+    if (this.telemetry.recoveryTransitions.length > 20) {
+      this.telemetry.recoveryTransitions.shift();
+    }
+  }
+
   public getTelemetry(): BridgeTelemetry {
     return { ...this.telemetry };
   }
@@ -133,6 +183,8 @@ export class TransportCoordinator {
   private workerUrl: string | null = null;
   private onMessageCallback: ((type: string, payload: unknown) => void) | null = null;
   private lastInitPayload: unknown = null;
+  
+  private currentRecoveryContext: RecoveryContext | null = null;
 
   constructor() {
     this.generationManager = new BridgeGenerationManager();
@@ -167,6 +219,10 @@ export class TransportCoordinator {
 
   public getSerialQueue(): SerialWriteQueue {
     return this.serialQueue;
+  }
+
+  public getRecoveryContext(): RecoveryContext | null {
+    return this.currentRecoveryContext;
   }
 
   public async initialize(
@@ -210,6 +266,13 @@ export class TransportCoordinator {
       const prevId = activeGen ? activeGen.id : 0;
       Logger.info("VM", `[TransportCoordinator] Initiating bridge recreation. Previous generation: ${prevId}`);
       
+      this.currentRecoveryContext = {
+        reason: "recovery recreation",
+        expectedTeardown: true,
+        bridgeGeneration: prevId + 1
+      };
+      this.generationManager.recordRecoveryTransition(`recreate generation ${prevId + 1}`);
+
       // 1. Terminate and invalidate old generations
       if (activeGen) {
         activeGen.bridge.terminate("bridge recreation");
@@ -228,23 +291,32 @@ export class TransportCoordinator {
 
       // 3. Initialize and wait for WORKER_READY handshake
       Logger.info("VM", `[TransportCoordinator] Initializing fresh bridge generation ${newGen.id}`);
-      await newBridge.initializeBridge(workerUrl, (type, payload) => {
-        const currentActive = this.generationManager.getActiveGeneration();
-        if (!currentActive || currentActive.id !== newGen.id || !currentActive.isValid) {
-          Logger.warn("VM", `[TransportCoordinator] Dropping callback message '${type}' from stale bridge generation ${newGen.id}`);
-          this.generationManager.recordStaleReferenceDetection();
-          return;
-        }
+      try {
+        await newBridge.initializeBridge(workerUrl, (type, payload) => {
+          const currentActive = this.generationManager.getActiveGeneration();
+          if (!currentActive || currentActive.id !== newGen.id || !currentActive.isValid) {
+            Logger.warn("VM", `[TransportCoordinator] Dropping callback message '${type}' from stale bridge generation ${newGen.id}`);
+            this.generationManager.recordStaleAsyncInvalidation();
+            return;
+          }
 
-        if (type === "INIT_SUCCESS") {
-          const initPayload = payload as { hasSerial1?: boolean } | undefined;
-          this.hasSerial1 = !!(initPayload && initPayload.hasSerial1);
-        }
+          if (type === "INIT_SUCCESS") {
+            const initPayload = payload as { hasSerial1?: boolean } | undefined;
+            this.hasSerial1 = !!(initPayload && initPayload.hasSerial1);
+          }
 
-        if (this.onMessageCallback) {
-          this.onMessageCallback(type, payload);
+          if (this.onMessageCallback) {
+            this.onMessageCallback(type, payload);
+          }
+        });
+      } catch (err) {
+        if (LifecycleErrorClassifier.isFatal(err)) {
+          throw err;
         }
-      });
+        Logger.info("VM", `[TransportCoordinator] Suppressed non-fatal teardown exception during bridge initialization: ${err}`);
+        this.generationManager.recordSuppressedTeardownException();
+        return;
+      }
 
       // 4. Auto-initialize the worker if config exists
       if (this.lastInitPayload) {
@@ -269,45 +341,61 @@ export class TransportCoordinator {
       this.lastInitPayload = payload;
     }
 
-    const activeGen = this.generationManager.getActiveGeneration();
-    const bridge = activeGen ? activeGen.bridge : null;
-    
-    if (
-      !activeGen || 
-      !activeGen.isValid || 
-      !bridge || 
-      bridge.getState() === WorkerBridgeState.TERMINATED || 
-      bridge.getState() === WorkerBridgeState.FAILED
-    ) {
-      Logger.warn("VM", `[TransportCoordinator] Active bridge is invalid/terminated (state: ${bridge ? bridge.getState() : "null"}). Recreating before posting '${type}'`);
-      this.generationManager.recordStaleReferenceDetection();
-      await this.recreateBridge();
-    }
+    try {
+      const activeGen = this.generationManager.getActiveGeneration();
+      const bridge = activeGen ? activeGen.bridge : null;
+      
+      if (
+        !activeGen || 
+        !activeGen.isValid || 
+        !bridge || 
+        bridge.getState() === WorkerBridgeState.TERMINATED || 
+        bridge.getState() === WorkerBridgeState.FAILED
+      ) {
+        Logger.warn("VM", `[TransportCoordinator] Active bridge is invalid/terminated (state: ${bridge ? bridge.getState() : "null"}). Recreating before posting '${type}'`);
+        this.generationManager.recordStaleReferenceDetection();
+        await this.recreateBridge();
+      }
 
-    const currentBridge = this.getBridge();
-    await currentBridge.waitUntilReady();
-    currentBridge.post(type, payload);
+      const currentBridge = this.getBridge();
+      await currentBridge.waitUntilReady();
+      currentBridge.post(type, payload);
+    } catch (err) {
+      if (LifecycleErrorClassifier.isFatal(err)) {
+        throw err;
+      }
+      Logger.info("VM", `[TransportCoordinator] Suppressed non-fatal teardown exception during post('${type}'): ${err}`);
+      this.generationManager.recordSuppressedTeardownException();
+    }
   }
 
   public async send(port: number, data: string): Promise<void> {
-    const activeGen = this.generationManager.getActiveGeneration();
-    const bridge = activeGen ? activeGen.bridge : null;
+    try {
+      const activeGen = this.generationManager.getActiveGeneration();
+      const bridge = activeGen ? activeGen.bridge : null;
 
-    if (
-      !activeGen || 
-      !activeGen.isValid || 
-      !bridge || 
-      bridge.getState() === WorkerBridgeState.TERMINATED || 
-      bridge.getState() === WorkerBridgeState.FAILED
-    ) {
-      Logger.warn("VM", `[TransportCoordinator] Active bridge is invalid/terminated (state: ${bridge ? bridge.getState() : "null"}). Recreating before sending on port ${port}`);
-      this.generationManager.recordStaleReferenceDetection();
-      await this.recreateBridge();
+      if (
+        !activeGen || 
+        !activeGen.isValid || 
+        !bridge || 
+        bridge.getState() === WorkerBridgeState.TERMINATED || 
+        bridge.getState() === WorkerBridgeState.FAILED
+      ) {
+        Logger.warn("VM", `[TransportCoordinator] Active bridge is invalid/terminated (state: ${bridge ? bridge.getState() : "null"}). Recreating before sending on port ${port}`);
+        this.generationManager.recordStaleReferenceDetection();
+        await this.recreateBridge();
+      }
+
+      const currentBridge = this.getBridge();
+      await currentBridge.waitUntilReady();
+      return await this.serialQueue.enqueue(port, data);
+    } catch (err) {
+      if (LifecycleErrorClassifier.isFatal(err)) {
+        throw err;
+      }
+      Logger.info("VM", `[TransportCoordinator] Suppressed non-fatal teardown exception during send on port ${port}: ${err}`);
+      this.generationManager.recordSuppressedTeardownException();
     }
-
-    const currentBridge = this.getBridge();
-    await currentBridge.waitUntilReady();
-    return this.serialQueue.enqueue(port, data);
   }
 
   public hasSerial1Support(): boolean {
@@ -325,5 +413,6 @@ export class TransportCoordinator {
     this.lastInitPayload = null;
     this.workerUrl = null;
     this.onMessageCallback = null;
+    this.currentRecoveryContext = null;
   }
 }

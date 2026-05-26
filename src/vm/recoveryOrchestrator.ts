@@ -92,7 +92,14 @@ export class RecoveryOrchestrator {
       this.rebootAttempts.push(now);
     }
 
-    const success = await this.onAction(this.stage);
+    let success = false;
+    try {
+      success = await this.onAction(this.stage);
+    } catch (err) {
+      Logger.error("VM", `Recovery stage ${RecoveryStage[this.stage]} action threw an error:`, err);
+      success = false;
+    }
+
     if (success) {
       // Wait for 4 seconds to see if health returns
       this.timeouts.register("recovery_escalation", 4000, () => {

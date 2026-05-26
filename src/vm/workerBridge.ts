@@ -12,6 +12,30 @@ export enum WorkerBridgeState {
   RECOVERING = "recovering"
 }
 
+export class WorkerBridgeError extends Error {
+  public readonly isFatal: boolean = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkerBridgeError";
+  }
+}
+
+export class WorkerBridgeTeardownError extends WorkerBridgeError {
+  public override readonly isFatal = false;
+  constructor(generationId: number, state: string) {
+    super(`Worker bridge ${generationId} intentionally stopped/teardown (state: ${state})`);
+    this.name = "WorkerBridgeTeardownError";
+  }
+}
+
+export class WorkerBridgeStaleError extends WorkerBridgeError {
+  public override readonly isFatal = false;
+  constructor(generationId: number, activeId: number) {
+    super(`Worker bridge ${generationId} is stale. Active generation is ${activeId}`);
+    this.name = "WorkerBridgeStaleError";
+  }
+}
+
 export class WorkerBridge {
   private worker: Worker | null = null;
   private state: WorkerBridgeState = WorkerBridgeState.UNINITIALIZED;
@@ -95,7 +119,12 @@ export class WorkerBridge {
         const rej = this.readyRejecter;
         this.readyResolver = null;
         this.readyRejecter = null;
-        rej(new Error(`Worker bridge ${this.generationId} transitioned to non-functional state: ${newState}`));
+        
+        if (newState === WorkerBridgeState.TERMINATING || newState === WorkerBridgeState.TERMINATED || !this.isValid) {
+          rej(new WorkerBridgeTeardownError(this.generationId, newState));
+        } else {
+          rej(new WorkerBridgeError(`Worker bridge ${this.generationId} transitioned to non-functional state: ${newState}`));
+        }
       }
     }
   }
@@ -120,10 +149,10 @@ export class WorkerBridge {
     return new Promise<void>((resolve, reject) => {
       // Setup timeout for worker initialization: 10 seconds max
       const initTimeout = setTimeout(() => {
-        if (this.state === WorkerBridgeState.INITIALIZING) {
+        if (this.state === WorkerBridgeState.INITIALIZING && this.isValid) {
           Logger.error("VM", `[WorkerBridge ${this.generationId}] Initialization timed out after 10s.`);
           this.transitionTo(WorkerBridgeState.FAILED);
-          reject(new Error("Worker initialization timed out"));
+          reject(new WorkerBridgeError("Worker initialization timed out"));
         }
       }, 10000);
 
@@ -131,6 +160,9 @@ export class WorkerBridge {
         this.worker = new Worker(workerUrl);
 
         this.worker.onmessage = (e: MessageEvent) => {
+          if (!this.isValid || this.state === WorkerBridgeState.TERMINATED || this.state === WorkerBridgeState.TERMINATING) {
+            return;
+          }
           if (!e.data) return;
           const { type, payload } = e.data;
 
@@ -160,6 +192,9 @@ export class WorkerBridge {
         };
 
         this.worker.onerror = (err) => {
+          if (!this.isValid || this.state === WorkerBridgeState.TERMINATED || this.state === WorkerBridgeState.TERMINATING) {
+            return;
+          }
           clearTimeout(initTimeout);
           this.errorCount++;
           Logger.error("VM", `[WorkerBridge ${this.generationId}] Worker thread error`, err);
@@ -194,7 +229,10 @@ export class WorkerBridge {
       this.state === WorkerBridgeState.TERMINATED ||
       !this.isValid
     ) {
-      return Promise.reject(new Error(`Worker bridge ${this.generationId} is in non-functional state: ${this.state} (valid: ${this.isValid})`));
+      const err = (!this.isValid || this.state === WorkerBridgeState.TERMINATING || this.state === WorkerBridgeState.TERMINATED)
+        ? new WorkerBridgeTeardownError(this.generationId, this.state)
+        : new WorkerBridgeError(`Worker bridge ${this.generationId} is in non-functional state: ${this.state}`);
+      return Promise.reject(err);
     }
 
     return new Promise<void>((resolve, reject) => {
