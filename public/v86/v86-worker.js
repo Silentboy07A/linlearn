@@ -253,11 +253,20 @@ self.onmessage = async function (e) {
       break;
 
     case "SET_RUNNING":
-      if (lifecycleState === "initialized" || lifecycleState === "booting") {
+      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "provisioning") {
         setLifecycleState("running");
         log("info", "Emulator successfully transitioned to running state (boot complete)");
       } else {
         log("warn", "Ignored SET_RUNNING: current state: " + lifecycleState);
+      }
+      break;
+
+    case "SET_PROVISIONING":
+      if (lifecycleState === "booting") {
+        setLifecycleState("provisioning");
+        log("info", "Emulator transitioned to provisioning state");
+      } else {
+        log("warn", "Ignored SET_PROVISIONING: current state: " + lifecycleState);
       }
       break;
 
