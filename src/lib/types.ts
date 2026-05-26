@@ -30,11 +30,28 @@ export interface VMSessionConfig {
   timeoutMs: number;
 }
 
+export type VMStateName = "idle" | "loading" | "booting" | "provisioning" | "running" | "stopping" | "stopped" | "error";
+
 export interface VMState {
-  state: "idle" | "loading" | "booting" | "provisioning" | "running" | "stopping" | "stopped" | "error";
+  state: VMStateName;
   bootTimeMs?: number;
   lastActiveTimestamp: number;
   ramUsageBytes: number;
+}
+
+export interface VMSnapshotMetadata {
+  hasSnapshot: boolean;
+  snapshotSizeBytes?: number;
+}
+
+export interface VMTransitionTrace {
+  timestamp: number;
+  from: VMStateName;
+  to: VMStateName;
+  source: string;
+  allowed: boolean;
+  workerEvent?: string;
+  snapshot?: VMSnapshotMetadata;
 }
 
 export interface RuleEvaluationResult {

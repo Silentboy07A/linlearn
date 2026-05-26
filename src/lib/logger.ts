@@ -43,9 +43,10 @@ export class Logger {
     this.info("VM", msg, meta);
   }
 
-  public static vmTransition(from: string, to: string, allowed: boolean, source?: string) {
+  public static vmTransition(from: string, to: string, allowed: boolean, source?: string, workerEvent?: string) {
     const status = allowed ? "ALLOWED" : "BLOCKED";
-    const meta = { from, to, status, source: source || "unknown", ts: Date.now() };
+    const meta: Record<string, unknown> = { from, to, status, source: source || "unknown", ts: Date.now() };
+    if (workerEvent) meta.workerEvent = workerEvent;
     if (allowed) {
       this.info("VM", `[TRANSITION] ${from} -> ${to} [${status}] (source: ${meta.source})`, meta);
     } else {

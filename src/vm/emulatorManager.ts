@@ -1,9 +1,8 @@
 // src/vm/emulatorManager.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { WorkerBridge } from "./workerBridge";
 import { VMLifecycleManager } from "./vmLifecycle";
 import { ResourceLimitsValidator } from "./resourceLimits";
-import { VMSessionConfig, VMState } from "../lib/types";
+import { VMSessionConfig, VMStateName, VMSnapshotMetadata } from "../lib/types";
 import { Logger } from "../lib/logger";
 import { VMInitializationError } from "../lib/errors";
 import { GUEST_INSPECT_SCRIPT } from "./inspect";
@@ -26,7 +25,7 @@ export class EmulatorManager {
   private onStateChange: ((state: string) => void) | null = null;
 
   private saveStateResolver: ((buffer: ArrayBuffer) => void) | null = null;
-  private saveStateRejecter: ((err: any) => void) | null = null;
+  private saveStateRejecter: ((err: Error) => void) | null = null;
   private watchdogTimer: NodeJS.Timeout | null = null;
   private serialHistory: string = "";
 
@@ -110,8 +109,12 @@ export class EmulatorManager {
         switch (type) {
           case "INIT_SUCCESS":
             if (initialState) {
-              // Direct transition to running for instant restoration
-              this.transitionState("running", "INIT_SUCCESS (snapshot restore)");
+              // Snapshot restore: loading -> running (valid in updated FSM)
+              const snapshotMeta: VMSnapshotMetadata = {
+                hasSnapshot: true,
+                snapshotSizeBytes: initialState.byteLength,
+              };
+              this.transitionState("running", "INIT_SUCCESS (snapshot restore)", false, "INIT_SUCCESS", snapshotMeta);
               clearTimeout(timeout);
               if (!resolved) {
                 resolved = true;
@@ -184,12 +187,17 @@ export class EmulatorManager {
           case "STATE_CHANGED":
             {
               // Worker is the source of truth — accept its state without echoing back
-              const newState = payload as any;
-              let mappedState: VMState["state"] = newState;
-              if (newState === "failed") mappedState = "error";
-              if (newState === "destroyed") mappedState = "stopped";
+              const rawState = payload as string;
+              let mappedState: VMStateName;
+              if (rawState === "failed") {
+                mappedState = "error";
+              } else if (rawState === "destroyed") {
+                mappedState = "stopped";
+              } else {
+                mappedState = rawState as VMStateName;
+              }
               // Use fromWorker=true to suppress the echo back to worker
-              this.transitionState(mappedState, "worker STATE_CHANGED", true);
+              this.transitionState(mappedState, "worker STATE_CHANGED", true, "STATE_CHANGED");
             }
             break;
         }
@@ -272,17 +280,32 @@ export class EmulatorManager {
 
   /**
    * Transition the main-thread lifecycle state.
-   * @param newState   Target state
-   * @param source     Where this transition originated
-   * @param fromWorker If true, skip echoing state back to worker (breaks feedback loop)
+   * Returns true if the transition was applied, false if rejected by FSM.
+   * Never throws.
+   *
+   * @param newState     Target state
+   * @param source       Where this transition originated
+   * @param fromWorker   If true, skip echoing state back to worker (breaks feedback loop)
+   * @param workerEvent  Optional originating worker message type for tracing
+   * @param snapshot     Optional snapshot metadata for tracing
    */
-  public transitionState(newState: VMState["state"], source?: string, fromWorker: boolean = false): void {
-    try {
-      this.lifecycle.transitionTo(newState, undefined, source);
-    } catch (e) {
-      Logger.warn("VM", `Ignored invalid state transition to ${newState}: ${e}`);
-      return;
+  public transitionState(
+    newState: VMStateName,
+    source?: string,
+    fromWorker: boolean = false,
+    workerEvent?: string,
+    snapshot?: VMSnapshotMetadata,
+  ): boolean {
+    const currentState = this.lifecycle.getState().state;
+    // Deduplicate: ignore redundant same-state transitions
+    if (currentState === newState) return true;
+
+    const succeeded = this.lifecycle.transitionTo(newState, undefined, source, workerEvent, snapshot);
+    if (!succeeded) {
+      // Already logged by VMLifecycleManager — just return
+      return false;
     }
+
     if (this.onStateChange) this.onStateChange(newState);
 
     // Only sync state back to worker if this transition did NOT originate from the worker
@@ -301,6 +324,8 @@ export class EmulatorManager {
     } else if (newState === "running" || newState === "stopped" || newState === "error") {
       this.stopWatchdog();
     }
+
+    return true;
   }
 
   /**

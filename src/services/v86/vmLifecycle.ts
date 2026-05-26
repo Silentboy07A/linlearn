@@ -14,13 +14,13 @@ let lastTransitionTimestamp = 0;
 // ─── Valid transition map (deterministic FSM) ───────────────────────────────
 const VALID_TRANSITIONS: Record<EmulatorState, Set<EmulatorState>> = {
   idle:         new Set<EmulatorState>(["loading", "stopped"]),
-  loading:      new Set<EmulatorState>(["booting", "error", "stopped"]),
+  loading:      new Set<EmulatorState>(["booting", "running", "error", "stopped"]),
   booting:      new Set<EmulatorState>(["provisioning", "running", "error", "stopped"]),
   provisioning: new Set<EmulatorState>(["running", "error", "stopped"]),
   running:      new Set<EmulatorState>(["stopping", "stopped", "error"]),
   stopping:     new Set<EmulatorState>(["stopped", "error"]),
-  stopped:      new Set<EmulatorState>(["idle", "loading"]),
-  error:        new Set<EmulatorState>(["idle", "loading", "stopped"]),
+  stopped:      new Set<EmulatorState>(["idle", "loading", "booting"]),
+  error:        new Set<EmulatorState>(["idle", "loading", "booting", "stopped"]),
 };
 
 const DEBOUNCE_MS = 50;
