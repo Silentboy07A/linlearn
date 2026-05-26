@@ -38,6 +38,8 @@ export interface BridgeTelemetry {
   suppressedTeardownExceptions: number;
   staleAsyncInvalidations: number;
   recoveryTransitions: { timestamp: number; transition: string }[];
+  configAvailability: boolean;
+  missingConfigDetections: number;
 }
 
 export interface BridgeGeneration {
@@ -61,7 +63,9 @@ export class BridgeGenerationManager {
     recoveryEscalationHistory: [],
     suppressedTeardownExceptions: 0,
     staleAsyncInvalidations: 0,
-    recoveryTransitions: []
+    recoveryTransitions: [],
+    configAvailability: false,
+    missingConfigDetections: 0
   };
 
   public createNextGeneration(bridge: WorkerBridge, token: string): BridgeGeneration {
@@ -164,6 +168,14 @@ export class BridgeGenerationManager {
     }
   }
 
+  public recordConfigAvailability(available: boolean): void {
+    this.telemetry.configAvailability = available;
+  }
+
+  public recordMissingConfigDetection(): void {
+    this.telemetry.missingConfigDetections++;
+  }
+
   public getTelemetry(): BridgeTelemetry {
     return { ...this.telemetry };
   }
@@ -173,18 +185,38 @@ export class BridgeGenerationManager {
   }
 }
 
+export interface TransportConfiguration {
+  workerUrl: string;
+  onMessageCallback: (type: string, payload: unknown) => void;
+  lastInitPayload: unknown;
+}
+
+export interface RuntimeTransportState {
+  hasSerial1: boolean;
+  currentRecoveryContext: RecoveryContext | null;
+  pendingInit: Promise<void> | null;
+  recreatePromise: Promise<void> | null;
+}
+
+export class WorkerBridgeFactory {
+  public static createBridge(generationId: number): WorkerBridge {
+    const token = Math.random().toString(36).substring(2);
+    return new WorkerBridge(generationId, token);
+  }
+}
+
 export class TransportCoordinator {
   private generationManager: BridgeGenerationManager;
   private serialQueue: SerialWriteQueue;
-  private pendingInit: Promise<void> | null = null;
-  private recreatePromise: Promise<void> | null = null;
-  private hasSerial1 = false;
-
-  private workerUrl: string | null = null;
-  private onMessageCallback: ((type: string, payload: unknown) => void) | null = null;
-  private lastInitPayload: unknown = null;
   
-  private currentRecoveryContext: RecoveryContext | null = null;
+  // Decoupled lifecycles: Config outlives transient runtime states
+  private config: TransportConfiguration | null = null;
+  private state: RuntimeTransportState = {
+    hasSerial1: false,
+    currentRecoveryContext: null,
+    pendingInit: null,
+    recreatePromise: null
+  };
 
   constructor() {
     this.generationManager = new BridgeGenerationManager();
@@ -222,51 +254,66 @@ export class TransportCoordinator {
   }
 
   public getRecoveryContext(): RecoveryContext | null {
-    return this.currentRecoveryContext;
+    return this.state.currentRecoveryContext;
+  }
+
+  public isConfigValid(): boolean {
+    return !!(this.config && this.config.workerUrl && this.config.onMessageCallback);
   }
 
   public async initialize(
     workerUrl: string, 
     onMessage: (type: string, payload: unknown) => void
   ): Promise<void> {
-    this.workerUrl = workerUrl;
-    this.onMessageCallback = onMessage;
+    // Capture immutable config settings
+    this.config = {
+      workerUrl,
+      onMessageCallback: onMessage,
+      lastInitPayload: this.config ? this.config.lastInitPayload : null
+    };
     
-    if (this.pendingInit) {
+    this.generationManager.recordConfigAvailability(true);
+    
+    if (this.state.pendingInit) {
       Logger.info("VM", "[TransportCoordinator] Initialization already in progress, awaiting it.");
-      return this.pendingInit;
+      return this.state.pendingInit;
     }
 
-    this.pendingInit = (async () => {
+    this.state.pendingInit = (async () => {
       this.serialQueue.clear();
       await this.recreateBridge();
     })();
 
     try {
-      await this.pendingInit;
+      await this.state.pendingInit;
     } finally {
-      this.pendingInit = null;
+      this.state.pendingInit = null;
     }
   }
 
   public async recreateBridge(): Promise<void> {
-    if (this.recreatePromise) {
+    if (this.state.recreatePromise) {
       Logger.info("VM", "[TransportCoordinator] Bridge recreation already in progress, awaiting existing promise.");
-      return this.recreatePromise;
+      return this.state.recreatePromise;
     }
 
-    const workerUrl = this.workerUrl;
-    if (!workerUrl) {
-      throw new Error("Cannot recreate bridge: workerUrl not set.");
+    if (!this.isConfigValid()) {
+      Logger.warn("VM", "[TransportCoordinator] Cannot recreate bridge: configuration is missing or invalid.");
+      this.generationManager.recordMissingConfigDetection();
+      this.generationManager.recordConfigAvailability(false);
+      throw new Error("Cannot recreate bridge: configuration not set");
     }
 
+    const config = this.config!;
+    this.generationManager.recordConfigAvailability(true);
+    
     const tStart = Date.now();
-    this.recreatePromise = (async () => {
+    this.state.recreatePromise = (async () => {
       const activeGen = this.generationManager.getActiveGeneration();
       const prevId = activeGen ? activeGen.id : 0;
       Logger.info("VM", `[TransportCoordinator] Initiating bridge recreation. Previous generation: ${prevId}`);
       
-      this.currentRecoveryContext = {
+      this.state.currentRecoveryContext = {
         reason: "recovery recreation",
         expectedTeardown: true,
         bridgeGeneration: prevId + 1
@@ -282,17 +329,16 @@ export class TransportCoordinator {
       // Reset capabilities and clear writes
       this.serialQueue.clear();
 
-      // 2. Create fresh bridge generation
+      // 2. Create fresh bridge generation using the factory
       const nextGenId = prevId + 1;
-      const token = Math.random().toString(36).substring(2);
-      const newBridge = new WorkerBridge(nextGenId, token);
+      const newBridge = WorkerBridgeFactory.createBridge(nextGenId);
       
-      const newGen = this.generationManager.createNextGeneration(newBridge, token);
+      const newGen = this.generationManager.createNextGeneration(newBridge, newBridge.getOwnershipToken());
 
       // 3. Initialize and wait for WORKER_READY handshake
       Logger.info("VM", `[TransportCoordinator] Initializing fresh bridge generation ${newGen.id}`);
       try {
-        await newBridge.initializeBridge(workerUrl, (type, payload) => {
+        await newBridge.initializeBridge(config.workerUrl, (type, payload) => {
           const currentActive = this.generationManager.getActiveGeneration();
           if (!currentActive || currentActive.id !== newGen.id || !currentActive.isValid) {
             Logger.warn("VM", `[TransportCoordinator] Dropping callback message '${type}' from stale bridge generation ${newGen.id}`);
@@ -302,11 +348,11 @@ export class TransportCoordinator {
 
           if (type === "INIT_SUCCESS") {
             const initPayload = payload as { hasSerial1?: boolean } | undefined;
-            this.hasSerial1 = !!(initPayload && initPayload.hasSerial1);
+            this.state.hasSerial1 = !!(initPayload && initPayload.hasSerial1);
           }
 
-          if (this.onMessageCallback) {
-            this.onMessageCallback(type, payload);
+          if (config.onMessageCallback) {
+            config.onMessageCallback(type, payload);
           }
         });
       } catch (err) {
@@ -319,9 +365,9 @@ export class TransportCoordinator {
       }
 
       // 4. Auto-initialize the worker if config exists
-      if (this.lastInitPayload) {
+      if (config.lastInitPayload) {
         Logger.info("VM", `[TransportCoordinator] Auto-initializing new worker generation ${newGen.id} with saved config.`);
-        newBridge.post("INIT", this.lastInitPayload);
+        newBridge.post("INIT", config.lastInitPayload);
       }
 
       const duration = Date.now() - tStart;
@@ -330,15 +376,15 @@ export class TransportCoordinator {
     })();
 
     try {
-      await this.recreatePromise;
+      await this.state.recreatePromise;
     } finally {
-      this.recreatePromise = null;
+      this.state.recreatePromise = null;
     }
   }
 
   public async post(type: string, payload?: unknown): Promise<void> {
-    if (type === "INIT") {
-      this.lastInitPayload = payload;
+    if (type === "INIT" && this.config) {
+      this.config.lastInitPayload = payload;
     }
 
     try {
@@ -399,20 +445,28 @@ export class TransportCoordinator {
   }
 
   public hasSerial1Support(): boolean {
-    return this.hasSerial1;
+    return this.state.hasSerial1;
   }
 
   public setSerial1Support(support: boolean): void {
-    this.hasSerial1 = support;
+    this.state.hasSerial1 = support;
   }
 
   public terminate(): void {
+    // 1. Clear transient queues
     this.serialQueue.clear();
+
+    // 2. Invalidate all active worker and bridge instances
     this.generationManager.invalidateAll("terminated transport");
-    this.hasSerial1 = false;
-    this.lastInitPayload = null;
-    this.workerUrl = null;
-    this.onMessageCallback = null;
-    this.currentRecoveryContext = null;
+    
+    // 3. Reset runtime state, but PRESERVE immutable configuration store (this.config)
+    this.state = {
+      hasSerial1: false,
+      currentRecoveryContext: null,
+      pendingInit: null,
+      recreatePromise: null
+    };
+
+    Logger.info("VM", "[TransportCoordinator] Terminated runtime resources, but preserved immutable configuration.");
   }
 }
