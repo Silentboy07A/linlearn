@@ -35,6 +35,7 @@ export class VMController {
 
   private wasRestoredFromSnapshot = false;
   private savedState: ArrayBuffer | null = null;
+  private hasSerial1Support = false;
 
   private lastInputTimestamp = Date.now();
   private lastSerialOutputTimestamp = Date.now();
@@ -172,6 +173,9 @@ export class VMController {
 
         switch (type) {
           case "INIT_SUCCESS":
+            const initPayload = payload as { hasSerial1?: boolean } | undefined;
+            this.hasSerial1Support = !!(initPayload && initPayload.hasSerial1);
+            Logger.info("VM", `Emulator initialized. hasSerial1Support: ${this.hasSerial1Support}`);
             break;
 
           case "INIT_FAILURE":
@@ -323,7 +327,7 @@ export class VMController {
         }
       });
 
-      this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT);
+      this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.hasSerial1Support);
 
     } else if (hasUserSentinel && this.provisioning.getState() === "running") {
       this.timeouts.cancel("provisioning_watchdog");
@@ -351,6 +355,10 @@ export class VMController {
   private async handleRecoveryAction(stage: RecoveryStage): Promise<boolean> {
     switch (stage) {
       case RecoveryStage.TTY_REPAIR:
+        if (!this.hasSerial1Support) {
+          Logger.warn("VM", "[Recovery] Skipping TTY_REPAIR: serial1 is unsupported.");
+          return false;
+        }
         Logger.info("VM", "Recovery [Stage 1]: Attempting out-of-band TTY repair via serial1...");
         if (this.onSerialOutput) {
           this.onSerialOutput("\r\n\x1b[1;33m[Recovery] Repairing terminal settings...\x1b[0m\r\n");
@@ -359,6 +367,10 @@ export class VMController {
         return true;
 
       case RecoveryStage.SHELL_RESTART:
+        if (!this.hasSerial1Support) {
+          Logger.warn("VM", "[Recovery] Skipping SHELL_RESTART: serial1 is unsupported.");
+          return false;
+        }
         Logger.info("VM", "Recovery [Stage 2]: Restarting user shell process...");
         if (this.onSerialOutput) {
           this.onSerialOutput("\r\n\x1b[1;33m[Recovery] Shell unresponsive. Restarting interactive session...\x1b[0m\r\n");
@@ -582,7 +594,8 @@ export class VMController {
     this.healthMonitor = new TerminalHealthMonitor(
       (type, payload) => this.bridge.post(type, payload),
       (reason) => this.orchestrator.triggerRecovery(reason || "health check failure"),
-      () => Math.max(this.lastInputTimestamp, this.lastSerialOutputTimestamp)
+      () => Math.max(this.lastInputTimestamp, this.lastSerialOutputTimestamp),
+      this.hasSerial1Support
     );
     this.healthMonitor.start();
   }

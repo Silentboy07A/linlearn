@@ -34,7 +34,7 @@ export class ProvisioningController {
     this.checkpoint = 0;
   }
 
-  public startProvisioning(restoreCmd: string, inspectScript: string): boolean {
+  public startProvisioning(restoreCmd: string, inspectScript: string, useSerial1: boolean): boolean {
     if (this.isLocked || this.state === "completed") {
       Logger.warn("VM", `Provisioning ignored. Locked: ${this.isLocked}, State: ${this.state}`);
       return false;
@@ -43,6 +43,32 @@ export class ProvisioningController {
     this.isLocked = true;
     this.transitionTo("running");
     this.checkpoint = 1;
+
+    if (!useSerial1) {
+      Logger.warn("VM", "[PROVISIONING] serial1 is unsupported. Falling back to serial0 interactive provisioning...");
+      const legacyScript = `stty -echo
+hostname linlearn
+mkdir -p /home/user/Projects /home/user/.config /home/user/workspace
+adduser -D -h /home/user -s /bin/sh user 2>/dev/null || true
+${restoreCmd}
+cat << 'EOF' > /home/user/.profile
+export HOME=/home/user
+export PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\\\$ '
+cd /home/user
+stty echo
+echo "PROVISIONING_COMPLETE"
+EOF
+cat << 'EOF' > /usr/bin/linlearn-inspect
+${inspectScript}
+EOF
+chmod +x /usr/bin/linlearn-inspect
+chown -R user:user /home/user
+chown user /dev/ttyS0
+exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'
+`;
+      this.onSendInput(0, legacyScript);
+      return true;
+    }
 
     Logger.info("VM", "Initiating provisioning script execution...");
 

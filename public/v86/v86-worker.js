@@ -141,6 +141,86 @@ async function loadAsset(url, name, options = {}) {
   }
 }
 
+// ─── 3.5. SERIAL CHANNEL MANAGER MODULE ──────────────────────────────────────
+/**
+ * Manages serial port capacity and routes inputs safely.
+ */
+var SerialChannelManager = {
+  ports: {},
+  logThrottle: {},
+
+  init: function(emu) {
+    this.ports = {};
+    this.logThrottle = {};
+    if (!emu) return;
+
+    var keys = Object.keys(emu);
+    log("info", "[SerialManager] Auditing emulator capabilities. Keys: " + keys.filter(function(k) {
+      return k.indexOf("serial") !== -1 || k.indexOf("adapter") !== -1;
+    }).join(", "));
+
+    this.ports['0'] = {
+      hasSend: typeof emu.serial0_send === "function",
+      ready: true
+    };
+
+    this.ports['1'] = {
+      hasSend: typeof emu.serial1_send === "function",
+      ready: typeof emu.serial_send_bytes === "function"
+    };
+
+    log("info", "[SerialManager] Port 0 capability: hasSend=" + this.ports['0'].hasSend);
+    log("info", "[SerialManager] Port 1 capability: hasSend=" + this.ports['1'].hasSend + ", hasSendBytes=" + this.ports['1'].ready);
+  },
+
+  send: function(port, data) {
+    if (!emulator) {
+      this.logThrottled("send_no_emu", "error", "[SerialManager] Cannot send: emulator not initialized.");
+      return false;
+    }
+
+    if (port === 1) {
+      if (typeof emulator.serial1_send === "function") {
+        emulator.serial1_send(data);
+        return true;
+      } else if (typeof emulator.serial_send_bytes === "function") {
+        var bytes = new Uint8Array(data.length);
+        for (var i = 0; i < data.length; i++) {
+          bytes[i] = data.charCodeAt(i);
+        }
+        emulator.serial_send_bytes(1, bytes);
+        return true;
+      } else {
+        this.logThrottled("serial1_unsupported", "warn", "[SerialManager] serial1 is unsupported by the emulator. Dropping payload.");
+        return false;
+      }
+    } else {
+      if (typeof emulator.serial0_send === "function") {
+        emulator.serial0_send(data);
+        return true;
+      } else if (typeof emulator.serial_send_bytes === "function") {
+        var bytes = new Uint8Array(data.length);
+        for (var i = 0; i < data.length; i++) {
+          bytes[i] = data.charCodeAt(i);
+        }
+        emulator.serial_send_bytes(0, bytes);
+        return true;
+      } else {
+        this.logThrottled("serial0_unsupported", "error", "[SerialManager] serial0 is unsupported! Dropping payload.");
+        return false;
+      }
+    }
+  },
+
+  logThrottled: function(key, level, msg) {
+    var now = Date.now();
+    if (!this.logThrottle[key] || now - this.logThrottle[key] > 5000) {
+      this.logThrottle[key] = now;
+      log(level, msg);
+    }
+  }
+};
+
 // ─── 4. EMULATOR MANAGER MODULE ──────────────────────────────────────────────
 /** @type {object|null} */
 var emulator = null;
@@ -168,6 +248,7 @@ async function createEmulator(config, win) {
     log("debug", "Configuring VM: RAM=" + (finalConfig.memory_size / (1024 * 1024)) + "MB, VGA RAM=" + (finalConfig.vga_memory_size / (1024 * 1024)) + "MB");
 
     emulator = new win.V86(finalConfig);
+    SerialChannelManager.init(emulator);
 
     // Bridge serial output with batch buffering
     emulator.add_listener("serial0-output-byte", function (byte) {
@@ -237,40 +318,19 @@ self.onmessage = async function (e) {
       break;
 
     case "INPUT":
-      if (!emulator) {
-        log("debug", "Ignored serial input: No active emulator (state: " + lifecycleState + ")");
-        break;
-      }
       if (typeof payload !== "string") {
         log("warn", "Ignored non-string serial input payload");
         break;
       }
-      log("debug", "Routing serial input of length " + payload.length + " to emulator");
-      try {
-        emulator.serial0_send(payload);
-      } catch (err) {
-        log("error", "Failed to send serial input: " + (err.message || String(err)));
-      }
+      SerialChannelManager.send(0, payload);
       break;
 
     case "INPUT1":
-      if (!emulator) {
-        log("debug", "Ignored serial1 input: No active emulator");
-        break;
-      }
       if (typeof payload !== "string") {
         log("warn", "Ignored non-string serial1 input payload");
         break;
       }
-      try {
-        if (typeof emulator.serial1_send === "function") {
-          emulator.serial1_send(payload);
-        } else {
-          log("warn", "emulator.serial1_send is not a function");
-        }
-      } catch (err) {
-        log("error", "Failed to send serial1 input: " + (err.message || String(err)));
-      }
+      SerialChannelManager.send(1, payload);
       break;
 
     case "SET_STATE":
@@ -429,7 +489,12 @@ async function handleInit(payload) {
     log("info", "Step 4/4: Creating v86 emulator instance...");
     await createEmulator(config, self);
 
-    self.postMessage({ type: "INIT_SUCCESS" });
+    self.postMessage({
+      type: "INIT_SUCCESS",
+      payload: {
+        hasSerial1: !!(SerialChannelManager.ports['1'] && SerialChannelManager.ports['1'].ready)
+      }
+    });
     if (payload.initial_state) {
       log("info", "v86 emulator successfully restored from snapshot. Transitioning to running...");
       setLifecycleState("running");

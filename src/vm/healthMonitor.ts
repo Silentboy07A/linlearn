@@ -12,15 +12,18 @@ export class TerminalHealthMonitor {
   private getLastActivityTime: () => number;
   private startedAt: number = Date.now();
   private serial1Buffer = "";
+  private useSerial1 = true;
 
   constructor(
     postMessage: (type: string, payload?: unknown) => void,
     onUnhealthy: (reason?: string) => void,
-    getLastActivityTime: () => number
+    getLastActivityTime: () => number,
+    useSerial1: boolean = true
   ) {
     this.postMessage = postMessage;
     this.onUnhealthy = onUnhealthy;
     this.getLastActivityTime = getLastActivityTime;
+    this.useSerial1 = useSerial1;
   }
 
   public start(): void {
@@ -54,6 +57,17 @@ export class TerminalHealthMonitor {
     if (timeSinceLastActivity < 15000) {
       Logger.debug("VM", `[HEALTH] Skipping heartbeat check: recent VM activity detected (${Math.round(timeSinceLastActivity / 1000)}s ago).`);
       this.lastHeartbeatTime = Date.now();
+      return;
+    }
+
+    if (!this.useSerial1) {
+      Logger.debug("VM", "[HEALTH] serial1 is unsupported. Sending CPU PING heartbeat directly...");
+      this.pingTimeout = setTimeout(() => {
+        this.pingTimeout = null;
+        Logger.error("VM", "[HEALTH] Worker CPU ping timed out! Guest VM is unresponsive.");
+        this.handleUnhealthy("worker CPU timeout");
+      }, 4000);
+      this.postMessage("PING");
       return;
     }
 

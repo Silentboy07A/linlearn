@@ -44,6 +44,7 @@ export class RecoveryOrchestrator {
   public reset(): void {
     this.stage = RecoveryStage.NONE;
     this.recoveryState = "healthy";
+    this.recoveryCooldownMs = 15000;
     this.onStateChange("healthy");
     this.timeouts.cancel("recovery_escalation");
   }
@@ -51,17 +52,21 @@ export class RecoveryOrchestrator {
   public triggerRecovery(reason: string): void {
     const now = Date.now();
     if (now - this.lastRecoveryTimestamp < this.recoveryCooldownMs) {
-      Logger.warn("VM", `Skipping recovery trigger: in cooldown period. Reason: ${reason}`);
+      Logger.warn("VM", `Skipping recovery trigger: in cooldown period (${Math.round((this.recoveryCooldownMs - (now - this.lastRecoveryTimestamp)) / 1000)}s remaining). Reason: ${reason}`);
       return;
     }
 
-    if (this.recoveryState === "crashloop") {
-      Logger.error("VM", "VM is in crashloop state. Manual intervention required (Reset VM State).");
+    if (this.recoveryState === "crashloop" || this.recoveryState === "degraded") {
+      Logger.warn("VM", `Skipping recovery trigger: VM is in ${this.recoveryState} state.`);
       return;
     }
 
     Logger.warn("VM", `Triggering recovery flow due to: ${reason}`);
     this.lastRecoveryTimestamp = now;
+    
+    // Exponential backoff for the next cooldown check
+    this.recoveryCooldownMs = Math.min(this.recoveryCooldownMs * 1.5, 60000);
+
     this.recoveryState = "recovering";
     this.onStateChange("recovering");
 
