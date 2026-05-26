@@ -25,6 +25,7 @@ interface CustomTerminal extends Terminal {
   _v86Disposable?: { dispose: () => void };
   _handleFocus?: () => void;
   _handleBlur?: () => void;
+  _rafId?: number;
 }
 
 interface TerminalSimulatorProps {
@@ -774,7 +775,7 @@ export function TerminalSimulator({
         rafId = requestAnimationFrame(flushSerial);
 
         // Store rafId on custom terminal properties to cancel it on unmount
-        (term as any)._rafId = rafId;
+        (term as CustomTerminal)._rafId = rafId;
 
         const onSerial = (char: string) => {
           if (!isMounted) return;
@@ -1329,8 +1330,8 @@ export function TerminalSimulator({
         if (customTerm._v86Disposable) {
           customTerm._v86Disposable.dispose();
         }
-        if ((term as any)._rafId) {
-          cancelAnimationFrame((term as any)._rafId);
+        if (customTerm._rafId) {
+          cancelAnimationFrame(customTerm._rafId);
         }
         if (term.element) {
           if (customTerm._handleFocus) {

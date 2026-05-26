@@ -9,7 +9,6 @@ import {
   canSendInput,
   setBootingInProgress,
   isBooting,
-  resetLifecycleState,
 } from "./vmLifecycle";
 import {
   getEmulator,
