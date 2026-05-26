@@ -14,7 +14,7 @@ import {
 } from "@/lib/virtualOs";
 
 import { updateMastery, DEFAULT_BKT_PARAMS, type LinuxTopic } from "@/lib/bkt";
-import { EmulatorManager } from "@/vm/emulatorManager";
+import { VMController } from "@/vm/emulatorManager";
 import { PersistenceManager } from "@/persistence/manager";
 import { GUEST_INSPECT_SCRIPT } from "@/vm/inspect";
 import { parseGuestState, GuestState } from "@/missions/validator";
@@ -353,7 +353,7 @@ export function TerminalSimulator({
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
-  const v86EmulatorRef = useRef<EmulatorManager | null>(null);
+  const v86EmulatorRef = useRef<VMController | null>(null);
   const persistenceManagerRef = useRef<PersistenceManager>(new PersistenceManager());
   const [isPersistenceSaving, setIsPersistenceSaving] = useState<boolean>(false);
   const [hasSavedState, setHasSavedState] = useState<boolean>(false);
@@ -839,16 +839,13 @@ export function TerminalSimulator({
         setV86Booting(true);
         setIsV86Running(false);
 
-        let emulator = EmulatorManager.getActiveInstance();
+        let emulator = VMController.getActiveInstance();
         const isReattached = !!emulator;
         if (!emulator) {
-          emulator = new EmulatorManager();
-          EmulatorManager.setActiveInstance(emulator);
+          emulator = new VMController();
+          VMController.setActiveInstance(emulator);
         }
         v86EmulatorRef.current = emulator;
-
-        let isProvisioned = false;
-        let isProvisioning = false;
 
         // Frame-batched serial output rendering for butter smooth performance
         let serialBuffer = "";
@@ -901,66 +898,8 @@ export function TerminalSimulator({
             return;
           }
 
-          // Standard terminal bridge (unless we are provisioning silently)
-          if (!isProvisioning) {
-            serialBuffer += char;
-          }
-
-          // State checking for guest provisioning
-          if (!isProvisioned) {
-            provisioningSearchBuffer += char;
-            if (provisioningSearchBuffer.length > 256) {
-              provisioningSearchBuffer = provisioningSearchBuffer.substring(provisioningSearchBuffer.length - 256);
-            }
-
-            // Detect prompt/sentinel patterns
-            const hasRootPrompt = provisioningSearchBuffer.endsWith("~% ") || provisioningSearchBuffer.endsWith("# ") || provisioningSearchBuffer.endsWith("~# ");
-            const hasUserSentinel = provisioningSearchBuffer.includes("PROVISIONING_COMPLETE");
-
-            if (hasRootPrompt && !isProvisioning) {
-              // Initiate silent environment provisioning
-              // Delegate transition to worker as single source of truth
-              isProvisioning = true;
-              emulator.requestProvisioningTransition();
-              // Clear screen first so root setup commands are totally hidden
-              term.write("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
-              
-              let restoreCmd = "";
-              if (savedStateRef.current) {
-                try {
-                  const backupB64 = arrayBufferToBase64(savedStateRef.current);
-                  restoreCmd = `cat << 'EOF' > /tmp/fs.tar.gz.b64\n${backupB64}\nEOF\nbase64 -d /tmp/fs.tar.gz.b64 | tar -xzf - -C /home/user 2>/dev/null\nrm -f /tmp/fs.tar.gz.b64\n`;
-                } catch (e) {
-                  console.error("Failed to generate restore command from backup:", e);
-                }
-              }
-
-              // Send silent provisioning string with permissions, echo recovery, self-healing loop, and sentinel
-              emulator.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\n${restoreCmd}cat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
-            } else if (hasUserSentinel) {
-              // User prompt sentinel matched: provisioning successfully complete!
-              // Delegate transition to worker as single source of truth
-              provisioningSearchBuffer = "";
-              isProvisioning = false;
-              isProvisioned = true;
-              emulator.requestRunningTransition();
-              // Note: setV86Booting/setIsV86Running will be set by the onState callback
-              // when the worker confirms the transition via STATE_CHANGED
-              
-              const bootTime = emulator.getLifecycleState().bootTimeMs || 0;
-              bootTimeRef.current = bootTime;
-
-              term.write("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
-              term.write(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
-              term.write(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
-              term.write("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
-              
-              // Focus terminal automatically with a small delay to ensure canvas is ready
-              setTimeout(() => {
-                localForceFocus();
-              }, 150);
-            }
-          }
+          // Standard terminal bridge
+          serialBuffer += char;
         };
 
         const onState = (newState: string) => {
@@ -971,19 +910,12 @@ export function TerminalSimulator({
             setV86Booting(false);
             setIsV86Running(false);
           } else if (newState === "running") {
-            isProvisioned = true;
-            isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(true);
-
-
-
             setTimeout(() => {
               localForceFocus();
             }, 200);
           } else if (newState === "provisioning") {
-            isProvisioned = false;
-            isProvisioning = true;
             setV86Booting(true);
             setIsV86Running(false);
           } else if (newState === "stopping") {
@@ -991,13 +923,9 @@ export function TerminalSimulator({
             setV86Booting(false);
             setIsV86Running(false);
           } else if (newState === "stopped") {
-            isProvisioned = false;
-            isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(false);
           } else if (newState === "booting" || newState === "loading") {
-            isProvisioned = false;
-            isProvisioning = false;
             setV86Booting(true);
             setIsV86Running(false);
           }
@@ -1011,21 +939,15 @@ export function TerminalSimulator({
           const currentVmState = emulator.getLifecycleState().state;
           setVmStateName(currentVmState);
           if (currentVmState === "running") {
-            isProvisioned = true;
-            isProvisioning = false;
             setV86Booting(false);
             setIsV86Running(true);
             setTimeout(() => {
               localForceFocus();
             }, 150);
           } else if (currentVmState === "provisioning") {
-            isProvisioned = false;
-            isProvisioning = true;
             setV86Booting(true);
             setIsV86Running(false);
           } else {
-            isProvisioned = false;
-            isProvisioning = false;
             setV86Booting(true);
             setIsV86Running(false);
           }

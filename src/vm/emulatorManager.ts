@@ -8,15 +8,15 @@ import { VMInitializationError } from "../lib/errors";
 import { GUEST_INSPECT_SCRIPT } from "./inspect";
 import { TerminalHealthMonitor } from "./healthMonitor";
 
-export class EmulatorManager {
-  private static activeInstance: EmulatorManager | null = null;
+export class VMController {
+  private static activeInstance: VMController | null = null;
 
-  public static getActiveInstance(): EmulatorManager | null {
-    return EmulatorManager.activeInstance;
+  public static getActiveInstance(): VMController | null {
+    return VMController.activeInstance;
   }
 
-  public static setActiveInstance(instance: EmulatorManager | null): void {
-    EmulatorManager.activeInstance = instance;
+  public static setActiveInstance(instance: VMController | null): void {
+    VMController.activeInstance = instance;
   }
 
   private bridge: WorkerBridge;
@@ -31,9 +31,23 @@ export class EmulatorManager {
   private serialHistory: string = "";
 
   private wasRestoredFromSnapshot = false;
+  private savedState: ArrayBuffer | null = null;
 
   private lastInputTimestamp = Date.now();
+  private lastSerialOutputTimestamp = Date.now();
+  private lastRestoreTimestamp = 0;
   private healthMonitor: TerminalHealthMonitor | null = null;
+  private rebootAttempts: number[] = [];
+
+  // Centralized provisioning state machine and buffer
+  private provisioningState: "idle" | "in-progress" | "complete" = "idle";
+  private isProvisioning = false;
+  private isProvisioned = false;
+  private provisioningSearchBuffer = "";
+
+  // Programmatic throttled sequential queue
+  private programmaticQueue: string[] = [];
+  private isSendingProgrammatic = false;
 
   // ─── Initialization mutex ─────────────────────────────────────────────────
   private initPromise: Promise<void> | null = null;
@@ -51,7 +65,6 @@ export class EmulatorManager {
     onState: (state: string) => void,
     initialState?: ArrayBuffer
   ): Promise<void> {
-    // Mutex: prevent concurrent start() calls
     if (this.initPromise) {
       Logger.warn("VM", "VM is already starting. Ignoring redundant start call.");
       return;
@@ -83,12 +96,36 @@ export class EmulatorManager {
   ): Promise<void> {
     this.onSerialOutput = onSerial;
     this.onStateChange = onState;
-    this.wasRestoredFromSnapshot = !!initialState;
-    this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes, "EmulatorManager.start");
+
+    // Validate snapshot integrity before restore (gzip magic bytes: 0x1F 0x8B)
+    if (initialState && initialState.byteLength > 2) {
+      const bytes = new Uint8Array(initialState);
+      if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+        this.wasRestoredFromSnapshot = true;
+        this.savedState = initialState;
+        this.lastRestoreTimestamp = Date.now();
+        Logger.info("VM", `Valid snapshot found (gzip magic 0x1F 0x8B): size ${initialState.byteLength} bytes.`);
+      } else {
+        Logger.warn("VM", "Invalid snapshot magic bytes (expected gzip 0x1F 0x8B). Discarding corrupted state.");
+        this.wasRestoredFromSnapshot = false;
+        this.savedState = null;
+      }
+    } else {
+      this.wasRestoredFromSnapshot = false;
+      this.savedState = null;
+      Logger.info("VM", "No snapshot found or empty snapshot. Clean cold boot.");
+    }
+
+    this.isProvisioned = false;
+    this.isProvisioning = false;
+    this.provisioningState = "idle";
+    this.provisioningSearchBuffer = "";
+
+    this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes, "VMController.start");
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
-    // Start provisioning watchdog
+    // Start boot watchdog
     this.startWatchdog();
 
     return new Promise((resolve, reject) => {
@@ -113,8 +150,7 @@ export class EmulatorManager {
 
         switch (type) {
           case "INIT_SUCCESS":
-            // For both cold boot and snapshot-recovery (which is now also a cold boot with fs restore),
-            // don't transition here — worker will send STATE_CHANGED("booting")
+            // For both cold boot and snapshot-recovery, don't transition here — worker will send STATE_CHANGED("booting")
             break;
 
           case "INIT_FAILURE":
@@ -128,8 +164,6 @@ export class EmulatorManager {
 
           case "SERIAL_OUT":
             if (this.lifecycle.getState().state === "booting") {
-              // Resolve the promise to indicate the VM has started executing,
-              // but leave the state as "booting" until prompt is matched.
               clearTimeout(timeout);
               if (!resolved) {
                 resolved = true;
@@ -141,7 +175,18 @@ export class EmulatorManager {
             if (this.serialHistory.length > 20000) {
               this.serialHistory = this.serialHistory.substring(this.serialHistory.length - 20000);
             }
-            if (this.onSerialOutput) {
+
+            // Track last serial output timestamp for watchdog activity checks
+            this.lastSerialOutputTimestamp = Date.now();
+
+            // Centralized prompt matching and provisioning triggers
+            this.handleSerialLifecycle(char);
+
+            // Refresh provisioning watchdog if provisioning is active
+            this.refreshProvisioningWatchdog();
+
+            // Print character to UI terminal (hide outputs printed during silent provisioning)
+            if (this.onSerialOutput && !this.isProvisioning) {
               this.onSerialOutput(char);
             }
             break;
@@ -188,7 +233,6 @@ export class EmulatorManager {
 
           case "STATE_CHANGED":
             {
-              // Worker is the source of truth — accept its state without echoing back
               const rawState = payload as string;
               let mappedState: VMStateName;
               if (rawState === "failed") {
@@ -198,7 +242,6 @@ export class EmulatorManager {
               } else {
                 mappedState = rawState as VMStateName;
               }
-              // Use fromWorker=true to suppress the echo back to worker
               this.transitionState(mappedState, "worker STATE_CHANGED", true, "STATE_CHANGED");
             }
             break;
@@ -215,6 +258,70 @@ export class EmulatorManager {
     });
   }
 
+  private handleSerialLifecycle(char: string): void {
+    if (this.provisioningState === "complete") return;
+
+    this.provisioningSearchBuffer += char;
+    if (this.provisioningSearchBuffer.length > 256) {
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.substring(this.provisioningSearchBuffer.length - 256);
+    }
+
+    const hasRootPrompt = this.provisioningSearchBuffer.endsWith("~% ") || 
+                          this.provisioningSearchBuffer.endsWith("# ") || 
+                          this.provisioningSearchBuffer.endsWith("~# ");
+    const hasUserSentinel = this.provisioningSearchBuffer.includes("PROVISIONING_COMPLETE");
+
+    if (hasRootPrompt && this.provisioningState === "idle") {
+      this.provisioningState = "in-progress";
+      this.isProvisioning = true;
+      this.requestProvisioningTransition();
+
+      Logger.info("VM", "[PROVISIONING] Root shell prompt detected in guest. Initiating provisioning sequence.");
+
+      if (this.onSerialOutput) {
+        this.onSerialOutput("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
+      }
+
+      let restoreCmd = "";
+      if (this.savedState) {
+        try {
+          const backupB64 = this.arrayBufferToBase64(this.savedState);
+          restoreCmd = `cat << 'EOF' > /tmp/fs.tar.gz.b64\n${backupB64}\nEOF\nbase64 -d /tmp/fs.tar.gz.b64 | tar -xzf - -C /home/user 2>/dev/null\nrm -f /tmp/fs.tar.gz.b64\n`;
+        } catch (e) {
+          Logger.error("VM", "Failed to generate restore command from backup:", e);
+        }
+      }
+
+      // Send silent provisioning commands sequentially and throttled to prevent UART overflows
+      this.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\n${restoreCmd}cat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
+    } else if (hasUserSentinel && this.provisioningState === "in-progress") {
+      this.provisioningSearchBuffer = "";
+      this.isProvisioning = false;
+      this.isProvisioned = true;
+      this.provisioningState = "complete";
+      this.requestRunningTransition();
+
+      Logger.info("VM", "[PROVISIONING] Sentinel matched. Guest user environment provisioned.");
+
+      if (this.onSerialOutput) {
+        this.onSerialOutput("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
+        this.onSerialOutput(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
+        this.onSerialOutput(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
+        this.onSerialOutput("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
+      }
+    }
+  }
+
+  private arrayBufferToBase64(buffer: ArrayBuffer): string {
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  }
+
   public reattach(
     onSerial: (data: string) => void,
     onState: (state: string) => void
@@ -222,7 +329,6 @@ export class EmulatorManager {
     Logger.info("VM", "Reattaching listeners to active VM session");
     this.onSerialOutput = onSerial;
     this.onStateChange = onState;
-    // Notify client of the current state immediately
     onState(this.lifecycle.getState().state);
   }
 
@@ -252,7 +358,6 @@ export class EmulatorManager {
 
       this.bridge.post("SAVE_STATE");
 
-      // 10 second timeout for saving state buffer
       setTimeout(() => {
         if (this.saveStateRejecter === reject) {
           this.saveStateResolver = null;
@@ -285,21 +390,41 @@ export class EmulatorManager {
       Logger.warn("VM", `Refusing to send programmatic serial input: VM is in non-interactive state: ${stateName}`);
       return;
     }
-    Logger.info("VM", `sendProgrammaticInput: routing character sequence to bridge: ${JSON.stringify(data.length > 50 ? data.substring(0, 50) + "..." : data)}`);
-    this.bridge.post("INPUT", data);
+    this.programmaticQueue.push(data);
+    this.processProgrammaticQueue();
   }
 
-  /**
-   * Transition the main-thread lifecycle state.
-   * Returns true if the transition was applied, false if rejected by FSM.
-   * Never throws.
-   *
-   * @param newState     Target state
-   * @param source       Where this transition originated
-   * @param fromWorker   If true, skip echoing state back to worker (breaks feedback loop)
-   * @param workerEvent  Optional originating worker message type for tracing
-   * @param snapshot     Optional snapshot metadata for tracing
-   */
+  private processProgrammaticQueue(): void {
+    if (this.isSendingProgrammatic || this.programmaticQueue.length === 0) {
+      return;
+    }
+
+    this.isSendingProgrammatic = true;
+    const data = this.programmaticQueue.shift()!;
+    
+    const chunkSize = 64;
+    const delayMs = 15;
+    let offset = 0;
+
+    const sendNextChunk = () => {
+      if (!this.lifecycle.isAlive()) {
+        this.isSendingProgrammatic = false;
+        return;
+      }
+      if (offset >= data.length) {
+        this.isSendingProgrammatic = false;
+        this.processProgrammaticQueue();
+        return;
+      }
+      const chunk = data.substring(offset, offset + chunkSize);
+      offset += chunkSize;
+      this.bridge.post("INPUT", chunk);
+      setTimeout(sendNextChunk, delayMs);
+    };
+
+    sendNextChunk();
+  }
+
   public transitionState(
     newState: VMStateName,
     source?: string,
@@ -308,21 +433,15 @@ export class EmulatorManager {
     snapshot?: VMSnapshotMetadata,
   ): boolean {
     const currentState = this.lifecycle.getState().state;
-    // Deduplicate: ignore redundant same-state transitions
     if (currentState === newState) return true;
 
     const succeeded = this.lifecycle.transitionTo(newState, undefined, source, workerEvent, snapshot);
     if (!succeeded) {
-      // Already logged by VMLifecycleManager — just return
       return false;
     }
 
     if (this.onStateChange) this.onStateChange(newState);
 
-    // Only sync state back to worker if this transition did NOT originate from the worker
-    // This is the key fix that breaks the echo loop:
-    //   Worker STATE_CHANGED -> main transitionState(fromWorker=true) -> NO echo back
-    //   Local transitionState(fromWorker=false) -> sync to worker
     if (!fromWorker) {
       let workerState: string = newState;
       if (newState === "stopped") workerState = "destroyed";
@@ -331,7 +450,7 @@ export class EmulatorManager {
     }
 
     if (newState === "provisioning") {
-      this.startProvisioningWatchdog();
+      this.refreshProvisioningWatchdog();
     } else if (newState === "running" || newState === "stopped" || newState === "error") {
       this.stopWatchdog();
       if (newState === "running") {
@@ -344,18 +463,10 @@ export class EmulatorManager {
     return true;
   }
 
-  /**
-   * Request the worker to transition to provisioning state.
-   * This keeps the worker as the single source of truth.
-   */
   public requestProvisioningTransition(): void {
     this.bridge.post("SET_PROVISIONING");
   }
 
-  /**
-   * Request the worker to transition to running state.
-   * This keeps the worker as the single source of truth.
-   */
   public requestRunningTransition(): void {
     this.bridge.post("SET_RUNNING");
   }
@@ -366,38 +477,34 @@ export class EmulatorManager {
     this.watchdogTimer = setTimeout(() => {
       const currentState = this.lifecycle.getState().state;
       if (currentState === "loading" || currentState === "booting") {
-        Logger.warn("VM", `[WATCHDOG] VM boot stalled in state: ${currentState}. Recovering...`);
-        this.transitionState("running", "watchdog recovery");
-        
-        // Execute recovery script to revive shell and stty settings
-        const recoveryScript = `\n\x03\x03\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nsu - user\nexport PS1='user@linlearn:\\w\\$ '\necho "PROVISIONING_COMPLETE"\n`;
-        this.sendProgrammaticInput(recoveryScript);
-
-        if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Boot took too long. Restoring shell and forcing interactive mode...\x1b[0m\r\n");
+        // Skip boot watchdog check if we've seen recent serial output activity
+        if (Date.now() - this.lastSerialOutputTimestamp < 15000) {
+          Logger.info("VM", "[WATCHDOG] Boot watchdog: VM is progressing (active serial output). Extending boot grace period.");
+          this.startWatchdog();
+          return;
         }
+        Logger.warn("VM", `[WATCHDOG] VM boot stalled in state: ${currentState}. Recovering...`);
+        this.recoverShell();
       }
-    }, 45000); // 45 seconds for kernel boot
+    }, 45000);
   }
 
-  private startProvisioningWatchdog(): void {
+  private refreshProvisioningWatchdog(): void {
+    if (this.lifecycle.getState().state !== "provisioning") return;
     this.stopWatchdog();
-    Logger.info("VM", "Starting provisioning watchdog timer (15s)...");
+    Logger.debug("VM", "[WATCHDOG] Refreshing provisioning watchdog due to serial output activity.");
     this.watchdogTimer = setTimeout(() => {
-      const currentState = this.lifecycle.getState().state;
-      if (currentState === "provisioning") {
-        Logger.warn("VM", `[WATCHDOG] VM provisioning stalled. Recovering...`);
-        this.transitionState("running", "provisioning watchdog recovery");
-        
-        // Execute recovery script to revive shell and stty settings
-        const recoveryScript = `\n\x03\x03\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nsu - user\nexport PS1='user@linlearn:\\w\\$ '\necho "PROVISIONING_COMPLETE"\n`;
-        this.sendProgrammaticInput(recoveryScript);
-
-        if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Provisioning took too long. Restoring shell and forcing interactive mode...\x1b[0m\r\n");
+      if (this.lifecycle.getState().state === "provisioning") {
+        // Double check active serial output before declaring provisioning stalled
+        if (Date.now() - this.lastSerialOutputTimestamp < 15000) {
+          Logger.info("VM", "[WATCHDOG] Provisioning watchdog: active serial output detected. Extending grace period.");
+          this.refreshProvisioningWatchdog();
+          return;
         }
+        Logger.warn("VM", `[WATCHDOG] VM provisioning stalled (no output for 45s). Recovering...`);
+        this.recoverShell();
       }
-    }, 15000); // 15 seconds for provisioning commands
+    }, 45000); // 45s of absolute silence during provisioning triggers reboot
   }
 
   private stopWatchdog(): void {
@@ -410,20 +517,19 @@ export class EmulatorManager {
   public async stop(): Promise<void> {
     Logger.info("VM", "Stopping guest VM session...");
 
-    // Abort any in-progress start
     if (this.initAbortController) {
       this.initAbortController.abort();
     }
 
     this.stopWatchdog();
-    this.transitionState("stopped", "EmulatorManager.stop");
+    this.transitionState("stopped", "VMController.stop");
     this.bridge.terminate();
     this.onSerialOutput = null;
     this.onStateChange = null;
     this.saveStateResolver = null;
     this.saveStateRejecter = null;
-    if (EmulatorManager.getActiveInstance() === this) {
-      EmulatorManager.setActiveInstance(null);
+    if (VMController.getActiveInstance() === this) {
+      VMController.setActiveInstance(null);
     }
   }
 
@@ -440,36 +546,81 @@ export class EmulatorManager {
   }
 
   private startHealthMonitoring(): void {
-    if (!this.healthMonitor) {
-      this.healthMonitor = new TerminalHealthMonitor(
-        (type, payload) => this.bridge.post(type, payload),
-        () => this.recoverShell()
-      );
-    }
+    this.stopHealthMonitoring();
+    Logger.info("VM", "Starting periodic shell health monitoring (every 20s)...");
+    this.healthMonitor = new TerminalHealthMonitor(
+      (type, payload) => this.bridge.post(type, payload),
+      () => this.recoverShell(),
+      () => Math.max(this.lastInputTimestamp, this.lastSerialOutputTimestamp)
+    );
     this.healthMonitor.start();
   }
 
   private stopHealthMonitoring(): void {
     if (this.healthMonitor) {
       this.healthMonitor.stop();
+      this.healthMonitor = null;
     }
   }
 
   public async recoverShell(): Promise<void> {
-    Logger.error("VM", "[HEALTH] Terminal session is unresponsive. Initiating VM hard reboot fallback...");
-    
-    // Call stop and start to perform a full cold boot & restore files from backup
+    const now = Date.now();
+
+    // Async-safe state validation: check if VM is still in an active/interactive state
+    const state = this.lifecycle.getState().state;
+    if (state !== "running" && state !== "booting" && state !== "provisioning" && state !== "loading") {
+      Logger.info("VM", `[Watchdog] Skipping recovery: VM state is ${state}`);
+      return;
+    }
+
+    // Cooldown check: if a snapshot restore occurred within the last 20 seconds, skip recovery
+    if (this.lastRestoreTimestamp > 0 && now - this.lastRestoreTimestamp < 20000) {
+      Logger.info("VM", "[Watchdog] Skipping recovery: within snapshot restore cooldown.");
+      return;
+    }
+
+    // Keep only attempts in the last 60 seconds
+    this.rebootAttempts = this.rebootAttempts.filter(t => now - t < 60000);
+
+    if (this.rebootAttempts.length >= 3) {
+      Logger.error("VM", "[WATCHDOG] Reboot loop detected! 3 failures in 60s. Suspending watchdog to prevent storms.");
+      if (this.onSerialOutput) {
+        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Critical: VM is stuck in a reboot loop. Boot suspended to protect state. Please click 'Reset VM State' to format.\x1b[0m\r\n");
+      }
+      this.transitionState("error", "reboot_loop_prevented");
+      await this.stop();
+      return;
+    }
+
+    this.rebootAttempts.push(now);
+    Logger.error("VM", `[HEALTH] Session is unresponsive (reboot attempt ${this.rebootAttempts.length}/3). Rebooting guest VM...`);
+
+    // Discard possibly corrupted snapshot on second failure
+    if (this.rebootAttempts.length === 2) {
+      Logger.warn("VM", "[WATCHDOG] Second boot failure. Discarding possibly corrupted snapshot to force clean recovery.");
+      if (this.onSerialOutput) {
+        this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Detecting snapshot corruption. Discarding snapshot and booting clean factory state...\x1b[0m\r\n");
+      }
+      this.savedState = null;
+      this.wasRestoredFromSnapshot = false;
+    }
+
     const activeOnSerial = this.onSerialOutput;
     const activeOnState = this.onStateChange;
     if (activeOnSerial && activeOnState) {
       if (this.onSerialOutput) {
-        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Guest virtual machine is unresponsive. Rebooting virtual machine...\x1b[0m\r\n");
+        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Guest virtual machine is unresponsive. Rebooting...\x1b[0m\r\n");
       }
       await this.stop();
-      // Wait a moment before restarting
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      // Re-initialize using start (will pick up latest IndexedDB backup)
-      await this.start(window.location.origin, activeOnSerial, activeOnState, new ArrayBuffer(0) /* passes truthy to indicate restore welcome is needed */);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      // Perform clean boot and let it restore files
+      await this.start(
+        window.location.origin, 
+        activeOnSerial, 
+        activeOnState, 
+        this.savedState || undefined
+      );
     }
   }
 }

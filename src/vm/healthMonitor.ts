@@ -8,10 +8,17 @@ export class TerminalHealthMonitor {
   private pingTimeout: NodeJS.Timeout | null = null;
   private onUnhealthy: () => void;
   private postMessage: (type: string, payload?: unknown) => void;
+  private getLastActivityTime: () => number;
+  private startedAt: number = Date.now();
 
-  constructor(postMessage: (type: string, payload?: unknown) => void, onUnhealthy: () => void) {
+  constructor(
+    postMessage: (type: string, payload?: unknown) => void,
+    onUnhealthy: () => void,
+    getLastActivityTime: () => number
+  ) {
     this.postMessage = postMessage;
     this.onUnhealthy = onUnhealthy;
+    this.getLastActivityTime = getLastActivityTime;
   }
 
   /**
@@ -21,6 +28,7 @@ export class TerminalHealthMonitor {
     this.stop();
     Logger.info("VM", "Starting periodic shell health monitoring (every 20s)...");
     this.lastHeartbeatTime = Date.now();
+    this.startedAt = Date.now();
     this.isHealthy = true;
 
     this.checkInterval = setInterval(() => {
@@ -46,6 +54,15 @@ export class TerminalHealthMonitor {
    * Send heartbeat check to worker
    */
   private checkHeartbeat(): void {
+    // Skip heartbeat checks if we had recent keyboard input or serial output activity
+    const lastActivity = this.getLastActivityTime();
+    const timeSinceLastActivity = Date.now() - lastActivity;
+    if (timeSinceLastActivity < 15000) {
+      Logger.debug("VM", `[HEALTH] Skipping heartbeat check: recent VM activity detected (${Math.round(timeSinceLastActivity / 1000)}s ago).`);
+      this.lastHeartbeatTime = Date.now();
+      return;
+    }
+
     Logger.debug("VM", "Sending worker heartbeat PING...");
     
     // 3-second timeout for the PONG reply
@@ -89,6 +106,13 @@ export class TerminalHealthMonitor {
    * Mark session as unhealthy and fire recovery callback
    */
   private handleUnhealthy(): void {
+    // 30-second cooldown/exemption period after boot or snapshot restore
+    const timeSinceStart = Date.now() - this.startedAt;
+    if (timeSinceStart < 30000) {
+      Logger.info("VM", `[HEALTH] Ignoring unhealthy signal: within grace period (${Math.round(timeSinceStart / 1000)}s since start).`);
+      return;
+    }
+
     if (this.isHealthy) {
       this.isHealthy = false;
       Logger.warn("VM", "Terminal session detected as unhealthy. Triggering recovery callback...");
