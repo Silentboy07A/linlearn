@@ -510,3 +510,6 @@ async function handleInit(payload) {
     self.postMessage({ type: "INIT_FAILURE", payload: initErr });
   }
 }
+
+// Post message that the worker script is fully loaded and ready to accept commands
+self.postMessage({ type: "WORKER_READY" });

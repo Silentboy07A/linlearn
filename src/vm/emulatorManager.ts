@@ -1,5 +1,4 @@
 // src/vm/emulatorManager.ts
-import { WorkerBridge } from "./workerBridge";
 import { VMLifecycleManager } from "./vmLifecycle";
 import { ResourceLimitsValidator } from "./resourceLimits";
 import { VMSessionConfig, VMStateName, VMSnapshotMetadata } from "../lib/types";
@@ -10,7 +9,7 @@ import { TerminalHealthMonitor } from "./healthMonitor";
 import { UnifiedTimeoutManager } from "./timeoutManager";
 import { ProvisioningController } from "./provisioning";
 import { RecoveryOrchestrator, RecoveryStage } from "./recoveryOrchestrator";
-import { SerialWriteQueue } from "./serialQueue";
+import { TransportCoordinator } from "./transportCoordinator";
 
 export class VMController {
   private static activeInstance: VMController | null = null;
@@ -23,7 +22,7 @@ export class VMController {
     VMController.activeInstance = instance;
   }
 
-  private bridge: WorkerBridge;
+  private transport: TransportCoordinator;
   private lifecycle: VMLifecycleManager;
   private config: VMSessionConfig;
   private onSerialOutput: ((data: string) => void) | null = null;
@@ -35,7 +34,6 @@ export class VMController {
 
   private wasRestoredFromSnapshot = false;
   private savedState: ArrayBuffer | null = null;
-  private hasSerial1Support = false;
 
   private lastInputTimestamp = Date.now();
   private lastSerialOutputTimestamp = Date.now();
@@ -50,19 +48,14 @@ export class VMController {
   // Provisioning matching buffer
   private provisioningSearchBuffer = "";
 
-  // Sequential write queue
-  private serialQueue: SerialWriteQueue;
-
   // Initialization mutex
   private initPromise: Promise<void> | null = null;
   private initAbortController: AbortController | null = null;
 
   constructor(config: Partial<VMSessionConfig> = {}) {
-    this.bridge = new WorkerBridge();
+    this.transport = new TransportCoordinator();
     this.lifecycle = new VMLifecycleManager();
     this.config = ResourceLimitsValidator.validate(config);
-
-    this.serialQueue = new SerialWriteQueue((type, payload) => this.bridge.post(type, payload));
 
     // Initialize unified timeout manager
     this.timeouts = new UnifiedTimeoutManager();
@@ -168,14 +161,11 @@ export class VMController {
 
       let resolved = false;
 
-      this.bridge.initialize(workerUrl, (type, payload) => {
+      this.transport.initialize(workerUrl, (type, payload) => {
         if (abortSignal.aborted) return;
 
         switch (type) {
           case "INIT_SUCCESS":
-            const initPayload = payload as { hasSerial1?: boolean } | undefined;
-            this.hasSerial1Support = !!(initPayload && initPayload.hasSerial1);
-            Logger.info("VM", `Emulator initialized. hasSerial1Support: ${this.hasSerial1Support}`);
             break;
 
           case "INIT_FAILURE":
@@ -272,14 +262,21 @@ export class VMController {
             }
             break;
         }
-      });
-
-      this.bridge.post("INIT", {
-        origin,
-        memory_size: this.config.memoryLimitBytes,
-        vga_memory_size: this.config.vgaMemoryLimitBytes,
-        version: Date.now().toString(),
-        initial_state: undefined, // Force cold boot, restore files via provisioning
+      }).then(() => {
+        if (abortSignal.aborted) return;
+        Logger.info("VM", "Worker is ready. Dispatching INIT configuration...");
+        this.transport.post("INIT", {
+          origin,
+          memory_size: this.config.memoryLimitBytes,
+          vga_memory_size: this.config.vgaMemoryLimitBytes,
+          version: Date.now().toString(),
+          initial_state: undefined,
+        });
+      }).catch((err) => {
+        if (!resolved) {
+          resolved = true;
+          reject(err);
+        }
       });
     });
   }
@@ -327,7 +324,7 @@ export class VMController {
         }
       });
 
-      this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.hasSerial1Support);
+      this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.transport.hasSerial1Support());
 
     } else if (hasUserSentinel && this.provisioning.getState() === "running") {
       this.timeouts.cancel("provisioning_watchdog");
@@ -355,7 +352,7 @@ export class VMController {
   private async handleRecoveryAction(stage: RecoveryStage): Promise<boolean> {
     switch (stage) {
       case RecoveryStage.TTY_REPAIR:
-        if (!this.hasSerial1Support) {
+        if (!this.transport.hasSerial1Support()) {
           Logger.warn("VM", "[Recovery] Skipping TTY_REPAIR: serial1 is unsupported.");
           return false;
         }
@@ -367,7 +364,7 @@ export class VMController {
         return true;
 
       case RecoveryStage.SHELL_RESTART:
-        if (!this.hasSerial1Support) {
+        if (!this.transport.hasSerial1Support()) {
           Logger.warn("VM", "[Recovery] Skipping SHELL_RESTART: serial1 is unsupported.");
           return false;
         }
@@ -391,7 +388,7 @@ export class VMController {
         if (this.onSerialOutput) {
           this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Guest CPU stalled. Rebooting VM...\x1b[0m\r\n");
         }
-        this.bridge.post("RESTART");
+        this.transport.post("RESTART");
         return true;
 
       case RecoveryStage.COLD_BOOT_FALLBACK:
@@ -462,7 +459,7 @@ export class VMController {
       this.saveStateResolver = resolve;
       this.saveStateRejecter = reject;
 
-      this.bridge.post("SAVE_STATE");
+      this.transport.post("SAVE_STATE");
 
       this.timeouts.register("save_state_timeout", 10000, () => {
         if (this.saveStateRejecter === reject) {
@@ -483,7 +480,7 @@ export class VMController {
     }
     this.lastInputTimestamp = Date.now();
     try {
-      this.bridge.post("INPUT", data);
+      this.transport.post("INPUT", data);
       
       // Heartbeat feedback: if a user types something, they are active, restore orchestrator health
       if (this.orchestrator.getRecoveryState() !== "healthy") {
@@ -502,7 +499,7 @@ export class VMController {
       Logger.warn("VM", `Refusing programmatic input in non-interactive state: ${stateName}`);
       return Promise.resolve();
     }
-    return this.serialQueue.enqueue(port, data);
+    return this.transport.send(port, data);
   }
 
   public transitionState(
@@ -526,7 +523,7 @@ export class VMController {
       let workerState: string = newState;
       if (newState === "stopped") workerState = "destroyed";
       if (newState === "error") workerState = "failed";
-      this.bridge.post("SET_STATE", workerState);
+      this.transport.post("SET_STATE", workerState);
     }
 
     // Coordinated timeout updates on state transition
@@ -543,11 +540,11 @@ export class VMController {
   }
 
   public requestProvisioningTransition(): void {
-    this.bridge.post("SET_PROVISIONING");
+    this.transport.post("SET_PROVISIONING");
   }
 
   public requestRunningTransition(): void {
-    this.bridge.post("SET_RUNNING");
+    this.transport.post("SET_RUNNING");
   }
 
   public async stop(): Promise<void> {
@@ -558,11 +555,10 @@ export class VMController {
     }
 
     this.timeouts.clearAll();
-    this.serialQueue.clear();
+    this.transport.terminate();
     this.orchestrator.reset();
     this.transitionState("stopped", "VMController.stop");
     this.lifecycle.transitionTerminalTo("detached", "VMController.stop");
-    this.bridge.terminate();
     this.onSerialOutput = null;
     this.onStateChange = null;
     this.saveStateResolver = null;
@@ -592,10 +588,10 @@ export class VMController {
     this.stopHealthMonitoring();
     Logger.info("VM", "Starting health monitoring...");
     this.healthMonitor = new TerminalHealthMonitor(
-      (type, payload) => this.bridge.post(type, payload),
+      (type, payload) => this.transport.post(type, payload),
       (reason) => this.orchestrator.triggerRecovery(reason || "health check failure"),
       () => Math.max(this.lastInputTimestamp, this.lastSerialOutputTimestamp),
-      this.hasSerial1Support
+      this.transport.hasSerial1Support()
     );
     this.healthMonitor.start();
   }
