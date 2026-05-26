@@ -10,6 +10,7 @@ import { TerminalHealthMonitor } from "./healthMonitor";
 import { UnifiedTimeoutManager } from "./timeoutManager";
 import { ProvisioningController } from "./provisioning";
 import { RecoveryOrchestrator, RecoveryStage } from "./recoveryOrchestrator";
+import { SerialWriteQueue } from "./serialQueue";
 
 export class VMController {
   private static activeInstance: VMController | null = null;
@@ -48,9 +49,8 @@ export class VMController {
   // Provisioning matching buffer
   private provisioningSearchBuffer = "";
 
-  // Programmatic throttled sequential queue
-  private programmaticQueue: string[] = [];
-  private isSendingProgrammatic = false;
+  // Sequential write queue
+  private serialQueue: SerialWriteQueue;
 
   // Initialization mutex
   private initPromise: Promise<void> | null = null;
@@ -61,13 +61,15 @@ export class VMController {
     this.lifecycle = new VMLifecycleManager();
     this.config = ResourceLimitsValidator.validate(config);
 
+    this.serialQueue = new SerialWriteQueue((type, payload) => this.bridge.post(type, payload));
+
     // Initialize unified timeout manager
     this.timeouts = new UnifiedTimeoutManager();
 
     // Initialize provisioning controller
     this.provisioning = new ProvisioningController(
       (state) => this.lifecycle.transitionProvisioningTo(state, "ProvisioningController"),
-      (data) => this.sendProgrammaticInput(data)
+      (port, data) => this.sendProgrammaticInput(port, data)
     );
 
     // Initialize recovery orchestrator
@@ -348,48 +350,42 @@ export class VMController {
 
   private async handleRecoveryAction(stage: RecoveryStage): Promise<boolean> {
     switch (stage) {
-      case RecoveryStage.SHELL_RECONNECT:
-        Logger.info("VM", "Recovery [Stage 1]: Sending carriage return to recover terminal...");
-        this.sendInput("\n");
-        return true;
-
-      case RecoveryStage.SERIAL_REBIND:
-        Logger.info("VM", "Recovery [Stage 2]: Re-triggering state changes listeners...");
-        if (this.onStateChange) {
-          this.onStateChange(this.lifecycle.getState().state);
-        }
-        return true;
-
-      case RecoveryStage.TERMINAL_RECOVERY:
-        Logger.info("VM", "Recovery [Stage 3]: Resetting visual prompt on screen...");
+      case RecoveryStage.TTY_REPAIR:
+        Logger.info("VM", "Recovery [Stage 1]: Attempting out-of-band TTY repair via serial1...");
         if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;33m[Recovery] Redrawing terminal prompt...\x1b[0m\r\n");
-          const promptPath = "~";
-          const symbol = "$";
-          this.onSerialOutput(`\r\n\x1b[1;32muser@linlearn\x1b[0m:\x1b[1;34m${promptPath}\x1b[0m${symbol} `);
+          this.onSerialOutput("\r\n\x1b[1;33m[Recovery] Repairing terminal settings...\x1b[0m\r\n");
         }
+        await this.sendProgrammaticInput(1, "RECOVER_TTY\n");
         return true;
 
-      case RecoveryStage.WORKER_RESTART:
-        Logger.info("VM", "Recovery [Stage 4]: Restarting worker processes...");
+      case RecoveryStage.SHELL_RESTART:
+        Logger.info("VM", "Recovery [Stage 2]: Restarting user shell process...");
         if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Worker unresponsive. Restarting worker adapter...\x1b[0m\r\n");
+          this.onSerialOutput("\r\n\x1b[1;33m[Recovery] Shell unresponsive. Restarting interactive session...\x1b[0m\r\n");
+        }
+        await this.sendProgrammaticInput(1, "RESTART_SHELL\n");
+        return true;
+
+      case RecoveryStage.SERIAL_RECONNECT:
+        Logger.info("VM", "Recovery [Stage 3]: Restarting serial connection worker bridge...");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Serial connection stalled. Reconnecting serial worker...\x1b[0m\r\n");
         }
         await this.recoverShell();
         return true;
 
       case RecoveryStage.VM_SOFT_REBOOT:
-        Logger.info("VM", "Recovery [Stage 5]: Performing soft restart...");
+        Logger.info("VM", "Recovery [Stage 4]: Performing VM soft reboot...");
         if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Stalled guest CPU. Triggering soft reboot...\x1b[0m\r\n");
+          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Guest CPU stalled. Rebooting VM...\x1b[0m\r\n");
         }
         this.bridge.post("RESTART");
         return true;
 
       case RecoveryStage.COLD_BOOT_FALLBACK:
-        Logger.info("VM", "Recovery [Stage 6]: Triggering cold boot fallback...");
+        Logger.info("VM", "Recovery [Stage 5]: Triggering cold boot fallback...");
         if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Recovery exhausted. Cleaning corrupted snapshot and cold booting...\x1b[0m\r\n");
+          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] All recovery exhausted. Cold booting guest VM...\x1b[0m\r\n");
         }
         this.savedState = null;
         this.wasRestoredFromSnapshot = false;
@@ -488,45 +484,13 @@ export class VMController {
     }
   }
 
-  public sendProgrammaticInput(data: string): void {
+  public sendProgrammaticInput(port: number, data: string): Promise<void> {
     const stateName = this.lifecycle.getState().state;
     if (stateName !== "running" && stateName !== "booting" && stateName !== "provisioning") {
       Logger.warn("VM", `Refusing programmatic input in non-interactive state: ${stateName}`);
-      return;
+      return Promise.resolve();
     }
-    this.programmaticQueue.push(data);
-    this.processProgrammaticQueue();
-  }
-
-  private processProgrammaticQueue(): void {
-    if (this.isSendingProgrammatic || this.programmaticQueue.length === 0) {
-      return;
-    }
-
-    this.isSendingProgrammatic = true;
-    const data = this.programmaticQueue.shift()!;
-    
-    const chunkSize = 64;
-    const delayMs = 15;
-    let offset = 0;
-
-    const sendNextChunk = () => {
-      if (!this.lifecycle.isAlive()) {
-        this.isSendingProgrammatic = false;
-        return;
-      }
-      if (offset >= data.length) {
-        this.isSendingProgrammatic = false;
-        this.processProgrammaticQueue();
-        return;
-      }
-      const chunk = data.substring(offset, offset + chunkSize);
-      offset += chunkSize;
-      this.bridge.post("INPUT", chunk);
-      setTimeout(sendNextChunk, delayMs);
-    };
-
-    sendNextChunk();
+    return this.serialQueue.enqueue(port, data);
   }
 
   public transitionState(
@@ -582,6 +546,7 @@ export class VMController {
     }
 
     this.timeouts.clearAll();
+    this.serialQueue.clear();
     this.orchestrator.reset();
     this.transitionState("stopped", "VMController.stop");
     this.lifecycle.transitionTerminalTo("detached", "VMController.stop");
@@ -616,7 +581,7 @@ export class VMController {
     Logger.info("VM", "Starting health monitoring...");
     this.healthMonitor = new TerminalHealthMonitor(
       (type, payload) => this.bridge.post(type, payload),
-      () => this.orchestrator.triggerRecovery("health check failure"),
+      (reason) => this.orchestrator.triggerRecovery(reason || "health check failure"),
       () => Math.max(this.lastInputTimestamp, this.lastSerialOutputTimestamp)
     );
     this.healthMonitor.start();

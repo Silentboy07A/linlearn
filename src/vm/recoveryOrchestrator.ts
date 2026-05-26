@@ -5,12 +5,11 @@ import { RecoveryState } from "./vmLifecycle";
 
 export enum RecoveryStage {
   NONE = 0,
-  SHELL_RECONNECT = 1,
-  SERIAL_REBIND = 2,
-  TERMINAL_RECOVERY = 3,
-  WORKER_RESTART = 4,
-  VM_SOFT_REBOOT = 5,
-  COLD_BOOT_FALLBACK = 6
+  TTY_REPAIR = 1,
+  SHELL_RESTART = 2,
+  SERIAL_RECONNECT = 3,
+  VM_SOFT_REBOOT = 4,
+  COLD_BOOT_FALLBACK = 5
 }
 
 export class RecoveryOrchestrator {
@@ -66,8 +65,8 @@ export class RecoveryOrchestrator {
     this.recoveryState = "recovering";
     this.onStateChange("recovering");
 
-    // Start escalation from Stage 1 (Shell reconnect)
-    this.stage = RecoveryStage.SHELL_RECONNECT;
+    // Start escalation from Stage 1 (TTY repair)
+    this.stage = RecoveryStage.TTY_REPAIR;
     this.executeCurrentStage();
   }
 
