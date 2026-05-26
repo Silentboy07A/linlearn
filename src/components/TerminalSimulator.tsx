@@ -99,6 +99,26 @@ async function computeHMAC(keyStr: string, dataStr: string): Promise<string> {
     .join("");
 }
 
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
 // Help dictionary for command metadata, difficulty levels, related commands, and flags
 const COMMAND_HELP_INFO: Record<string, {
   name: string;
@@ -340,10 +360,15 @@ export function TerminalSimulator({
   const bootTimeRef = useRef<number | null>(null);
   const lastCommandRef = useRef<string>("");
   const lastOutputRef = useRef<string>("");
+  const savedStateRef = useRef<ArrayBuffer | null>(null);
 
   const validationResolverRef = useRef<((val: boolean) => void) | null>(null);
   const validationBufferRef = useRef("");
   
+  const isCapturingBackupRef = useRef<boolean>(false);
+  const backupBufferRef = useRef("");
+  const backupResolverRef = useRef<((val: boolean) => void) | null>(null);
+
   const [completedVasmMissions, setCompletedVasmMissions] = useState<Record<string, boolean>>({});
   const [validatingMissions, setValidatingMissions] = useState<Record<string, boolean>>({});
   const isCapturingValidationRef = useRef<boolean>(false);
@@ -429,6 +454,54 @@ export function TerminalSimulator({
           resolve(null);
         }
       }, 6000);
+    });
+  };
+
+  const runV86Backup = (): Promise<string | null> => {
+    return new Promise((resolve) => {
+      const emulator = v86EmulatorRef.current;
+      if (!emulator) {
+        resolve(null);
+        return;
+      }
+
+      console.log("[VM DEBUG] Triggering silent filesystem backup inside guest...");
+      isCapturingBackupRef.current = true;
+      backupBufferRef.current = "";
+      backupResolverRef.current = (done) => {
+        if (done) {
+          const output = backupBufferRef.current;
+          const startIndex = output.indexOf("BACKUP_START");
+          const endIndex = output.indexOf("BACKUP_END");
+          if (startIndex !== -1 && endIndex !== -1) {
+            const b64Data = output.substring(startIndex + "BACKUP_START".length, endIndex)
+              .replace(/\r?\n/g, "")
+              .trim();
+            console.log("[VM DEBUG] Filesystem backup captured successfully. Base64 length:", b64Data.length);
+            resolve(b64Data);
+          } else {
+            console.warn("[VM DEBUG] BACKUP delimiters not found in output:", output);
+            resolve(null);
+          }
+        } else {
+          resolve(null);
+        }
+      };
+
+      // Send silent backup command sequence: stty -echo, print delimiters, tar + base64, restore stty echo
+      emulator.sendInput("\nstty -echo\necho \"BACKUP_START\"\ntar -czf - -C /home/user . 2>/dev/null | base64\necho \"BACKUP_END\"\nstty echo\n");
+
+      // 10 second timeout guard
+      setTimeout(() => {
+        if (backupResolverRef.current) {
+          isCapturingBackupRef.current = false;
+          backupResolverRef.current = null;
+          // Force-send stty echo to recover terminal in guest
+          emulator.sendInput("\nstty echo\n");
+          console.warn("[VM DEBUG] Filesystem backup request timed out after 10s.");
+          resolve(null);
+        }
+      }, 10000);
     });
   };
   
@@ -816,6 +889,18 @@ export function TerminalSimulator({
             return;
           }
 
+          // Intercept output during silent backup
+          if (isCapturingBackupRef.current && backupResolverRef.current) {
+            backupBufferRef.current += char;
+            if (backupBufferRef.current.includes("BACKUP_END")) {
+              const resolve = backupResolverRef.current;
+              backupResolverRef.current = null;
+              isCapturingBackupRef.current = false;
+              resolve(true); // Signal backup done
+            }
+            return;
+          }
+
           // Standard terminal bridge (unless we are provisioning silently)
           if (!isProvisioning) {
             serialBuffer += char;
@@ -840,8 +925,18 @@ export function TerminalSimulator({
               // Clear screen first so root setup commands are totally hidden
               term.write("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
               
+              let restoreCmd = "";
+              if (savedStateRef.current) {
+                try {
+                  const backupB64 = arrayBufferToBase64(savedStateRef.current);
+                  restoreCmd = `cat << 'EOF' > /tmp/fs.tar.gz.b64\n${backupB64}\nEOF\nbase64 -d /tmp/fs.tar.gz.b64 | tar -xzf - -C /home/user 2>/dev/null\nrm -f /tmp/fs.tar.gz.b64\n`;
+                } catch (e) {
+                  console.error("Failed to generate restore command from backup:", e);
+                }
+              }
+
               // Send silent provisioning string with permissions, echo recovery, self-healing loop, and sentinel
-              emulator.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\ncat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\$(pwd | sed "s|^\$HOME|~|")\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
+              emulator.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\n${restoreCmd}cat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
             } else if (hasUserSentinel) {
               // User prompt sentinel matched: provisioning successfully complete!
               // Delegate transition to worker as single source of truth
@@ -952,6 +1047,7 @@ export function TerminalSimulator({
           try {
             // 1. Fetch saved state snapshot
             const savedState = await persistenceManager.loadState("default_session");
+            savedStateRef.current = savedState;
             if (!isMounted) {
               term.dispose();
               if (rafId !== null) cancelAnimationFrame(rafId);
@@ -1036,12 +1132,15 @@ export function TerminalSimulator({
                 if (v86EmulatorRef.current) {
                   setIsPersistenceSaving(true);
                   try {
-                    const rawSnapshot = await v86EmulatorRef.current.saveState();
-                    setHasSavedState(true);
-                    return rawSnapshot;
+                    const b64Backup = await runV86Backup();
+                    if (b64Backup) {
+                      const rawSnapshot = base64ToArrayBuffer(b64Backup);
+                      savedStateRef.current = rawSnapshot;
+                      setHasSavedState(true);
+                      return rawSnapshot;
+                    }
                   } catch (e) {
-                    console.error("Autosave snapshot failed:", e);
-                    return null;
+                    console.error("Autosave backup failed:", e);
                   } finally {
                     setIsPersistenceSaving(false);
                   }

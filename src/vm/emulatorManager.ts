@@ -31,6 +31,12 @@ export class EmulatorManager {
 
   private wasRestoredFromSnapshot = false;
 
+  private lastInputTimestamp = Date.now();
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  private healthCheckTimeout: NodeJS.Timeout | null = null;
+  private isCheckingHealth = false;
+  private healthPingMatched = false;
+
   // ─── Initialization mutex ─────────────────────────────────────────────────
   private initPromise: Promise<void> | null = null;
   private initAbortController: AbortController | null = null;
@@ -84,10 +90,8 @@ export class EmulatorManager {
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
-    // Start provisioning watchdog if cold boot
-    if (!initialState) {
-      this.startWatchdog();
-    }
+    // Start provisioning watchdog
+    this.startWatchdog();
 
     return new Promise((resolve, reject) => {
       if (abortSignal.aborted) {
@@ -111,20 +115,8 @@ export class EmulatorManager {
 
         switch (type) {
           case "INIT_SUCCESS":
-            if (initialState) {
-              // Snapshot restore: loading -> running (valid in updated FSM)
-              const snapshotMeta: VMSnapshotMetadata = {
-                hasSnapshot: true,
-                snapshotSizeBytes: initialState.byteLength,
-              };
-              this.transitionState("running", "INIT_SUCCESS (snapshot restore)", false, "INIT_SUCCESS", snapshotMeta);
-              clearTimeout(timeout);
-              if (!resolved) {
-                resolved = true;
-                resolve();
-              }
-            }
-            // For cold boot, don't transition here — worker will send STATE_CHANGED("booting")
+            // For both cold boot and snapshot-recovery (which is now also a cold boot with fs restore),
+            // don't transition here — worker will send STATE_CHANGED("booting")
             break;
 
           case "INIT_FAILURE":
@@ -151,6 +143,13 @@ export class EmulatorManager {
             if (this.serialHistory.length > 20000) {
               this.serialHistory = this.serialHistory.substring(this.serialHistory.length - 20000);
             }
+
+            // Check health ping match
+            if (this.isCheckingHealth && this.serialHistory.includes("# HEALTH_PING")) {
+              this.healthPingMatched = true;
+              this.serialHistory = this.serialHistory.replace("# HEALTH_PING", "# HEALTH_OK");
+            }
+
             if (this.onSerialOutput) {
               this.onSerialOutput(char);
             }
@@ -211,7 +210,7 @@ export class EmulatorManager {
         memory_size: this.config.memoryLimitBytes,
         vga_memory_size: this.config.vgaMemoryLimitBytes,
         version: Date.now().toString(),
-        initial_state: initialState,
+        initial_state: undefined, // Always force cold boot for guest stability
       });
     });
   }
@@ -269,6 +268,7 @@ export class EmulatorManager {
       Logger.warn("VM", "Refusing to send user keyboard input: VM is not alive");
       return;
     }
+    this.lastInputTimestamp = Date.now();
     Logger.info("VM", `sendInput: routing character sequence to bridge: ${JSON.stringify(data)}`);
     this.bridge.post("INPUT", data);
   }
@@ -328,6 +328,11 @@ export class EmulatorManager {
       this.startProvisioningWatchdog();
     } else if (newState === "running" || newState === "stopped" || newState === "error") {
       this.stopWatchdog();
+      if (newState === "running") {
+        this.startHealthMonitoring();
+      } else {
+        this.stopHealthMonitoring();
+      }
     }
 
     return true;
@@ -426,5 +431,95 @@ export class EmulatorManager {
 
   public clearWasRestored(): void {
     this.wasRestoredFromSnapshot = false;
+  }
+
+  private startHealthMonitoring(): void {
+    this.stopHealthMonitoring();
+    Logger.info("VM", "Starting periodic shell health monitoring (every 20s)...");
+    this.healthCheckInterval = setInterval(() => {
+      this.checkShellHealth();
+    }, 20000);
+  }
+
+  private stopHealthMonitoring(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+    if (this.healthCheckTimeout) {
+      clearTimeout(this.healthCheckTimeout);
+      this.healthCheckTimeout = null;
+    }
+    this.isCheckingHealth = false;
+  }
+
+  private async checkShellHealth(): Promise<void> {
+    if (this.lifecycle.getState().state !== "running" || this.isCheckingHealth) {
+      return;
+    }
+
+    // If user input occurred in the last 15s, assume shell is healthy
+    if (Date.now() - this.lastInputTimestamp < 15000) {
+      return;
+    }
+
+    this.isCheckingHealth = true;
+    this.healthPingMatched = false;
+    Logger.debug("VM", "[HEALTH] Sending silent health ping to check tty activity...");
+
+    // Send silent comment ping
+    this.sendProgrammaticInput("\n# HEALTH_PING\n");
+
+    this.healthCheckTimeout = setTimeout(async () => {
+      this.healthCheckTimeout = null;
+      if (!this.healthPingMatched) {
+        Logger.warn("VM", "[HEALTH] Health ping did NOT echo back! Shell is unresponsive. Initiating recovery...");
+        await this.recoverShell();
+      } else {
+        Logger.debug("VM", "[HEALTH] Health ping echoed back. Shell is healthy.");
+        this.isCheckingHealth = false;
+      }
+    }, 3000);
+  }
+
+  public async recoverShell(): Promise<void> {
+    Logger.warn("VM", "[HEALTH] Attempting soft recovery (Ctrl+C, Ctrl+D, Enter)...");
+    this.sendProgrammaticInput("\x03\x04\n");
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    if (this.healthPingMatched) {
+      Logger.info("VM", "[HEALTH] Soft recovery succeeded.");
+      this.isCheckingHealth = false;
+      return;
+    }
+
+    Logger.warn("VM", "[HEALTH] Soft recovery failed. Trying hard tty environment recovery...");
+    this.sendProgrammaticInput("\nstty echo\nreset\nchown user /dev/ttyS0 2>/dev/null || true\nsu - user\n");
+
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    if (this.healthPingMatched) {
+      Logger.info("VM", "[HEALTH] Hard tty environment recovery succeeded.");
+      this.isCheckingHealth = false;
+      return;
+    }
+
+    Logger.error("VM", "[HEALTH] Shell remains unresponsive. Initiating VM hard reboot fallback...");
+    this.isCheckingHealth = false;
+    
+    // Call stop and start to perform a full cold boot & restore files from backup
+    const activeOnSerial = this.onSerialOutput;
+    const activeOnState = this.onStateChange;
+    if (activeOnSerial && activeOnState) {
+      if (this.onSerialOutput) {
+        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Guest shell is completely frozen. Rebooting virtual machine...\x1b[0m\r\n");
+      }
+      await this.stop();
+      // Wait a moment before restarting
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Re-initialize using start (will pick up latest IndexedDB backup)
+      await this.start(window.location.origin, activeOnSerial, activeOnState, new ArrayBuffer(0) /* passes truthy to indicate restore welcome is needed */);
+    }
   }
 }
