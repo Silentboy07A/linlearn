@@ -350,6 +350,7 @@ export class VMController {
   }
 
   private async handleRecoveryAction(stage: RecoveryStage): Promise<boolean> {
+    this.transport.getGenerationManager().recordRecoveryEscalation(RecoveryStage[stage]);
     switch (stage) {
       case RecoveryStage.TTY_REPAIR:
         if (!this.transport.hasSerial1Support()) {
