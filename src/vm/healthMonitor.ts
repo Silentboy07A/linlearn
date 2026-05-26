@@ -10,6 +10,7 @@ export class TerminalHealthMonitor {
   private postMessage: (type: string, payload?: unknown) => void;
   private getLastActivityTime: () => number;
   private startedAt: number = Date.now();
+  private serial1Buffer = "";
 
   constructor(
     postMessage: (type: string, payload?: unknown) => void,
@@ -21,9 +22,6 @@ export class TerminalHealthMonitor {
     this.getLastActivityTime = getLastActivityTime;
   }
 
-  /**
-   * Start periodic health checks (heartbeat)
-   */
   public start(): void {
     this.stop();
     Logger.info("VM", "Starting periodic shell health monitoring (every 20s)...");
@@ -36,9 +34,6 @@ export class TerminalHealthMonitor {
     }, 20000); // Check every 20 seconds
   }
 
-  /**
-   * Stop health monitoring
-   */
   public stop(): void {
     if (this.checkInterval) {
       clearInterval(this.checkInterval);
@@ -50,63 +45,74 @@ export class TerminalHealthMonitor {
     }
   }
 
-  /**
-   * Send heartbeat check to worker
-   */
   private checkHeartbeat(): void {
-    // Skip heartbeat checks if we had recent keyboard input or serial output activity
     const lastActivity = this.getLastActivityTime();
     const timeSinceLastActivity = Date.now() - lastActivity;
+    
+    // Skip health check if there has been very recent user/console activity
     if (timeSinceLastActivity < 15000) {
       Logger.debug("VM", `[HEALTH] Skipping heartbeat check: recent VM activity detected (${Math.round(timeSinceLastActivity / 1000)}s ago).`);
       this.lastHeartbeatTime = Date.now();
       return;
     }
 
-    Logger.debug("VM", "Sending worker heartbeat PING...");
-    
-    // 3-second timeout for the PONG reply
-    this.pingTimeout = setTimeout(() => {
-      this.pingTimeout = null;
-      Logger.error("VM", "Worker heartbeat PING timed out! Worker or VM is unresponsive.");
-      this.handleUnhealthy();
-    }, 3000);
+    Logger.debug("VM", "Sending serial1 guest PING heartbeat...");
+    this.serial1Buffer = "";
 
-    this.postMessage("PING");
+    // Set 4-second timeout for the serial1 PONG. If it fails, fall back to worker CPU ping.
+    this.pingTimeout = setTimeout(() => {
+      Logger.warn("VM", "[HEALTH] serial1 PONG timed out. Falling back to worker CPU status check...");
+      
+      // Fallback: ping worker to see if worker process and VM CPU are still responsive
+      this.pingTimeout = setTimeout(() => {
+        this.pingTimeout = null;
+        Logger.error("VM", "[HEALTH] Worker CPU ping timed out! Guest VM is unresponsive.");
+        this.handleUnhealthy();
+      }, 3000);
+
+      this.postMessage("PING");
+    }, 4000);
+
+    // Send PING to the invisible serial1 port
+    this.postMessage("INPUT1", "PING\n");
   }
 
-  /**
-   * Handle the PONG response from the worker
-   */
+  public handleSerial1Byte(byte: number): void {
+    this.serial1Buffer += String.fromCharCode(byte);
+    if (this.serial1Buffer.includes("PONG")) {
+      Logger.debug("VM", "[HEALTH] Guest shell response verified on serial1 (PONG).");
+      this.serial1Buffer = "";
+      if (this.pingTimeout) {
+        clearTimeout(this.pingTimeout);
+        this.pingTimeout = null;
+      }
+      this.lastHeartbeatTime = Date.now();
+      this.isHealthy = true;
+    }
+  }
+
   public handlePong(cpuRunning: boolean): void {
     if (this.pingTimeout) {
       clearTimeout(this.pingTimeout);
       this.pingTimeout = null;
     }
     this.lastHeartbeatTime = Date.now();
-    Logger.debug("VM", `Worker heartbeat PONG received. CPU running: ${cpuRunning}`);
+    Logger.debug("VM", `[HEALTH] Fallback CPU ping received. CPU running: ${cpuRunning}`);
 
     if (!cpuRunning) {
-      Logger.warn("VM", "Worker is responsive but guest CPU is halted.");
+      Logger.warn("VM", "[HEALTH] Guest CPU is halted.");
       this.handleUnhealthy();
     } else {
       this.isHealthy = true;
     }
   }
 
-  /**
-   * Handle communication/serial error reports from interactive TTY
-   */
   public reportSerialError(err: Error): void {
-    Logger.error("VM", `Serial adapter communication error: ${err.message}`);
+    Logger.error("VM", `[HEALTH] Serial adapter communication error: ${err.message}`);
     this.handleUnhealthy();
   }
 
-  /**
-   * Mark session as unhealthy and fire recovery callback
-   */
   private handleUnhealthy(): void {
-    // 30-second cooldown/exemption period after boot or snapshot restore
     const timeSinceStart = Date.now() - this.startedAt;
     if (timeSinceStart < 30000) {
       Logger.info("VM", `[HEALTH] Ignoring unhealthy signal: within grace period (${Math.round(timeSinceStart / 1000)}s since start).`);
@@ -115,7 +121,7 @@ export class TerminalHealthMonitor {
 
     if (this.isHealthy) {
       this.isHealthy = false;
-      Logger.warn("VM", "Terminal session detected as unhealthy. Triggering recovery callback...");
+      Logger.warn("VM", "[HEALTH] Terminal session detected as unhealthy. Triggering recovery callback...");
       this.onUnhealthy();
     }
   }

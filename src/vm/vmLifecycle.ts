@@ -2,12 +2,28 @@
 import { VMState, VMStateName, VMTransitionTrace, VMSnapshotMetadata } from "../lib/types";
 import { Logger } from "../lib/logger";
 
+export type VMRuntimeState = VMStateName;
+export type ProvisioningState = "idle" | "running" | "completed" | "failed" | "recovering";
+export type TerminalState = "detached" | "attached" | "interactive" | "recovering";
+export type RecoveryState = "healthy" | "recovering" | "degraded" | "crashloop";
+
+export interface VMFullState {
+  runtime: VMRuntimeState;
+  provisioning: ProvisioningState;
+  terminal: TerminalState;
+  recovery: RecoveryState;
+}
+
 export class VMLifecycleManager {
   private currentState: VMState = {
     state: "idle",
     lastActiveTimestamp: Date.now(),
     ramUsageBytes: 0,
   };
+
+  private provisioningState: ProvisioningState = "idle";
+  private terminalState: TerminalState = "detached";
+  private recoveryState: RecoveryState = "healthy";
 
   private bootStartTimestamp: number | null = null;
   private lastTransitionTimestamp: number = 0;
@@ -16,17 +32,6 @@ export class VMLifecycleManager {
   private static readonly DEBOUNCE_MS = 50;
   private static readonly MAX_HISTORY = 50;
 
-  /**
-   * Corrected FSM transition map.
-   *
-   * Key additions over the previous strict version:
-   *  - loading -> running   : instant snapshot restore path (INIT_SUCCESS with initialState)
-   *  - loading -> booting   : normal cold-boot path (already existed)
-   *  - error   -> booting   : retry after failure
-   *  - stopped -> booting   : direct restart without going back to idle
-   *
-   * All states can still reach "stopped" or "error" as emergency exits.
-   */
   private static readonly VALID_TRANSITIONS: Record<VMStateName, Set<VMStateName>> = {
     idle:         new Set<VMStateName>(["loading", "stopped"]),
     loading:      new Set<VMStateName>(["booting", "running", "error", "stopped"]),
@@ -38,17 +43,28 @@ export class VMLifecycleManager {
     error:        new Set<VMStateName>(["idle", "loading", "booting", "stopped"]),
   };
 
-  /**
-   * Attempt a validated lifecycle transition.
-   * Returns true if the transition succeeded, false if it was rejected.
-   * Never throws — callers should handle false gracefully.
-   *
-   * @param newState       Target state
-   * @param ramBytes       Optional RAM usage update
-   * @param source         Human-readable source for structured logging
-   * @param workerEvent    Optional originating worker message type
-   * @param snapshot       Optional snapshot metadata for trace
-   */
+  private static readonly VALID_PROVISIONING_TRANSITIONS: Record<ProvisioningState, Set<ProvisioningState>> = {
+    idle:       new Set<ProvisioningState>(["running", "failed"]),
+    running:    new Set<ProvisioningState>(["completed", "failed", "recovering"]),
+    completed:  new Set<ProvisioningState>(["idle"]),
+    failed:     new Set<ProvisioningState>(["idle", "running", "recovering"]),
+    recovering: new Set<ProvisioningState>(["running", "completed", "failed"])
+  };
+
+  private static readonly VALID_TERMINAL_TRANSITIONS: Record<TerminalState, Set<TerminalState>> = {
+    detached:    new Set<TerminalState>(["attached", "recovering"]),
+    attached:    new Set<TerminalState>(["interactive", "detached", "recovering"]),
+    interactive: new Set<TerminalState>(["detached", "recovering"]),
+    recovering:  new Set<TerminalState>(["attached", "interactive", "detached"])
+  };
+
+  private static readonly VALID_RECOVERY_TRANSITIONS: Record<RecoveryState, Set<RecoveryState>> = {
+    healthy:    new Set<RecoveryState>(["recovering", "degraded"]),
+    recovering: new Set<RecoveryState>(["healthy", "degraded", "crashloop"]),
+    degraded:   new Set<RecoveryState>(["healthy", "recovering", "crashloop"]),
+    crashloop:  new Set<RecoveryState>(["healthy"])
+  };
+
   public transitionTo(
     newState: VMStateName,
     ramBytes?: number,
@@ -58,12 +74,10 @@ export class VMLifecycleManager {
   ): boolean {
     const oldState = this.currentState.state;
 
-    // Silently ignore same-state no-ops (prevents log spam)
     if (oldState === newState) return true;
 
     const allowed = VMLifecycleManager.VALID_TRANSITIONS[oldState]?.has(newState) ?? false;
 
-    // Record into rolling trace history (capped at MAX_HISTORY)
     const trace: VMTransitionTrace = {
       timestamp: Date.now(),
       from: oldState,
@@ -78,11 +92,9 @@ export class VMLifecycleManager {
       this.transitionHistory.shift();
     }
 
-    // Structured transition log
     Logger.vmTransition(oldState, newState, allowed, source, workerEvent);
 
     if (!allowed) {
-      // Warn, but do NOT throw — let the caller decide how to handle the rejection
       Logger.warn(
         "VM",
         `[FSM REJECT] ${oldState} -> ${newState} is not a valid transition. ` +
@@ -92,7 +104,6 @@ export class VMLifecycleManager {
       return false;
     }
 
-    // Debounce: warn on suspiciously rapid transitions but still allow them
     const now = Date.now();
     if (now - this.lastTransitionTimestamp < VMLifecycleManager.DEBOUNCE_MS) {
       Logger.debug(
@@ -109,7 +120,6 @@ export class VMLifecycleManager {
       this.currentState.ramUsageBytes = ramBytes;
     }
 
-    // Boot timing
     if (newState === "loading") {
       this.bootStartTimestamp = now;
     } else if (newState === "running" && this.bootStartTimestamp) {
@@ -118,6 +128,64 @@ export class VMLifecycleManager {
     }
 
     return true;
+  }
+
+  public transitionRuntimeTo(newState: VMRuntimeState, source?: string): boolean {
+    return this.transitionTo(newState, undefined, source);
+  }
+
+  public transitionProvisioningTo(newState: ProvisioningState, source?: string): boolean {
+    const oldState = this.provisioningState;
+    if (oldState === newState) return true;
+
+    const allowed = VMLifecycleManager.VALID_PROVISIONING_TRANSITIONS[oldState]?.has(newState) ?? false;
+    if (!allowed) {
+      Logger.warn("VM", `[FSM REJECT] Provisioning substate transition: ${oldState} -> ${newState} rejected. (source: ${source})`);
+      return false;
+    }
+
+    Logger.info("VM", `[FSM transition] Provisioning substate: ${oldState} -> ${newState} (source: ${source})`);
+    this.provisioningState = newState;
+    return true;
+  }
+
+  public transitionTerminalTo(newState: TerminalState, source?: string): boolean {
+    const oldState = this.terminalState;
+    if (oldState === newState) return true;
+
+    const allowed = VMLifecycleManager.VALID_TERMINAL_TRANSITIONS[oldState]?.has(newState) ?? false;
+    if (!allowed) {
+      Logger.warn("VM", `[FSM REJECT] Terminal substate transition: ${oldState} -> ${newState} rejected. (source: ${source})`);
+      return false;
+    }
+
+    Logger.info("VM", `[FSM transition] Terminal substate: ${oldState} -> ${newState} (source: ${source})`);
+    this.terminalState = newState;
+    return true;
+  }
+
+  public transitionRecoveryTo(newState: RecoveryState, source?: string): boolean {
+    const oldState = this.recoveryState;
+    if (oldState === newState) return true;
+
+    const allowed = VMLifecycleManager.VALID_RECOVERY_TRANSITIONS[oldState]?.has(newState) ?? false;
+    if (!allowed) {
+      Logger.warn("VM", `[FSM REJECT] Recovery substate transition: ${oldState} -> ${newState} rejected. (source: ${source})`);
+      return false;
+    }
+
+    Logger.info("VM", `[FSM transition] Recovery substate: ${oldState} -> ${newState} (source: ${source})`);
+    this.recoveryState = newState;
+    return true;
+  }
+
+  public getFullState(): VMFullState {
+    return {
+      runtime: this.currentState.state,
+      provisioning: this.provisioningState,
+      terminal: this.terminalState,
+      recovery: this.recoveryState
+    };
   }
 
   public getState(): VMState {
@@ -136,12 +204,10 @@ export class VMLifecycleManager {
     );
   }
 
-  /** True only while actively executing guest code */
   public isRunning(): boolean {
     return this.currentState.state === "running";
   }
 
-  /** True while any boot/provision phase is active */
   public isBooting(): boolean {
     return (
       this.currentState.state === "loading" ||

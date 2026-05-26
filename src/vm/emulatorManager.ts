@@ -7,6 +7,9 @@ import { Logger } from "../lib/logger";
 import { VMInitializationError } from "../lib/errors";
 import { GUEST_INSPECT_SCRIPT } from "./inspect";
 import { TerminalHealthMonitor } from "./healthMonitor";
+import { UnifiedTimeoutManager } from "./timeoutManager";
+import { ProvisioningController } from "./provisioning";
+import { RecoveryOrchestrator, RecoveryStage } from "./recoveryOrchestrator";
 
 export class VMController {
   private static activeInstance: VMController | null = null;
@@ -27,7 +30,6 @@ export class VMController {
 
   private saveStateResolver: ((buffer: ArrayBuffer) => void) | null = null;
   private saveStateRejecter: ((err: Error) => void) | null = null;
-  private watchdogTimer: NodeJS.Timeout | null = null;
   private serialHistory: string = "";
 
   private wasRestoredFromSnapshot = false;
@@ -37,19 +39,20 @@ export class VMController {
   private lastSerialOutputTimestamp = Date.now();
   private lastRestoreTimestamp = 0;
   private healthMonitor: TerminalHealthMonitor | null = null;
-  private rebootAttempts: number[] = [];
 
-  // Centralized provisioning state machine and buffer
-  private provisioningState: "idle" | "in-progress" | "complete" = "idle";
-  private isProvisioning = false;
-  private isProvisioned = false;
+  // New modules
+  private timeouts: UnifiedTimeoutManager;
+  private provisioning: ProvisioningController;
+  private orchestrator: RecoveryOrchestrator;
+
+  // Provisioning matching buffer
   private provisioningSearchBuffer = "";
 
   // Programmatic throttled sequential queue
   private programmaticQueue: string[] = [];
   private isSendingProgrammatic = false;
 
-  // ─── Initialization mutex ─────────────────────────────────────────────────
+  // Initialization mutex
   private initPromise: Promise<void> | null = null;
   private initAbortController: AbortController | null = null;
 
@@ -57,6 +60,22 @@ export class VMController {
     this.bridge = new WorkerBridge();
     this.lifecycle = new VMLifecycleManager();
     this.config = ResourceLimitsValidator.validate(config);
+
+    // Initialize unified timeout manager
+    this.timeouts = new UnifiedTimeoutManager();
+
+    // Initialize provisioning controller
+    this.provisioning = new ProvisioningController(
+      (state) => this.lifecycle.transitionProvisioningTo(state, "ProvisioningController"),
+      (data) => this.sendProgrammaticInput(data)
+    );
+
+    // Initialize recovery orchestrator
+    this.orchestrator = new RecoveryOrchestrator(
+      this.timeouts,
+      (stage) => this.handleRecoveryAction(stage),
+      (state) => this.lifecycle.transitionRecoveryTo(state, "RecoveryOrchestrator")
+    );
   }
 
   public async start(
@@ -106,7 +125,7 @@ export class VMController {
         this.lastRestoreTimestamp = Date.now();
         Logger.info("VM", `Valid snapshot found (gzip magic 0x1F 0x8B): size ${initialState.byteLength} bytes.`);
       } else {
-        Logger.warn("VM", "Invalid snapshot magic bytes (expected gzip 0x1F 0x8B). Discarding corrupted state.");
+        Logger.warn("VM", "Invalid snapshot magic bytes (expected gzip 0x1F 0x8B). Discarding corrupted state safely.");
         this.wasRestoredFromSnapshot = false;
         this.savedState = null;
       }
@@ -116,17 +135,27 @@ export class VMController {
       Logger.info("VM", "No snapshot found or empty snapshot. Clean cold boot.");
     }
 
-    this.isProvisioned = false;
-    this.isProvisioning = false;
-    this.provisioningState = "idle";
+    this.provisioning.reset();
     this.provisioningSearchBuffer = "";
 
-    this.lifecycle.transitionTo("loading", this.config.memoryLimitBytes, "VMController.start");
+    this.transitionState("loading", "VMController.start");
+    this.lifecycle.transitionTerminalTo("detached", "VMController.start");
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
-    // Start boot watchdog
-    this.startWatchdog();
+    // Start boot watchdog timeout
+    this.timeouts.register("boot_watchdog", this.config.timeoutMs, () => {
+      const state = this.lifecycle.getState().state;
+      if (state === "loading" || state === "booting") {
+        if (Date.now() - this.lastSerialOutputTimestamp < 15000) {
+          Logger.info("VM", "Boot progress active (serial output received). Extending boot timeout.");
+          this.timeouts.extend("boot_watchdog", 15000);
+          return;
+        }
+        Logger.warn("VM", `Boot watchdog triggered. Stalled in state: ${state}`);
+        this.orchestrator.triggerRecovery("boot timeout exceeded");
+      }
+    });
 
     return new Promise((resolve, reject) => {
       if (abortSignal.aborted) {
@@ -136,25 +165,15 @@ export class VMController {
 
       let resolved = false;
 
-      const timeout = setTimeout(() => {
-        if (!resolved) {
-          this.transitionState("error", "boot timeout");
-          this.bridge.terminate();
-          this.stopWatchdog();
-          reject(new VMInitializationError(`Boot timeout exceeded: ${this.config.timeoutMs}ms`));
-        }
-      }, this.config.timeoutMs);
-
       this.bridge.initialize(workerUrl, (type, payload) => {
         if (abortSignal.aborted) return;
 
         switch (type) {
           case "INIT_SUCCESS":
-            // For both cold boot and snapshot-recovery, don't transition here — worker will send STATE_CHANGED("booting")
             break;
 
           case "INIT_FAILURE":
-            clearTimeout(timeout);
+            this.timeouts.cancel("boot_watchdog");
             this.transitionState("error", "INIT_FAILURE");
             if (!resolved) {
               resolved = true;
@@ -164,7 +183,6 @@ export class VMController {
 
           case "SERIAL_OUT":
             if (this.lifecycle.getState().state === "booting") {
-              clearTimeout(timeout);
               if (!resolved) {
                 resolved = true;
                 resolve();
@@ -176,18 +194,20 @@ export class VMController {
               this.serialHistory = this.serialHistory.substring(this.serialHistory.length - 20000);
             }
 
-            // Track last serial output timestamp for watchdog activity checks
             this.lastSerialOutputTimestamp = Date.now();
 
-            // Centralized prompt matching and provisioning triggers
+            // Match prompt and trigger provisioning
             this.handleSerialLifecycle(char);
 
-            // Refresh provisioning watchdog if provisioning is active
-            this.refreshProvisioningWatchdog();
-
-            // Print character to UI terminal (hide outputs printed during silent provisioning)
-            if (this.onSerialOutput && !this.isProvisioning) {
+            // Print character to UI terminal (hide outputs during silent provisioning)
+            if (this.onSerialOutput && this.provisioning.getState() !== "running") {
               this.onSerialOutput(char);
+            }
+            break;
+
+          case "SERIAL1_OUT":
+            if (this.healthMonitor) {
+              this.healthMonitor.handleSerial1Byte(payload as number);
             }
             break;
 
@@ -253,13 +273,13 @@ export class VMController {
         memory_size: this.config.memoryLimitBytes,
         vga_memory_size: this.config.vgaMemoryLimitBytes,
         version: Date.now().toString(),
-        initial_state: undefined, // Always force cold boot for guest stability
+        initial_state: undefined, // Force cold boot, restore files via provisioning
       });
     });
   }
 
   private handleSerialLifecycle(char: string): void {
-    if (this.provisioningState === "complete") return;
+    if (this.provisioning.getState() === "completed") return;
 
     this.provisioningSearchBuffer += char;
     if (this.provisioningSearchBuffer.length > 256) {
@@ -271,12 +291,12 @@ export class VMController {
                           this.provisioningSearchBuffer.endsWith("~# ");
     const hasUserSentinel = this.provisioningSearchBuffer.includes("PROVISIONING_COMPLETE");
 
-    if (hasRootPrompt && this.provisioningState === "idle") {
-      this.provisioningState = "in-progress";
-      this.isProvisioning = true;
-      this.requestProvisioningTransition();
+    if (hasRootPrompt && this.provisioning.getState() === "idle") {
+      this.timeouts.cancel("boot_watchdog");
+      this.transitionState("provisioning", "handleSerialLifecycle");
+      this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
 
-      Logger.info("VM", "[PROVISIONING] Root shell prompt detected in guest. Initiating provisioning sequence.");
+      Logger.info("VM", "[PROVISIONING] Root prompt detected. Starting environment provisioning...");
 
       if (this.onSerialOutput) {
         this.onSerialOutput("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
@@ -292,16 +312,26 @@ export class VMController {
         }
       }
 
-      // Send silent provisioning commands sequentially and throttled to prevent UART overflows
-      this.sendProgrammaticInput(`stty -echo\nhostname linlearn\nmkdir -p /home/user/Projects /home/user/.config /home/user/workspace\nadduser -D -h /home/user -s /bin/sh user 2>/dev/null || true\n${restoreCmd}cat << 'EOF' > /home/user/.profile\nexport HOME=/home/user\nexport PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\\\$ '\ncd /home/user\nstty echo\necho "PROVISIONING_COMPLETE"\nEOF\ncat << 'EOF' > /usr/bin/linlearn-inspect\n${GUEST_INSPECT_SCRIPT}\nEOF\nchmod +x /usr/bin/linlearn-inspect\nchown -R user:user /home/user\nchown user /dev/ttyS0\nexec sh -c 'while true; do chown user /dev/ttyS0; su - user; done'\n`);
-    } else if (hasUserSentinel && this.provisioningState === "in-progress") {
-      this.provisioningSearchBuffer = "";
-      this.isProvisioning = false;
-      this.isProvisioned = true;
-      this.provisioningState = "complete";
-      this.requestRunningTransition();
+      // Provisioning timeout guard: 45 seconds to finish provisioning
+      this.timeouts.register("provisioning_watchdog", 45000, () => {
+        if (this.provisioning.getState() === "running") {
+          Logger.warn("VM", "Provisioning watchdog triggered. Provisioning stalled.");
+          this.provisioning.handleFailure();
+          this.orchestrator.triggerRecovery("provisioning timeout exceeded");
+        }
+      });
 
-      Logger.info("VM", "[PROVISIONING] Sentinel matched. Guest user environment provisioned.");
+      this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT);
+
+    } else if (hasUserSentinel && this.provisioning.getState() === "running") {
+      this.timeouts.cancel("provisioning_watchdog");
+      this.provisioningSearchBuffer = "";
+
+      this.provisioning.handleProvisioningComplete();
+      this.transitionState("running", "handleSerialLifecycle");
+      this.lifecycle.transitionTerminalTo("interactive", "handleSerialLifecycle");
+
+      Logger.info("VM", "[PROVISIONING] Complete. Guest VM shell running.");
 
       if (this.onSerialOutput) {
         this.onSerialOutput("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
@@ -309,6 +339,68 @@ export class VMController {
         this.onSerialOutput(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
         this.onSerialOutput("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
       }
+
+      // Tell orchestrator we are healthy and start health monitor
+      this.orchestrator.reportHealthy();
+      this.startHealthMonitoring();
+    }
+  }
+
+  private async handleRecoveryAction(stage: RecoveryStage): Promise<boolean> {
+    switch (stage) {
+      case RecoveryStage.SHELL_RECONNECT:
+        Logger.info("VM", "Recovery [Stage 1]: Sending carriage return to recover terminal...");
+        this.sendInput("\n");
+        return true;
+
+      case RecoveryStage.SERIAL_REBIND:
+        Logger.info("VM", "Recovery [Stage 2]: Re-triggering state changes listeners...");
+        if (this.onStateChange) {
+          this.onStateChange(this.lifecycle.getState().state);
+        }
+        return true;
+
+      case RecoveryStage.TERMINAL_RECOVERY:
+        Logger.info("VM", "Recovery [Stage 3]: Resetting visual prompt on screen...");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;33m[Recovery] Redrawing terminal prompt...\x1b[0m\r\n");
+          const promptPath = "~";
+          const symbol = "$";
+          this.onSerialOutput(`\r\n\x1b[1;32muser@linlearn\x1b[0m:\x1b[1;34m${promptPath}\x1b[0m${symbol} `);
+        }
+        return true;
+
+      case RecoveryStage.WORKER_RESTART:
+        Logger.info("VM", "Recovery [Stage 4]: Restarting worker processes...");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Worker unresponsive. Restarting worker adapter...\x1b[0m\r\n");
+        }
+        await this.recoverShell();
+        return true;
+
+      case RecoveryStage.VM_SOFT_REBOOT:
+        Logger.info("VM", "Recovery [Stage 5]: Performing soft restart...");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Stalled guest CPU. Triggering soft reboot...\x1b[0m\r\n");
+        }
+        this.bridge.post("RESTART");
+        return true;
+
+      case RecoveryStage.COLD_BOOT_FALLBACK:
+        Logger.info("VM", "Recovery [Stage 6]: Triggering cold boot fallback...");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Recovery exhausted. Cleaning corrupted snapshot and cold booting...\x1b[0m\r\n");
+        }
+        this.savedState = null;
+        this.wasRestoredFromSnapshot = false;
+        await this.recoverShell();
+        return true;
+
+      case RecoveryStage.NONE:
+      default:
+        Logger.warn("VM", "Recovery suspended or unknown stage executed.");
+        await this.stop();
+        return false;
     }
   }
 
@@ -330,12 +422,18 @@ export class VMController {
     this.onSerialOutput = onSerial;
     this.onStateChange = onState;
     onState(this.lifecycle.getState().state);
+
+    this.lifecycle.transitionTerminalTo("attached", "VMController.reattach");
+    if (this.lifecycle.getState().state === "running") {
+      this.lifecycle.transitionTerminalTo("interactive", "VMController.reattach");
+    }
   }
 
   public detach(): void {
     Logger.info("VM", "Detaching listeners from active VM session");
     this.onSerialOutput = null;
     this.onStateChange = null;
+    this.lifecycle.transitionTerminalTo("detached", "VMController.detach");
   }
 
   public getSerialHistory(): string {
@@ -358,25 +456,31 @@ export class VMController {
 
       this.bridge.post("SAVE_STATE");
 
-      setTimeout(() => {
+      this.timeouts.register("save_state_timeout", 10000, () => {
         if (this.saveStateRejecter === reject) {
           this.saveStateResolver = null;
           this.saveStateRejecter = null;
           reject(new Error("VM snapshot save operation timed out."));
         }
-      }, 10000);
+      });
     });
   }
 
   public sendInput(data: string): void {
-    if (!this.lifecycle.isAlive()) {
-      Logger.warn("VM", "Refusing to send user keyboard input: VM is not alive");
+    // Interactivity is decoupled: keyboard input allowed when VM is booting/provisioning/running
+    const status = this.lifecycle.getState().state;
+    if (status !== "running" && status !== "booting" && status !== "provisioning") {
+      Logger.warn("VM", `Refusing input: VM in state: ${status}`);
       return;
     }
     this.lastInputTimestamp = Date.now();
-    Logger.info("VM", `sendInput: routing character sequence to bridge: ${JSON.stringify(data)}`);
     try {
       this.bridge.post("INPUT", data);
+      
+      // Heartbeat feedback: if a user types something, they are active, restore orchestrator health
+      if (this.orchestrator.getRecoveryState() !== "healthy") {
+        this.orchestrator.reportHealthy();
+      }
     } catch (err: unknown) {
       if (this.healthMonitor) {
         this.healthMonitor.reportSerialError(err instanceof Error ? err : new Error(String(err)));
@@ -387,7 +491,7 @@ export class VMController {
   public sendProgrammaticInput(data: string): void {
     const stateName = this.lifecycle.getState().state;
     if (stateName !== "running" && stateName !== "booting" && stateName !== "provisioning") {
-      Logger.warn("VM", `Refusing to send programmatic serial input: VM is in non-interactive state: ${stateName}`);
+      Logger.warn("VM", `Refusing programmatic input in non-interactive state: ${stateName}`);
       return;
     }
     this.programmaticQueue.push(data);
@@ -449,15 +553,14 @@ export class VMController {
       this.bridge.post("SET_STATE", workerState);
     }
 
-    if (newState === "provisioning") {
-      this.refreshProvisioningWatchdog();
-    } else if (newState === "running" || newState === "stopped" || newState === "error") {
-      this.stopWatchdog();
-      if (newState === "running") {
-        this.startHealthMonitoring();
-      } else {
-        this.stopHealthMonitoring();
-      }
+    // Coordinated timeout updates on state transition
+    if (newState === "running") {
+      this.timeouts.cancel("boot_watchdog");
+      this.timeouts.cancel("provisioning_watchdog");
+      this.startHealthMonitoring();
+    } else if (newState === "stopped" || newState === "error") {
+      this.timeouts.clearAll();
+      this.stopHealthMonitoring();
     }
 
     return true;
@@ -471,49 +574,6 @@ export class VMController {
     this.bridge.post("SET_RUNNING");
   }
 
-  private startWatchdog(): void {
-    this.stopWatchdog();
-    Logger.info("VM", "Starting boot watchdog timer (45s)...");
-    this.watchdogTimer = setTimeout(() => {
-      const currentState = this.lifecycle.getState().state;
-      if (currentState === "loading" || currentState === "booting") {
-        // Skip boot watchdog check if we've seen recent serial output activity
-        if (Date.now() - this.lastSerialOutputTimestamp < 15000) {
-          Logger.info("VM", "[WATCHDOG] Boot watchdog: VM is progressing (active serial output). Extending boot grace period.");
-          this.startWatchdog();
-          return;
-        }
-        Logger.warn("VM", `[WATCHDOG] VM boot stalled in state: ${currentState}. Recovering...`);
-        this.recoverShell();
-      }
-    }, 45000);
-  }
-
-  private refreshProvisioningWatchdog(): void {
-    if (this.lifecycle.getState().state !== "provisioning") return;
-    this.stopWatchdog();
-    Logger.debug("VM", "[WATCHDOG] Refreshing provisioning watchdog due to serial output activity.");
-    this.watchdogTimer = setTimeout(() => {
-      if (this.lifecycle.getState().state === "provisioning") {
-        // Double check active serial output before declaring provisioning stalled
-        if (Date.now() - this.lastSerialOutputTimestamp < 15000) {
-          Logger.info("VM", "[WATCHDOG] Provisioning watchdog: active serial output detected. Extending grace period.");
-          this.refreshProvisioningWatchdog();
-          return;
-        }
-        Logger.warn("VM", `[WATCHDOG] VM provisioning stalled (no output for 45s). Recovering...`);
-        this.recoverShell();
-      }
-    }, 45000); // 45s of absolute silence during provisioning triggers reboot
-  }
-
-  private stopWatchdog(): void {
-    if (this.watchdogTimer) {
-      clearTimeout(this.watchdogTimer);
-      this.watchdogTimer = null;
-    }
-  }
-
   public async stop(): Promise<void> {
     Logger.info("VM", "Stopping guest VM session...");
 
@@ -521,8 +581,10 @@ export class VMController {
       this.initAbortController.abort();
     }
 
-    this.stopWatchdog();
+    this.timeouts.clearAll();
+    this.orchestrator.reset();
     this.transitionState("stopped", "VMController.stop");
+    this.lifecycle.transitionTerminalTo("detached", "VMController.stop");
     this.bridge.terminate();
     this.onSerialOutput = null;
     this.onStateChange = null;
@@ -537,6 +599,10 @@ export class VMController {
     return this.lifecycle.getState();
   }
 
+  public getFullLifecycleState() {
+    return this.lifecycle.getFullState();
+  }
+
   public wasRestored(): boolean {
     return this.wasRestoredFromSnapshot;
   }
@@ -547,10 +613,10 @@ export class VMController {
 
   private startHealthMonitoring(): void {
     this.stopHealthMonitoring();
-    Logger.info("VM", "Starting periodic shell health monitoring (every 20s)...");
+    Logger.info("VM", "Starting health monitoring...");
     this.healthMonitor = new TerminalHealthMonitor(
       (type, payload) => this.bridge.post(type, payload),
-      () => this.recoverShell(),
+      () => this.orchestrator.triggerRecovery("health check failure"),
       () => Math.max(this.lastInputTimestamp, this.lastSerialOutputTimestamp)
     );
     this.healthMonitor.start();
@@ -564,57 +630,14 @@ export class VMController {
   }
 
   public async recoverShell(): Promise<void> {
-    const now = Date.now();
-
-    // Async-safe state validation: check if VM is still in an active/interactive state
-    const state = this.lifecycle.getState().state;
-    if (state !== "running" && state !== "booting" && state !== "provisioning" && state !== "loading") {
-      Logger.info("VM", `[Watchdog] Skipping recovery: VM state is ${state}`);
-      return;
-    }
-
-    // Cooldown check: if a snapshot restore occurred within the last 20 seconds, skip recovery
-    if (this.lastRestoreTimestamp > 0 && now - this.lastRestoreTimestamp < 20000) {
-      Logger.info("VM", "[Watchdog] Skipping recovery: within snapshot restore cooldown.");
-      return;
-    }
-
-    // Keep only attempts in the last 60 seconds
-    this.rebootAttempts = this.rebootAttempts.filter(t => now - t < 60000);
-
-    if (this.rebootAttempts.length >= 3) {
-      Logger.error("VM", "[WATCHDOG] Reboot loop detected! 3 failures in 60s. Suspending watchdog to prevent storms.");
-      if (this.onSerialOutput) {
-        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Critical: VM is stuck in a reboot loop. Boot suspended to protect state. Please click 'Reset VM State' to format.\x1b[0m\r\n");
-      }
-      this.transitionState("error", "reboot_loop_prevented");
-      await this.stop();
-      return;
-    }
-
-    this.rebootAttempts.push(now);
-    Logger.error("VM", `[HEALTH] Session is unresponsive (reboot attempt ${this.rebootAttempts.length}/3). Rebooting guest VM...`);
-
-    // Discard possibly corrupted snapshot on second failure
-    if (this.rebootAttempts.length === 2) {
-      Logger.warn("VM", "[WATCHDOG] Second boot failure. Discarding possibly corrupted snapshot to force clean recovery.");
-      if (this.onSerialOutput) {
-        this.onSerialOutput("\r\n\x1b[1;33m[Watchdog] Detecting snapshot corruption. Discarding snapshot and booting clean factory state...\x1b[0m\r\n");
-      }
-      this.savedState = null;
-      this.wasRestoredFromSnapshot = false;
-    }
-
     const activeOnSerial = this.onSerialOutput;
     const activeOnState = this.onStateChange;
+    
     if (activeOnSerial && activeOnState) {
-      if (this.onSerialOutput) {
-        this.onSerialOutput("\r\n\x1b[1;31m[Watchdog] Guest virtual machine is unresponsive. Rebooting...\x1b[0m\r\n");
-      }
       await this.stop();
       await new Promise(resolve => setTimeout(resolve, 1500));
       
-      // Perform clean boot and let it restore files
+      // Perform fresh initialization
       await this.start(
         window.location.origin, 
         activeOnSerial, 

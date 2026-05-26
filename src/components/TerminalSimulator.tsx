@@ -316,6 +316,11 @@ export function TerminalSimulator({
 
   const [isV86Running, setIsV86Running] = useState<boolean>(false);
   const [vmStateName, setVmStateName] = useState<string>("idle");
+  const [provisioningState, setProvisioningState] = useState<string>("idle");
+  const [terminalState, setTerminalState] = useState<string>("detached");
+  const [recoveryState, setRecoveryState] = useState<string>("healthy");
+  const activeTermRef = useRef<Terminal | null>(null);
+
   const [isFocused, setIsFocused] = useState<boolean>(false);
   const [termResetCounter, setTermResetCounter] = useState<number>(0);
 
@@ -370,10 +375,10 @@ export function TerminalSimulator({
       const updated = { ...prev, [topic]: pLNext };
       localStorage.setItem("linlearn_mastery", JSON.stringify(updated));
 
-      if (xtermInstance.current) {
+      if (activeTermRef.current) {
         const diff = pLNext - pLCurrent;
         const indicator = diff >= 0 ? `\x1b[1;32m+${(diff*100).toFixed(1)}%\x1b[0m` : `\x1b[1;31m${(diff*100).toFixed(1)}%\x1b[0m`;
-        xtermInstance.current.write(`\r\n\x1b[1;90m[Telemetry] BKT Mastery for ${topic} updated to ${(pLNext*100).toFixed(1)}% (${indicator})\x1b[0m\r\n`);
+        activeTermRef.current.write(`\r\n\x1b[1;90m[Telemetry] BKT Mastery for ${topic} updated to ${(pLNext*100).toFixed(1)}% (${indicator})\x1b[0m\r\n`);
       }
       return updated;
     });
@@ -516,9 +521,9 @@ export function TerminalSimulator({
   // Handle clearSignal from parent
   useEffect(() => {
     if (clearSignal === 0) return;
-    if (xtermInstance.current) {
-      xtermInstance.current.clear();
-      xtermInstance.current.write(getPromptString(stateRef.current));
+    if (activeTermRef.current) {
+      activeTermRef.current.clear();
+      activeTermRef.current.write(getPromptString(stateRef.current));
     }
   }, [clearSignal]);
 
@@ -552,10 +557,10 @@ export function TerminalSimulator({
       const fresh = getInitialState();
       setOsState(fresh);
       setLastCommand("");
-      if (xtermInstance.current) {
-        xtermInstance.current.clear();
-        xtermInstance.current.write("\r\n\x1b[1;33mSystem restored. Virtual filesystem, Docker, and services refreshed.\x1b[0m\r\n\r\n");
-        xtermInstance.current.write(getPromptString(fresh));
+      if (activeTermRef.current) {
+        activeTermRef.current.clear();
+        activeTermRef.current.write("\r\n\x1b[1;33mSystem restored. Virtual filesystem, Docker, and services refreshed.\x1b[0m\r\n\r\n");
+        activeTermRef.current.write(getPromptString(fresh));
       }
     }
   };
@@ -820,6 +825,7 @@ export function TerminalSimulator({
       };
 
       xtermInstance.current = term;
+      activeTermRef.current = term;
 
       if (isV86Mode) {
         // --- WASM v86 VM Mode ---
@@ -843,8 +849,8 @@ export function TerminalSimulator({
 
         const flushSerial = () => {
           if (!isMounted) return;
-          if (serialBuffer.length > 0 && term) {
-            term.write(serialBuffer);
+          if (serialBuffer.length > 0 && activeTermRef.current) {
+            activeTermRef.current.write(serialBuffer);
             serialBuffer = "";
           }
           rafId = requestAnimationFrame(flushSerial);
@@ -894,8 +900,18 @@ export function TerminalSimulator({
         const onState = (newState: string) => {
           if (!isMounted) return;
           setVmStateName(newState);
+
+          if (v86EmulatorRef.current) {
+            const fullState = v86EmulatorRef.current.getFullLifecycleState();
+            setProvisioningState(fullState.provisioning);
+            setTerminalState(fullState.terminal);
+            setRecoveryState(fullState.recovery);
+          }
+
           if (newState === "error") {
-            term.write(`\r\n\x1b[1;31mError: Failed to boot guest virtual machine.\x1b[0m\r\n`);
+            if (activeTermRef.current) {
+              activeTermRef.current.write(`\r\n\x1b[1;31mError: Failed to boot guest virtual machine.\x1b[0m\r\n`);
+            }
             setV86Booting(false);
             setIsV86Running(false);
           } else if (newState === "running") {
@@ -927,6 +943,11 @@ export function TerminalSimulator({
           // Re-sync local flags from emulator state
           const currentVmState = emulator.getLifecycleState().state;
           setVmStateName(currentVmState);
+          const fullState = emulator.getFullLifecycleState();
+          setProvisioningState(fullState.provisioning);
+          setTerminalState(fullState.terminal);
+          setRecoveryState(fullState.recovery);
+
           if (currentVmState === "running") {
             setV86Booting(false);
             setIsV86Running(true);
@@ -969,9 +990,6 @@ export function TerminalSimulator({
                 if (rafId !== null) cancelAnimationFrame(rafId);
                 return;
               }
-              
-              // Handled by onState(running) on the active reattached component instance
-              // to support strict mode double-mounting cleanly without race conditions.
             } catch (bootErr) {
               if (!isMounted) {
                 term.dispose();
@@ -1014,7 +1032,8 @@ export function TerminalSimulator({
             console.log("[xterm DEBUG] onData skipped: validation in progress");
             return;
           }
-          const vmState = emulator.getLifecycleState().state;
+          if (!v86EmulatorRef.current) return;
+          const vmState = v86EmulatorRef.current.getLifecycleState().state;
           if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
             console.warn("[xterm DEBUG] onData ignored: VM not in interactive state:", vmState);
             return;
@@ -1051,7 +1070,9 @@ export function TerminalSimulator({
           } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
             currentLine += data;
           }
-          emulator.sendInput(data);
+          if (v86EmulatorRef.current) {
+            v86EmulatorRef.current.sendInput(data);
+          }
         });
 
         term.attachCustomKeyEventHandler((ev) => {
@@ -1059,7 +1080,8 @@ export function TerminalSimulator({
           if (isCapturingValidationRef.current) {
             return false;
           }
-          const vmState = emulator.getLifecycleState().state;
+          if (!v86EmulatorRef.current) return false;
+          const vmState = v86EmulatorRef.current.getLifecycleState().state;
           if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
             console.warn("[xterm DEBUG] attachCustomKeyEventHandler rejected: VM not in interactive state:", vmState);
             return false;
@@ -1067,15 +1089,15 @@ export function TerminalSimulator({
           if (ev.ctrlKey && ev.type === "keydown") {
             const code = ev.key.toLowerCase();
             if (code === "c") {
-              emulator.sendInput("\x03");
+              if (v86EmulatorRef.current) v86EmulatorRef.current.sendInput("\x03");
               return false;
             }
             if (code === "z") {
-              emulator.sendInput("\x1a");
+              if (v86EmulatorRef.current) v86EmulatorRef.current.sendInput("\x1a");
               return false;
             }
             if (code === "d") {
-              emulator.sendInput("\x04");
+              if (v86EmulatorRef.current) v86EmulatorRef.current.sendInput("\x04");
               return false;
             }
           }
@@ -1369,6 +1391,7 @@ export function TerminalSimulator({
         }
         term.dispose();
       }
+      activeTermRef.current = null;
       setIsV86Running(false);
       if (v86EmulatorRef.current) {
         v86EmulatorRef.current.detach();
@@ -1471,17 +1494,29 @@ export function TerminalSimulator({
           
           {/* Terminal Canvas Container */}
           <div className="p-2 min-h-[500px] flex-1 flex flex-col justify-stretch relative">
-            {isV86Mode && (vmStateName === "loading" || vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "idle" || vmStateName === "stopping") && (
+            {isV86Mode && (
+              vmStateName === "loading" || 
+              vmStateName === "booting" || 
+              vmStateName === "provisioning" || 
+              vmStateName === "idle" || 
+              vmStateName === "stopping" ||
+              recoveryState === "recovering" ||
+              recoveryState === "crashloop"
+            ) && (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#06070a]/90 gap-3">
                 <RefreshCw className="h-8 w-8 text-[#E95420] animate-spin" />
                 <span className="text-sm font-mono text-gray-400">
-                  {vmStateName === "loading" ? "Downloading WebAssembly & Linux Kernel..." :
+                  {recoveryState === "crashloop" ? "Virtual Machine in Crash Loop!" :
+                   recoveryState === "recovering" ? "Attempting Self-Healing Recovery..." :
+                   vmStateName === "loading" ? "Downloading WebAssembly & Linux Kernel..." :
                    vmStateName === "booting" ? "Booting Real Linux Kernel in WASM..." :
                    vmStateName === "provisioning" ? "Provisioning User Environment Silently..." :
                    "Initializing Virtual Machine..."}
                 </span>
                 <span className="text-xs font-mono text-gray-600">
-                  {vmStateName === "loading" ? "Downloading Buildroot disk image (~10MB)" :
+                  {recoveryState === "crashloop" ? "Please click 'Reset VM State' to restore factory settings." :
+                   recoveryState === "recovering" ? "Running recovery escalation routines..." :
+                   vmStateName === "loading" ? "Downloading Buildroot disk image (~10MB)" :
                    vmStateName === "booting" ? "Decompressing kernel & starting x86 CPU" :
                    vmStateName === "provisioning" ? "Configuring user login & inspect hooks" :
                    "Configuring virtual resources (96MB RAM)"}
@@ -1498,17 +1533,25 @@ export function TerminalSimulator({
                 <div className="flex items-center gap-4">
                   <div className="flex items-center gap-1.5">
                     <span className={`h-2 w-2 rounded-full ${
+                      recoveryState === "crashloop" ? "bg-rose-600 animate-ping" :
+                      recoveryState === "recovering" ? "bg-amber-500 animate-ping" :
                       vmStateName === "running" ? "bg-emerald-500 animate-pulse" : 
                       (vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "loading") ? "bg-amber-500 animate-pulse" : 
                       vmStateName === "stopping" ? "bg-orange-500 animate-pulse" :
                       vmStateName === "error" ? "bg-rose-500 animate-pulse" : "bg-gray-500"
                     }`} />
-                    <span>Status: <span className="uppercase text-[10px] font-bold px-1.5 py-0.5 rounded bg-white/5">{vmStateName}</span></span>
+                    <span>Status: <span className="uppercase text-[10px] font-bold px-1.5 py-0.5 rounded bg-white/5">{
+                      recoveryState === "crashloop" ? "crashloop" :
+                      recoveryState === "recovering" ? "recovering" :
+                      vmStateName
+                    }</span></span>
                   </div>
                   {bootTimeRef.current !== null && (
                     <div>Boot: {(bootTimeRef.current / 1000).toFixed(1)}s</div>
                   )}
                   <div>RAM: 96MB</div>
+                  <div className="hidden sm:block">TTY: <span className="uppercase text-[9px] font-bold text-gray-400 bg-white/5 px-1 py-0.5 rounded">{terminalState}</span></div>
+                  <div className="hidden sm:block">Setup: <span className="uppercase text-[9px] font-bold text-gray-400 bg-white/5 px-1 py-0.5 rounded">{provisioningState}</span></div>
                 </div>
                 <div className="flex items-center gap-2">
                   {isPersistenceSaving ? (

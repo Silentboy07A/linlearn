@@ -182,6 +182,11 @@ async function createEmulator(config, win) {
       }
     });
 
+    // Bridge serial1 output (invisible heartbeat channel)
+    emulator.add_listener("serial1-output-byte", function (byte) {
+      self.postMessage({ type: "SERIAL1_OUT", payload: byte });
+    });
+
     log("info", "v86 emulator successfully created.");
   } catch (err) {
     emulator = null;
@@ -245,6 +250,26 @@ self.onmessage = async function (e) {
         emulator.serial0_send(payload);
       } catch (err) {
         log("error", "Failed to send serial input: " + (err.message || String(err)));
+      }
+      break;
+
+    case "INPUT1":
+      if (!emulator) {
+        log("debug", "Ignored serial1 input: No active emulator");
+        break;
+      }
+      if (typeof payload !== "string") {
+        log("warn", "Ignored non-string serial1 input payload");
+        break;
+      }
+      try {
+        if (typeof emulator.serial1_send === "function") {
+          emulator.serial1_send(payload);
+        } else {
+          log("warn", "emulator.serial1_send is not a function");
+        }
+      } catch (err) {
+        log("error", "Failed to send serial1 input: " + (err.message || String(err)));
       }
       break;
 
