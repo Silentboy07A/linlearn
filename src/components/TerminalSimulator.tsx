@@ -16,7 +16,6 @@ import {
 import { updateMastery, DEFAULT_BKT_PARAMS, type LinuxTopic } from "@/lib/bkt";
 import { VMController } from "@/vm/emulatorManager";
 import { PersistenceManager } from "@/persistence/manager";
-import { GUEST_INSPECT_SCRIPT } from "@/vm/inspect";
 import { parseGuestState, GuestState } from "@/missions/validator";
 import { getMissionsByCategory, type MissionCategory } from "@/missions/config";
 
@@ -99,15 +98,6 @@ async function computeHMAC(keyStr: string, dataStr: string): Promise<string> {
     .join("");
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
 
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
   const binaryString = atob(base64);
@@ -849,7 +839,6 @@ export function TerminalSimulator({
 
         // Frame-batched serial output rendering for butter smooth performance
         let serialBuffer = "";
-        let provisioningSearchBuffer = "";
         let rafId: number | null = null;
 
         const flushSerial = () => {
