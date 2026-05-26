@@ -3,7 +3,7 @@ import { VMState, VMStateName, VMTransitionTrace, VMSnapshotMetadata } from "../
 import { Logger } from "../lib/logger";
 
 export type VMRuntimeState = VMStateName;
-export type ProvisioningState = "idle" | "running" | "completed" | "failed" | "recovering";
+export type ProvisioningState = "idle" | "preparing" | "transferring" | "executing" | "waiting_completion" | "completed" | "failed" | "recovering";
 export type TerminalState = "detached" | "attached" | "interactive" | "recovering";
 export type RecoveryState = "healthy" | "recovering" | "degraded" | "crashloop";
 
@@ -44,11 +44,14 @@ export class VMLifecycleManager {
   };
 
   private static readonly VALID_PROVISIONING_TRANSITIONS: Record<ProvisioningState, Set<ProvisioningState>> = {
-    idle:       new Set<ProvisioningState>(["running", "failed"]),
-    running:    new Set<ProvisioningState>(["completed", "failed", "recovering"]),
-    completed:  new Set<ProvisioningState>(["idle"]),
-    failed:     new Set<ProvisioningState>(["idle", "running", "recovering"]),
-    recovering: new Set<ProvisioningState>(["running", "completed", "failed"])
+    idle:               new Set<ProvisioningState>(["preparing", "failed"]),
+    preparing:          new Set<ProvisioningState>(["transferring", "failed"]),
+    transferring:       new Set<ProvisioningState>(["executing", "failed"]),
+    executing:          new Set<ProvisioningState>(["waiting_completion", "failed"]),
+    waiting_completion: new Set<ProvisioningState>(["completed", "failed", "recovering"]),
+    completed:          new Set<ProvisioningState>(["idle"]),
+    failed:             new Set<ProvisioningState>(["idle", "preparing", "recovering"]),
+    recovering:         new Set<ProvisioningState>(["preparing", "completed", "failed"])
   };
 
   private static readonly VALID_TERMINAL_TRANSITIONS: Record<TerminalState, Set<TerminalState>> = {

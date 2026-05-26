@@ -11,6 +11,55 @@ import { ProvisioningController } from "./provisioning";
 import { RecoveryOrchestrator, RecoveryStage } from "./recoveryOrchestrator";
 import { TransportCoordinator } from "./transportCoordinator";
 
+// ─── Async Mutex ────────────────────────────────────────────────────────────
+// Serializes all lifecycle operations into a FIFO queue.
+// Only one lifecycle action can execute at a time.
+class AsyncMutex {
+  private queue: Promise<void> = Promise.resolve();
+
+  public acquire(): Promise<() => void> {
+    let release: () => void;
+    const prev = this.queue;
+    this.queue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return prev.then(() => release!);
+  }
+}
+
+// ─── Emulator Action Types ──────────────────────────────────────────────────
+// Every lifecycle intent is expressed as a typed action dispatched through
+// the central gate. No subsystem may mutate lifecycle state directly.
+export type EmulatorAction =
+  | { type: "START"; origin: string; onSerial: (data: string) => void; onState: (state: string) => void; initialState?: ArrayBuffer }
+  | { type: "STOP" }
+  | { type: "RECOVER_SHELL" }
+  | { type: "SOFT_REBOOT" }
+  | { type: "COLD_BOOT" }
+  | { type: "REATTACH"; onSerial: (data: string) => void; onState: (state: string) => void }
+  | { type: "DETACH" }
+  | { type: "RESET"; origin: string; onSerial: (data: string) => void; onState: (state: string) => void };
+
+// ─── Action validation gates ────────────────────────────────────────────────
+// Maps each action type to the set of lifecycle states from which it is valid.
+const ACTION_VALID_FROM: Record<EmulatorAction["type"], Set<VMStateName> | "always" | "alive"> = {
+  START:         new Set<VMStateName>(["idle", "stopped", "error"]),
+  STOP:          new Set<VMStateName>(["loading", "booting", "provisioning", "running", "stopping"]),
+  RECOVER_SHELL: "alive",
+  SOFT_REBOOT:   "alive",
+  COLD_BOOT:     "alive",
+  REATTACH:      "always",
+  DETACH:        "always",
+  RESET:         "always",
+};
+
+function isActionAllowed(action: EmulatorAction, currentState: VMStateName, isAlive: boolean): boolean {
+  const rule = ACTION_VALID_FROM[action.type];
+  if (rule === "always") return true;
+  if (rule === "alive") return isAlive;
+  return rule.has(currentState);
+}
+
 export class VMController {
   private static activeInstance: VMController | null = null;
 
@@ -48,9 +97,13 @@ export class VMController {
   // Provisioning matching buffer
   private provisioningSearchBuffer = "";
 
-  // Initialization mutex
+  // Initialization mutex (legacy — kept for _doStart abort signal)
   private initPromise: Promise<void> | null = null;
   private initAbortController: AbortController | null = null;
+
+  // ─── Single-Authority Lifecycle Gate ─────────────────────────────────────
+  private lifecycleMutex = new AsyncMutex();
+  private actionToken = 0;
 
   constructor(config: Partial<VMSessionConfig> = {}) {
     this.transport = new TransportCoordinator();
@@ -67,6 +120,7 @@ export class VMController {
     );
 
     // Initialize recovery orchestrator
+    // Recovery actions are now routed through dispatch() — no direct lifecycle mutation.
     this.orchestrator = new RecoveryOrchestrator(
       this.timeouts,
       (stage) => this.handleRecoveryAction(stage),
@@ -74,20 +128,106 @@ export class VMController {
     );
   }
 
-  public async start(
-    origin: string,
-    onSerial: (data: string) => void,
-    onState: (state: string) => void,
-    initialState?: ArrayBuffer
-  ): Promise<void> {
-    if (this.initPromise) {
-      Logger.warn("VM", "VM is already starting. Ignoring redundant start call.");
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DISPATCH — The single entry point for all lifecycle mutations.
+  // All external callers must use this method. Concurrent dispatches are
+  // serialized by the AsyncMutex. Each dispatch receives a monotonically-
+  // increasing action token; if a newer action supersedes, the stale token
+  // causes early-exit from async continuations.
+  // ═══════════════════════════════════════════════════════════════════════════
+  public async dispatch(action: EmulatorAction): Promise<void> {
+    const token = ++this.actionToken;
+    const currentState = this.lifecycle.getState().state;
+    const alive = this.lifecycle.isAlive();
+
+    // Pre-validation: check if this action is valid from the current state.
+    // RESET is always allowed; it forces a stop before restarting.
+    if (!isActionAllowed(action, currentState, alive)) {
+      Logger.warn(
+        "VM",
+        `[DISPATCH REJECTED] Action '${action.type}' is not valid from state '${currentState}'. ` +
+        `Token #${token}. Ignoring.`
+      );
       return;
     }
 
+    Logger.info("VM", `[DISPATCH] Queuing action '${action.type}' (token #${token}) from state '${currentState}'`);
+
+    const release = await this.lifecycleMutex.acquire();
+    try {
+      // Stale-guard: if a newer action was dispatched while we waited for the mutex,
+      // this action is superseded and should be silently dropped.
+      if (token !== this.actionToken) {
+        Logger.info("VM", `[DISPATCH STALE] Action '${action.type}' (token #${token}) superseded by token #${this.actionToken}. Dropping.`);
+        return;
+      }
+
+      Logger.info("VM", `[DISPATCH EXECUTING] Action '${action.type}' (token #${token})`);
+
+      switch (action.type) {
+        case "START":
+          await this._dispatchStart(action.origin, action.onSerial, action.onState, action.initialState, token);
+          break;
+
+        case "STOP":
+          await this._dispatchStop();
+          break;
+
+        case "RECOVER_SHELL":
+          await this._dispatchRecoverShell(token);
+          break;
+
+        case "SOFT_REBOOT":
+          await this._dispatchSoftReboot();
+          break;
+
+        case "COLD_BOOT":
+          await this._dispatchColdBoot(token);
+          break;
+
+        case "REATTACH":
+          this._dispatchReattach(action.onSerial, action.onState);
+          break;
+
+        case "DETACH":
+          this._dispatchDetach();
+          break;
+
+        case "RESET":
+          await this._dispatchReset(action.origin, action.onSerial, action.onState, token);
+          break;
+      }
+    } catch (err) {
+      Logger.error("VM", `[DISPATCH ERROR] Action '${action.type}' (token #${token}) threw:`, err);
+      throw err;
+    } finally {
+      release();
+    }
+  }
+
+  // ─── Stale-guard helper ─────────────────────────────────────────────────
+  private isStaleAction(token: number): boolean {
+    if (token !== this.actionToken) {
+      Logger.info("VM", `[STALE GUARD] Token #${token} is stale (current: #${this.actionToken}). Aborting continuation.`);
+      return true;
+    }
+    return false;
+  }
+
+  // ─── Dispatch implementations ───────────────────────────────────────────
+
+  private async _dispatchStart(
+    origin: string,
+    onSerial: (data: string) => void,
+    onState: (state: string) => void,
+    initialState: ArrayBuffer | undefined,
+    token: number
+  ): Promise<void> {
+    // If already alive, stop first
     if (this.lifecycle.isAlive()) {
       Logger.warn("VM", "VM already running. Destroying it before starting new session.");
-      await this.stop();
+      await this._internalStop();
+      if (this.isStaleAction(token)) return;
     }
 
     this.initAbortController = new AbortController();
@@ -101,6 +241,174 @@ export class VMController {
       this.initAbortController = null;
     }
   }
+
+  private async _dispatchStop(): Promise<void> {
+    await this._internalStop();
+  }
+
+  private async _dispatchRecoverShell(token: number): Promise<void> {
+    const activeOnSerial = this.onSerialOutput;
+    const activeOnState = this.onStateChange;
+
+    if (activeOnSerial && activeOnState) {
+      await this._internalStop();
+      if (this.isStaleAction(token)) return;
+
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      if (this.isStaleAction(token)) return;
+
+      // Perform fresh initialization
+      this.initAbortController = new AbortController();
+      const abortSignal = this.initAbortController.signal;
+      this.initPromise = this._doStart(
+        window.location.origin,
+        activeOnSerial,
+        activeOnState,
+        this.savedState || undefined,
+        abortSignal
+      );
+      try {
+        await this.initPromise;
+      } finally {
+        this.initPromise = null;
+        this.initAbortController = null;
+      }
+    }
+  }
+
+  private async _dispatchSoftReboot(): Promise<void> {
+    Logger.info("VM", "Recovery [Stage 4]: Performing VM soft reboot via dispatch...");
+    if (this.onSerialOutput) {
+      this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Guest CPU stalled. Rebooting VM...\x1b[0m\r\n");
+    }
+    this.transport.post("RESTART");
+  }
+
+  private async _dispatchColdBoot(token: number): Promise<void> {
+    Logger.info("VM", "Recovery [Stage 5]: Triggering cold boot fallback via dispatch...");
+    if (this.onSerialOutput) {
+      this.onSerialOutput("\r\n\x1b[1;31m[Recovery] All recovery exhausted. Cold booting guest VM...\x1b[0m\r\n");
+    }
+    this.savedState = null;
+    this.wasRestoredFromSnapshot = false;
+
+    // Full shell recovery (stop → delay → start)
+    await this._dispatchRecoverShell(token);
+  }
+
+  private _dispatchReattach(
+    onSerial: (data: string) => void,
+    onState: (state: string) => void
+  ): void {
+    Logger.info("VM", "Reattaching listeners to active VM session");
+    this.onSerialOutput = onSerial;
+    this.onStateChange = onState;
+    onState(this.lifecycle.getState().state);
+
+    this.lifecycle.transitionTerminalTo("attached", "VMController.reattach");
+    if (this.lifecycle.getState().state === "running") {
+      this.lifecycle.transitionTerminalTo("interactive", "VMController.reattach");
+    }
+  }
+
+  private _dispatchDetach(): void {
+    Logger.info("VM", "Detaching listeners from active VM session");
+    this.onSerialOutput = null;
+    this.onStateChange = null;
+    this.lifecycle.transitionTerminalTo("detached", "VMController.detach");
+  }
+
+  private async _dispatchReset(
+    origin: string,
+    onSerial: (data: string) => void,
+    onState: (state: string) => void,
+    token: number
+  ): Promise<void> {
+    Logger.info("VM", "[DISPATCH] Executing RESET: force stop + clear snapshot + cold boot.");
+    
+    // Force stop regardless of state
+    if (this.lifecycle.isAlive() || this.lifecycle.getState().state !== "idle") {
+      await this._internalStop();
+      if (this.isStaleAction(token)) return;
+    }
+
+    // Clear snapshot
+    this.savedState = null;
+    this.wasRestoredFromSnapshot = false;
+    this.serialHistory = "";
+
+    // Cold start
+    this.initAbortController = new AbortController();
+    const abortSignal = this.initAbortController.signal;
+    this.initPromise = this._doStart(origin, onSerial, onState, undefined, abortSignal);
+    try {
+      await this.initPromise;
+    } finally {
+      this.initPromise = null;
+      this.initAbortController = null;
+    }
+  }
+
+  // ─── Internal stop (no mutex, no dispatch — used inside dispatch impls) ─
+  private async _internalStop(): Promise<void> {
+    Logger.info("VM", "Stopping guest VM session...");
+
+    if (this.initAbortController) {
+      this.initAbortController.abort();
+    }
+
+    this.timeouts.clearAll();
+    this.transport.terminate();
+    this.orchestrator.reset();
+    this.transitionState("stopped", "VMController.stop");
+    this.lifecycle.transitionTerminalTo("detached", "VMController.stop");
+    this.onSerialOutput = null;
+    this.onStateChange = null;
+    this.saveStateResolver = null;
+    this.saveStateRejecter = null;
+    if (VMController.getActiveInstance() === this) {
+      VMController.setActiveInstance(null);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PUBLIC API — Legacy methods that delegate to dispatch()
+  // These exist for backward compatibility. All paths go through dispatch().
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  public async start(
+    origin: string,
+    onSerial: (data: string) => void,
+    onState: (state: string) => void,
+    initialState?: ArrayBuffer
+  ): Promise<void> {
+    return this.dispatch({ type: "START", origin, onSerial, onState, initialState });
+  }
+
+  public async stop(): Promise<void> {
+    return this.dispatch({ type: "STOP" });
+  }
+
+  public reattach(
+    onSerial: (data: string) => void,
+    onState: (state: string) => void
+  ): void {
+    // Reattach is synchronous and lightweight — dispatch is async but we fire-and-forget
+    this.dispatch({ type: "REATTACH", onSerial, onState });
+  }
+
+  public detach(): void {
+    this.dispatch({ type: "DETACH" });
+  }
+
+  public async recoverShell(): Promise<void> {
+    return this.dispatch({ type: "RECOVER_SHELL" });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // INTERNAL IMPLEMENTATION — Boot, serial lifecycle, health monitoring
+  // These are NOT called directly by external callers.
+  // ═══════════════════════════════════════════════════════════════════════════
 
   private async _doStart(
     origin: string,
@@ -196,7 +504,9 @@ export class VMController {
             this.handleSerialLifecycle(char);
 
             // Print character to UI terminal (hide outputs during silent provisioning)
-            if (this.onSerialOutput && this.provisioning.getState() !== "running") {
+            const provState = this.provisioning.getState();
+            const isProvisioningActive = provState === "preparing" || provState === "transferring" || provState === "executing" || provState === "waiting_completion";
+            if (this.onSerialOutput && !isProvisioningActive) {
               this.onSerialOutput(char);
             }
             break;
@@ -292,7 +602,7 @@ export class VMController {
     const hasRootPrompt = this.provisioningSearchBuffer.endsWith("~% ") || 
                           this.provisioningSearchBuffer.endsWith("# ") || 
                           this.provisioningSearchBuffer.endsWith("~# ");
-    const hasUserSentinel = this.provisioningSearchBuffer.includes("PROVISIONING_COMPLETE");
+    const sentinelMatch = this.provisioningSearchBuffer.match(/PROVISIONING_COMPLETE:(\d+)/);
 
     if (hasRootPrompt && this.provisioning.getState() === "idle") {
       this.timeouts.cancel("boot_watchdog");
@@ -317,8 +627,9 @@ export class VMController {
 
       // Provisioning timeout guard: 45 seconds to finish provisioning
       this.timeouts.register("provisioning_watchdog", 45000, () => {
-        if (this.provisioning.getState() === "running") {
-          Logger.warn("VM", "Provisioning watchdog triggered. Provisioning stalled.");
+        const state = this.provisioning.getState();
+        if (state === "preparing" || state === "transferring" || state === "executing" || state === "waiting_completion") {
+          Logger.warn("VM", `Provisioning watchdog triggered. Provisioning stalled in state: ${state}.`);
           this.provisioning.handleFailure();
           this.orchestrator.triggerRecovery("provisioning timeout exceeded");
         }
@@ -326,11 +637,12 @@ export class VMController {
 
       this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.transport.hasSerial1Support());
 
-    } else if (hasUserSentinel && this.provisioning.getState() === "running") {
+    } else if (sentinelMatch && this.provisioning.getState() === "waiting_completion") {
+      const execId = parseInt(sentinelMatch[1], 10);
       this.timeouts.cancel("provisioning_watchdog");
       this.provisioningSearchBuffer = "";
 
-      this.provisioning.handleProvisioningComplete();
+      this.provisioning.handleProvisioningComplete(execId);
       this.transitionState("running", "handleSerialLifecycle");
       this.lifecycle.transitionTerminalTo("interactive", "handleSerialLifecycle");
 
@@ -349,6 +661,10 @@ export class VMController {
     }
   }
 
+  // ─── Recovery action handler (called by RecoveryOrchestrator) ───────────
+  // Stages that mutate lifecycle (SERIAL_RECONNECT, VM_SOFT_REBOOT,
+  // COLD_BOOT_FALLBACK) now go through dispatch(). TTY_REPAIR and
+  // SHELL_RESTART are non-lifecycle transport posts and remain direct.
   private async handleRecoveryAction(stage: RecoveryStage): Promise<boolean> {
     this.transport.getGenerationManager().recordRecoveryEscalation(RecoveryStage[stage]);
     switch (stage) {
@@ -377,35 +693,27 @@ export class VMController {
         return true;
 
       case RecoveryStage.SERIAL_RECONNECT:
-        Logger.info("VM", "Recovery [Stage 3]: Restarting serial connection worker bridge...");
+        Logger.info("VM", "Recovery [Stage 3]: Dispatching RECOVER_SHELL through lifecycle gate...");
         if (this.onSerialOutput) {
           this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Serial connection stalled. Reconnecting serial worker...\x1b[0m\r\n");
         }
-        await this.recoverShell();
+        await this.dispatch({ type: "RECOVER_SHELL" });
         return true;
 
       case RecoveryStage.VM_SOFT_REBOOT:
-        Logger.info("VM", "Recovery [Stage 4]: Performing VM soft reboot...");
-        if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Guest CPU stalled. Rebooting VM...\x1b[0m\r\n");
-        }
-        this.transport.post("RESTART");
+        Logger.info("VM", "Recovery [Stage 4]: Dispatching SOFT_REBOOT through lifecycle gate...");
+        await this.dispatch({ type: "SOFT_REBOOT" });
         return true;
 
       case RecoveryStage.COLD_BOOT_FALLBACK:
-        Logger.info("VM", "Recovery [Stage 5]: Triggering cold boot fallback...");
-        if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] All recovery exhausted. Cold booting guest VM...\x1b[0m\r\n");
-        }
-        this.savedState = null;
-        this.wasRestoredFromSnapshot = false;
-        await this.recoverShell();
+        Logger.info("VM", "Recovery [Stage 5]: Dispatching COLD_BOOT through lifecycle gate...");
+        await this.dispatch({ type: "COLD_BOOT" });
         return true;
 
       case RecoveryStage.NONE:
       default:
         Logger.warn("VM", "Recovery suspended or unknown stage executed.");
-        await this.stop();
+        await this.dispatch({ type: "STOP" });
         return false;
     }
   }
@@ -418,28 +726,6 @@ export class VMController {
       binary += String.fromCharCode(bytes[i]);
     }
     return btoa(binary);
-  }
-
-  public reattach(
-    onSerial: (data: string) => void,
-    onState: (state: string) => void
-  ): void {
-    Logger.info("VM", "Reattaching listeners to active VM session");
-    this.onSerialOutput = onSerial;
-    this.onStateChange = onState;
-    onState(this.lifecycle.getState().state);
-
-    this.lifecycle.transitionTerminalTo("attached", "VMController.reattach");
-    if (this.lifecycle.getState().state === "running") {
-      this.lifecycle.transitionTerminalTo("interactive", "VMController.reattach");
-    }
-  }
-
-  public detach(): void {
-    Logger.info("VM", "Detaching listeners from active VM session");
-    this.onSerialOutput = null;
-    this.onStateChange = null;
-    this.lifecycle.transitionTerminalTo("detached", "VMController.detach");
   }
 
   public getSerialHistory(): string {
@@ -474,6 +760,7 @@ export class VMController {
 
   public sendInput(data: string): void {
     // Interactivity is decoupled: keyboard input allowed when VM is booting/provisioning/running
+    // sendInput does NOT mutate lifecycle — no dispatch() needed.
     const status = this.lifecycle.getState().state;
     if (status !== "running" && status !== "booting" && status !== "provisioning") {
       Logger.warn("VM", `Refusing input: VM in state: ${status}`);
@@ -548,27 +835,6 @@ export class VMController {
     this.transport.post("SET_RUNNING");
   }
 
-  public async stop(): Promise<void> {
-    Logger.info("VM", "Stopping guest VM session...");
-
-    if (this.initAbortController) {
-      this.initAbortController.abort();
-    }
-
-    this.timeouts.clearAll();
-    this.transport.terminate();
-    this.orchestrator.reset();
-    this.transitionState("stopped", "VMController.stop");
-    this.lifecycle.transitionTerminalTo("detached", "VMController.stop");
-    this.onSerialOutput = null;
-    this.onStateChange = null;
-    this.saveStateResolver = null;
-    this.saveStateRejecter = null;
-    if (VMController.getActiveInstance() === this) {
-      VMController.setActiveInstance(null);
-    }
-  }
-
   public getLifecycleState() {
     return this.lifecycle.getState();
   }
@@ -601,24 +867,6 @@ export class VMController {
     if (this.healthMonitor) {
       this.healthMonitor.stop();
       this.healthMonitor = null;
-    }
-  }
-
-  public async recoverShell(): Promise<void> {
-    const activeOnSerial = this.onSerialOutput;
-    const activeOnState = this.onStateChange;
-    
-    if (activeOnSerial && activeOnState) {
-      await this.stop();
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      
-      // Perform fresh initialization
-      await this.start(
-        window.location.origin, 
-        activeOnSerial, 
-        activeOnState, 
-        this.savedState || undefined
-      );
     }
   }
 }
