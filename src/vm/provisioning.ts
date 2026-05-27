@@ -2,6 +2,49 @@
 import { Logger } from "../lib/logger";
 import { ProvisioningState } from "./vmLifecycle";
 
+export class ProvisioningCompletionParser {
+  private buffer = "";
+  
+  public feed(data: string): { type: "complete" | "failed" | "heartbeat"; id: number }[] {
+    this.buffer += data;
+    if (this.buffer.length > 4096) {
+      this.buffer = this.buffer.slice(-4096);
+    }
+    
+    const results: { type: "complete" | "failed" | "heartbeat"; id: number }[] = [];
+    
+    // Look for isolated markers
+    const completeRegex = /\*\*LLVM_PROVISION_COMPLETE\*\*:(\d+)/g;
+    let match;
+    while ((match = completeRegex.exec(this.buffer)) !== null) {
+      results.push({ type: "complete", id: parseInt(match[1], 10) });
+    }
+    
+    const failedRegex = /PROVISIONING_FAILED:(\d+)/g;
+    while ((match = failedRegex.exec(this.buffer)) !== null) {
+      results.push({ type: "failed", id: parseInt(match[1], 10) });
+    }
+
+    const heartbeatRegex = /PROVISIONING_HEARTBEAT:(\d+)/g;
+    while ((match = heartbeatRegex.exec(this.buffer)) !== null) {
+      results.push({ type: "heartbeat", id: parseInt(match[1], 10) });
+    }
+    
+    if (results.length > 0) {
+      this.buffer = this.buffer
+        .replace(/\*\*LLVM_PROVISION_COMPLETE\*\*:(\d+)/g, "")
+        .replace(/PROVISIONING_FAILED:(\d+)/g, "")
+        .replace(/PROVISIONING_HEARTBEAT:(\d+)/g, "");
+    }
+    
+    return results;
+  }
+  
+  public reset(): void {
+    this.buffer = "";
+  }
+}
+
 export class ProvisioningController {
   private state: ProvisioningState = "idle";
   private isLocked = false;
@@ -9,6 +52,8 @@ export class ProvisioningController {
   private currentExecutionId = 0;
   private executionStartTimestamp = 0;
   private lastHeartbeatTimestamp = 0;
+  private activeBridgeGeneration = 0;
+  private completionParser = new ProvisioningCompletionParser();
   private onStateChange: (state: ProvisioningState) => void;
   private onSendInput: (port: number, data: string) => Promise<void>;
 
@@ -48,10 +93,15 @@ export class ProvisioningController {
     this.onStateChange(newState);
   }
 
+  public getCompletionParser(): ProvisioningCompletionParser {
+    return this.completionParser;
+  }
+
   public reset(): void {
     this.state = "idle";
     this.isLocked = false;
     this.checkpoint = 0;
+    this.completionParser.reset();
   }
 
   public getDiagnostics(): Record<string, unknown> {
@@ -62,12 +112,14 @@ export class ProvisioningController {
       executionId: this.currentExecutionId,
       executionStartTimestamp: this.executionStartTimestamp,
       lastHeartbeatTimestamp: this.lastHeartbeatTimestamp,
+      activeBridgeGeneration: this.activeBridgeGeneration,
+      parserBufferLength: (this.completionParser as unknown as { buffer: string }).buffer.length,
       elapsedMs: this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0,
       heartbeatAgeMs: this.lastHeartbeatTimestamp ? Date.now() - this.lastHeartbeatTimestamp : 0,
     };
   }
 
-  public async startProvisioning(restoreCmd: string, inspectScript: string, useSerial1: boolean): Promise<boolean> {
+  public async startProvisioning(restoreCmd: string, inspectScript: string, useSerial1: boolean, bridgeGeneration: number): Promise<boolean> {
     if (this.isLocked || this.state === "completed") {
       Logger.warn("VM", `Provisioning ignored. Locked: ${this.isLocked}, State: ${this.state}`);
       return false;
@@ -78,11 +130,13 @@ export class ProvisioningController {
     const executionId = this.currentExecutionId;
     this.executionStartTimestamp = Date.now();
     this.lastHeartbeatTimestamp = 0;
+    this.activeBridgeGeneration = bridgeGeneration;
+    this.completionParser.reset();
 
     this.transitionTo("preparing");
     this.checkpoint = 1;
 
-    Logger.info("VM", `[PROVISIONING] Preparing execution ID ${executionId}. useSerial1=${useSerial1}, restoreCmdLen=${restoreCmd.length}, inspectScriptLen=${inspectScript.length}`);
+    Logger.info("VM", `[PROVISIONING] Preparing execution ID ${executionId}. useSerial1=${useSerial1}, bridgeGen=${bridgeGeneration}, restoreCmdLen=${restoreCmd.length}, inspectScriptLen=${inspectScript.length}`);
 
     let backgroundMonitorScript = "";
     if (useSerial1) {
@@ -180,7 +234,25 @@ ${backgroundMonitorScript}
 
 # Mark provisioning as completed BEFORE the exec
 _provision_completed=1
-echo "PROVISIONING_COMPLETE:${executionId}" > /dev/ttyS0
+echo "done" > /tmp/provision_complete
+
+# Stdout, serial, newline flush before completion emission
+echo "" > /dev/ttyS0
+sync
+sleep 1
+
+# Emit single-line, machine-readable isolation marker
+echo "**LLVM_PROVISION_COMPLETE**:${executionId}" > /dev/ttyS0
+sync
+
+# Two-way completion handshake: wait for host ACK
+while read -r ack_line; do
+  case "$ack_line" in
+    "PROVISIONING_ACK:${executionId}"*)
+      break
+      ;;
+  esac
+done < /dev/ttyS0
 
 # Replace this shell with the user login loop
 exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 > /dev/ttyS0 2>&1
@@ -218,25 +290,33 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     return true;
   }
 
-  public handleProvisioningComplete(id: number): void {
+  public handleProvisioningComplete(id: number, bridgeGeneration: number): void {
     if (id !== this.currentExecutionId) {
       Logger.warn("VM", `[PROVISIONING] Ignored stale PROVISIONING_COMPLETE marker for execution ID ${id} (current is ${this.currentExecutionId})`);
       return;
     }
+    if (bridgeGeneration !== this.activeBridgeGeneration) {
+      Logger.warn("VM", `[PROVISIONING] Ignored PROVISIONING_COMPLETE marker from stale bridge generation ${bridgeGeneration} (current is ${this.activeBridgeGeneration})`);
+      return;
+    }
     const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
-    Logger.info("VM", `[PROVISIONING] Complete! execId=${id}, elapsed=${elapsed}ms`);
+    Logger.info("VM", `[PROVISIONING] Complete! execId=${id}, bridgeGen=${bridgeGeneration}, elapsed=${elapsed}ms`);
     this.checkpoint = 2;
     this.isLocked = false;
     this.transitionTo("completed");
   }
 
-  public handleProvisioningFailed(id: number): void {
+  public handleProvisioningFailed(id: number, bridgeGeneration: number): void {
     if (id !== this.currentExecutionId) {
       Logger.warn("VM", `[PROVISIONING] Ignored stale PROVISIONING_FAILED marker for execution ID ${id} (current is ${this.currentExecutionId})`);
       return;
     }
+    if (bridgeGeneration !== this.activeBridgeGeneration) {
+      Logger.warn("VM", `[PROVISIONING] Ignored PROVISIONING_FAILED marker from stale bridge generation ${bridgeGeneration} (current is ${this.activeBridgeGeneration})`);
+      return;
+    }
     const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
-    Logger.error("VM", `[PROVISIONING] Script exited without completion marker! execId=${id}, elapsed=${elapsed}ms`);
+    Logger.error("VM", `[PROVISIONING] Script exited without completion marker! execId=${id}, bridgeGen=${bridgeGeneration}, elapsed=${elapsed}ms`);
     this.isLocked = false;
     this.transitionTo("failed");
   }

@@ -457,7 +457,7 @@ export class VMController {
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
     // Start boot watchdog timeout
-    this.timeouts.register("boot_watchdog", this.config.timeoutMs, () => {
+    this.timeouts.register("boot_watchdog", this.config.timeoutMs, async () => {
       const state = this.lifecycle.getState().state;
       if (state === "loading" || state === "booting") {
         if (Date.now() - this.lastSerialOutputTimestamp < 15000) {
@@ -465,6 +465,15 @@ export class VMController {
           this.timeouts.extend("boot_watchdog", 15000);
           return;
         }
+        
+        // Probe shell responsiveness
+        const shellResponsive = await this.probeShellResponsiveness();
+        if (shellResponsive) {
+          Logger.info("VM", "[BOOT WATCHDOG] Shell responded to probe. Extending boot timeout.");
+          this.timeouts.extend("boot_watchdog", 15000);
+          return;
+        }
+
         Logger.warn("VM", `Boot watchdog triggered. Stalled in state: ${state}`);
         this.orchestrator.triggerRecovery("boot timeout exceeded");
       }
@@ -611,22 +620,40 @@ export class VMController {
     const hasRootPrompt = this.provisioningSearchBuffer.endsWith("~% ") || 
                           this.provisioningSearchBuffer.endsWith("# ") || 
                           this.provisioningSearchBuffer.endsWith("~# ");
-    const sentinelMatch = this.provisioningSearchBuffer.match(/PROVISIONING_COMPLETE:(\d+)/);
-    const failureMatch = this.provisioningSearchBuffer.match(/PROVISIONING_FAILED:(\d+)/);
-    const heartbeatMatch = this.provisioningSearchBuffer.match(/PROVISIONING_HEARTBEAT:(\d+)/);
 
-    // ── Heartbeat: reset watchdog timer on activity ──
-    if (heartbeatMatch) {
-      const hbId = parseInt(heartbeatMatch[1], 10);
-      if (hbId === this.provisioning.getExecutionId()) {
-        this.provisioning.recordHeartbeat();
-        // Extend the watchdog since the script is actively running
-        this.timeouts.cancel("provisioning_watchdog");
-        this.timeouts.register("provisioning_watchdog", 45000, () => {
-          this._onProvisioningWatchdogFired();
-        });
-        // Clear the heartbeat from the buffer so it doesn't re-trigger
-        this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace(/PROVISIONING_HEARTBEAT:\d+/, "");
+    const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+    const activeGenId = activeGen ? activeGen.id : 0;
+    const parserEvents = this.provisioning.getCompletionParser().feed(char);
+
+    for (const event of parserEvents) {
+      const execId = event.id;
+      
+      if (event.type === "heartbeat") {
+        if (execId === this.provisioning.getExecutionId()) {
+          this.provisioning.recordHeartbeat();
+          // Extend the watchdog since the script is actively running
+          this.timeouts.cancel("provisioning_watchdog");
+          this.timeouts.register("provisioning_watchdog", 45000, () => {
+            this._onProvisioningWatchdogFired();
+          });
+        }
+      } else if (event.type === "failed") {
+        const provState = this.provisioning.getState();
+        if (provState === "executing" || provState === "waiting_completion") {
+          this.timeouts.cancel("provisioning_watchdog");
+          Logger.error("VM", `[PROVISIONING] Failure marker parsed for execId=${execId}.`);
+          this.provisioning.handleProvisioningFailed(execId, activeGenId);
+          this.orchestrator.triggerRecovery("provisioning script failure parsed");
+        }
+      } else if (event.type === "complete") {
+        const provState = this.provisioning.getState();
+        if (provState === "executing" || provState === "waiting_completion") {
+          this.timeouts.cancel("provisioning_watchdog");
+          Logger.info("VM", `[PROVISIONING] Completion marker parsed for execId=${execId}. Starting handshake/readiness check.`);
+          void this.executeTerminalReadinessHandshake(execId, activeGenId);
+        } else {
+          Logger.warn("VM", `[PROVISIONING] Completion marker parsed but state is '${provState}' (not executing/waiting_completion). execId=${execId}`);
+        }
       }
     }
 
@@ -652,67 +679,45 @@ export class VMController {
         }
       }
 
-      // Provisioning timeout guard: 45 seconds to finish provisioning
-      this.timeouts.register("provisioning_watchdog", 45000, () => {
+      // Dynamic provisioning timeout
+      let timeoutMs = 45000;
+      if (this.wasRestoredFromSnapshot) {
+        timeoutMs = 60000;
+      } else {
+        timeoutMs = 75000;
+      }
+      if (this.orchestrator.getStage() > RecoveryStage.NONE) {
+        timeoutMs += 15000;
+      }
+
+      this.timeouts.register("provisioning_watchdog", timeoutMs, () => {
         this._onProvisioningWatchdogFired();
       });
 
-      // CRITICAL: await the async provisioning call.
-      // We use void to indicate fire-and-forget but the state transitions
-      // inside startProvisioning happen before the first yield point (the send),
-      // ensuring executing/waiting_completion are set deterministically.
-      void this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.transport.hasSerial1Support());
-
-    // ── Failure marker: script exited without completion ──
-    } else if (failureMatch) {
-      const failId = parseInt(failureMatch[1], 10);
-      const provState = this.provisioning.getState();
-      if (provState === "executing" || provState === "waiting_completion") {
-        this.timeouts.cancel("provisioning_watchdog");
-        this.provisioningSearchBuffer = "";
-        Logger.error("VM", `[PROVISIONING] Failure marker detected for execId=${failId}. Script exited without completing.`);
-        this.provisioning.handleProvisioningFailed(failId);
-        this.orchestrator.triggerRecovery("provisioning script exited without completion");
-      }
-
-    // ── Completion marker: provisioning succeeded ──
-    } else if (sentinelMatch) {
-      const execId = parseInt(sentinelMatch[1], 10);
-      const provState = this.provisioning.getState();
-
-      // Accept completion from executing OR waiting_completion to handle
-      // the race where the VM script completes before the async send resolves
-      if (provState === "executing" || provState === "waiting_completion") {
-        this.timeouts.cancel("provisioning_watchdog");
-        this.provisioningSearchBuffer = "";
-
-        this.provisioning.handleProvisioningComplete(execId);
-        this.transitionState("running", "handleSerialLifecycle");
-        this.lifecycle.transitionTerminalTo("interactive", "handleSerialLifecycle");
-
-        Logger.info("VM", "[PROVISIONING] Complete. Guest VM shell running.");
-
-        if (this.onSerialOutput) {
-          this.onSerialOutput("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
-          this.onSerialOutput(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
-          this.onSerialOutput(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
-          this.onSerialOutput("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
-        }
-
-        // Tell orchestrator we are healthy and start health monitor
-        this.orchestrator.reportHealthy();
-        this.startHealthMonitoring();
-      } else {
-        Logger.warn("VM", `[PROVISIONING] Completion marker received but state is '${provState}' (not executing/waiting_completion). execId=${execId}`);
-      }
+      void this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.transport.hasSerial1Support(), activeGenId);
     }
   }
 
   // ─── Provisioning watchdog handler ─────────────────────────────────────
-  private _onProvisioningWatchdogFired(): void {
+  private async _onProvisioningWatchdogFired(): Promise<void> {
     const state = this.provisioning.getState();
     if (state === "preparing" || state === "transferring" || state === "executing" || state === "waiting_completion") {
       const diag = this.provisioning.getDiagnostics();
+      
+      // Print buffered output diagnostics
+      const parserBuffer = (this.provisioning.getCompletionParser() as unknown as { buffer: string }).buffer;
+      Logger.info("VM", `[PROVISIONING DIAGNOSTICS] Parser buffer: ${JSON.stringify(parserBuffer)}, Last 128 chars of serial: ${JSON.stringify(this.provisioningSearchBuffer.slice(-128))}`);
+      
+      // Probe shell responsiveness
+      const shellResponsive = await this.probeShellResponsiveness();
+      if (shellResponsive) {
+        Logger.info("VM", "[PROVISIONING WATCHDOG] Shell is responsive to probe. Extending provisioning timeout instead of escalating.");
+        this.timeouts.register("provisioning_watchdog", 15000, () => {
+          this._onProvisioningWatchdogFired();
+        });
+        return;
+      }
+
       Logger.error("VM", `[PROVISIONING WATCHDOG] Timeout fired. Diagnostics: ${JSON.stringify(diag)}`);
       Logger.error("VM", `[PROVISIONING WATCHDOG] Last 128 chars of serial buffer: ${JSON.stringify(this.provisioningSearchBuffer.slice(-128))}`);
       Logger.error("VM", `[PROVISIONING WATCHDOG] Serial forwarding active: ${!!this.onSerialOutput}, Runtime state: ${this.lifecycle.getState().state}`);
@@ -816,18 +821,87 @@ export class VMController {
     const execId = this.provisioning.getExecutionId();
     Logger.info("VM", `[Provisioning Recovery] Attempting non-destructive recovery for execution ID ${execId}...`);
     
-    // 1. Refresh serial listeners
+    // 1. Refresh serial listeners & reset parser
+    this.provisioning.getCompletionParser().reset();
     this.transport.reconnectSerial();
     if (this.onSerialOutput && this.onStateChange) {
       this._dispatchReattach(this.onSerialOutput, this.onStateChange);
     }
     
     // 2. Inspect shell responsiveness & verify execution alive
-    const queryCmd = `\n[ -f /tmp/p.sh ] && (ps | grep -v grep | grep -q "p.sh" && echo "PROVISIONING_HEARTBEAT:${execId}" || (grep -q "PROVISIONING_COMPLETE" /tmp/provision_exec.log 2>/dev/null && echo "PROVISIONING_COMPLETE:${execId}" || echo "PROVISIONING_FAILED:${execId}")) || echo "PROVISIONING_IDLE:${execId}"\n`;
+    const queryCmd = `\n[ -f /tmp/p.sh ] && (ps | grep -v grep | grep -q "p.sh" && echo "PROVISIONING_HEARTBEAT:${execId}" || ([ -f /tmp/provision_complete ] && echo "**LLVM_PROVISION_COMPLETE**:${execId}" || echo "PROVISIONING_FAILED:${execId}")) || echo "PROVISIONING_IDLE:${execId}"\n`;
     
     // Send the query on serial0
     void this.sendProgrammaticInput(0, queryCmd);
     Logger.info("VM", `[Provisioning Recovery] Sent completion query command for execId=${execId}`);
+  }
+
+  public async probeShellResponsiveness(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const originalBuffer = this.serialHistory;
+      const startOffset = originalBuffer.length;
+      
+      setTimeout(() => {
+        const newContent = this.serialHistory.substring(startOffset);
+        if (newContent.includes("**PONG**") || newContent.includes("**SHELL_READY**")) {
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      }, 1000);
+
+      // Send both probe commands
+      void this.sendProgrammaticInput(0, "\necho '**PONG**'\necho '**SHELL_READY**'\n");
+    });
+  }
+
+  private async executeTerminalReadinessHandshake(execId: number, activeGenId: number): Promise<void> {
+    Logger.info("VM", `[Handshake] Sending PROVISIONING_ACK for execId=${execId}...`);
+    
+    // 1. Send ACK to guest VM so it exits the read loop and starts user login shell
+    await this.sendProgrammaticInput(0, `PROVISIONING_ACK:${execId}\n`);
+    
+    // 2. Wait up to 5 seconds for the shell to start and respond to probe
+    let shellResponsive = false;
+    
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      if (!this.lifecycle.isAlive() || this.provisioning.getState() === "completed") {
+        return;
+      }
+      
+      Logger.info("VM", `[Handshake] Probing shell responsiveness (attempt ${attempt}/10)...`);
+      
+      const probeResult = await this.probeShellResponsiveness();
+      if (probeResult) {
+        shellResponsive = true;
+        break;
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    if (shellResponsive) {
+      Logger.info("VM", `[Handshake] Shell responded successfully! Handshake complete.`);
+      
+      // Finalize provisioning
+      this.provisioning.handleProvisioningComplete(execId, activeGenId);
+      
+      this.transitionState("running", "executeTerminalReadinessHandshake");
+      this.lifecycle.transitionTerminalTo("interactive", "executeTerminalReadinessHandshake");
+      
+      if (this.onSerialOutput) {
+        this.onSerialOutput("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
+        this.onSerialOutput(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
+        this.onSerialOutput(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
+        this.onSerialOutput("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
+      }
+      
+      this.orchestrator.reportHealthy();
+      this.startHealthMonitoring();
+    } else {
+      Logger.error("VM", `[Handshake] Shell failed to respond to probes after 5s. Triggering recovery callback.`);
+      this.orchestrator.triggerRecovery("provisioning completion handshake timed out");
+    }
   }
 
   private arrayBufferToBase64(buffer: ArrayBuffer): string {
