@@ -683,9 +683,9 @@ var WorkerProvisioner = {
         var sanitized = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
         
         // Process FSM states
-        var beginMarker = "<<<PROTO:BEGIN:" + execId + ">>>";
-        var visibleMarker = "<<<PROTO:FILE_VISIBLE:" + execId + ">>>";
-        var endMarker = "<<<PROTO:VERIFY_END:" + execId + ">>>";
+        var beginMarker = "<<<PROTO:" + execId + ":1:BEGIN>>>";
+        var visibleMarker = "<<<PROTO:" + execId + ":2:FILE_VISIBLE>>>";
+        var endMarker = "<<<PROTO:" + execId + ":3:VERIFY_END>>>";
         
         if (parserState === "awaiting_verify_begin") {
           var beginIdx = sanitized.indexOf(beginMarker);
@@ -726,8 +726,10 @@ var WorkerProvisioner = {
       emu.add_listener("serial0-output-byte", listener);
       
       // Build mount, copy, and test command wrapped in a single non-interactive sh -c block
+      // Prepended with stty -echo to prevent echoing the command characters to the serial port
       var testCmd = 
-        "sh -c 'PS1=\"\"; stty -echo; echo \"<<<PROTO:BEGIN:" + execId + ">>>\"; " +
+        "stty -echo\n" +
+        "sh -c 'PS1=\"\"; echo \"<<<PROTO:" + execId + ":1:BEGIN>>>\"; " +
         "mkdir -p /mnt/9p /tmp 2>/dev/null; " +
         "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
         "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
@@ -735,8 +737,8 @@ var WorkerProvisioner = {
         "cp /mnt/9p" + filePath + " " + filePath + " 2>/dev/null; " +
         "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null; " +
         "chmod +x " + filePath + " 2>/dev/null; " +
-        "if [ -f " + filePath + " ]; then echo \"<<<PROTO:FILE_VISIBLE:" + execId + ">>>\"; fi; " +
-        "echo \"<<<PROTO:VERIFY_END:" + execId + ">>>\"'\n";
+        "if [ -f " + filePath + " ]; then echo \"<<<PROTO:" + execId + ":2:FILE_VISIBLE>>>\"; fi; " +
+        "echo \"<<<PROTO:" + execId + ":3:VERIFY_END>>>\"'\n";
         
       SerialChannelManager.send(0, testCmd);
       
@@ -1203,7 +1205,8 @@ self.onmessage = async function (e) {
       } else {
         log("info", "[WorkerProvisioner] Guest visibility verified. Using local file execution mode: " + execFilePath);
         triggerCmd = 
-          "sh -c 'stty -echo; mkdir -p /mnt/9p /tmp 2>/dev/null; " +
+          "stty -echo\n" +
+          "sh -c 'mkdir -p /mnt/9p /tmp 2>/dev/null; " +
           "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p host9p /mnt/9p 2>/dev/null; " +

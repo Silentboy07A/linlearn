@@ -20,94 +20,175 @@ export class ProvisioningCompletionParser {
   private buffer = "";
   private state: "IDLE" | "VERIFY_BEGIN" | "FILE_VISIBLE" | "VERIFY_END" | "EXEC_START" | "SUCCESS" | "FAIL" = "IDLE";
   private currentExecId = -1;
+  private processedPackets = new Set<string>();
+  private lastProcessedSequence = 0;
+  private isExecutionMode = false;
+  private currentPhaseTimestamp = Date.now();
 
   public feed(data: string): { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] {
-    this.buffer += data;
+    // Sanitize immediately to prevent replacement mismatches caused by ANSI codes or carriage returns
+    this.buffer = this.sanitize(this.buffer + data);
     if (this.buffer.length > 8192) {
       this.buffer = this.buffer.slice(-8192);
     }
 
     const results: { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] = [];
 
-    // Sanitize buffer for parsing
-    const cleaned = this.sanitize(this.buffer);
-
-    // Regex to match <<<PROTO:ACTION:execId(:reason)>>>
-    const protoRegex = /<<<PROTO:([A-Z_]+):(\d+)(?::([^>]*))?>>>/g;
+    // Regex to match <<<PROTO:execId:sequence:ACTION(:reason)>>>
+    const protoRegex = /<<<PROTO:(\d+):(\d+):([A-Z_]+)(?::([^>]*))?>>>/g;
     let match;
 
     // Use a temporary array of matched items
-    const matchesToReplace: { raw: string; action: string; execId: number; reason?: string }[] = [];
+    const matchesToReplace: { raw: string; action: string; execId: number; sequence: number; reason?: string }[] = [];
 
-    while ((match = protoRegex.exec(cleaned)) !== null) {
+    while ((match = protoRegex.exec(this.buffer)) !== null) {
       const raw = match[0];
-      const action = match[1];
-      const execId = parseInt(match[2], 10);
-      const reason = match[3];
+      const execId = parseInt(match[1], 10);
+      const sequence = parseInt(match[2], 10);
+      const action = match[3];
+      const reason = match[4];
 
-      matchesToReplace.push({ raw, action, execId, reason });
+      matchesToReplace.push({ raw, action, execId, sequence, reason });
     }
 
     for (const item of matchesToReplace) {
-      const { raw, action, execId, reason } = item;
+      const { raw, action, execId, sequence, reason } = item;
+
+      // 1. Monotonic Execution ID constraint
+      if (execId < this.currentExecId) {
+        Logger.warn("VM", `[Provisioning FSM] Ignored stale execution packet '${action}' for past execId=${execId} (current=${this.currentExecId})`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+
+      if (execId > this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] Monotonic execId progression: ${this.currentExecId} -> ${execId}. Resetting parser state.`);
+        this.currentExecId = execId;
+        this.lastProcessedSequence = 0;
+        this.processedPackets.clear();
+        this.state = "IDLE";
+        this.isExecutionMode = false;
+        this.currentPhaseTimestamp = Date.now();
+      }
+
+      // 2. Execution-Phase Parser Mode Isolation
+      const isVerificationAction = action === "BEGIN" || action === "FILE_VISIBLE" || action === "VERIFY_END";
+      if (this.isExecutionMode && isVerificationAction) {
+        Logger.warn("VM", `[Provisioning FSM] Ignored stale verification marker '${action}' (seq=${sequence}) during execution phase for execId=${execId}`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+
+      // 3. Packet Deduplication
+      const packetKey = `${execId}:${sequence}:${action}`;
+      if (action !== "HEARTBEAT" && this.processedPackets.has(packetKey)) {
+        Logger.debug("VM", `[Provisioning FSM] Ignored duplicate packet '${action}' (seq=${sequence}) for execId=${execId}`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+
+      // 4. Packet Sequence Ordering Validation
+      if (action !== "HEARTBEAT" && sequence <= this.lastProcessedSequence) {
+        Logger.warn("VM", `[Provisioning FSM] Ignored out-of-order/stale packet '${action}' with sequence ${sequence} (last processed: ${this.lastProcessedSequence})`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+      if (action === "HEARTBEAT" && sequence < this.lastProcessedSequence) {
+        Logger.warn("VM", `[Provisioning FSM] Ignored stale heartbeat with sequence ${sequence} (last processed: ${this.lastProcessedSequence})`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+
+      // 5. Stale Frame TTL Check (15 seconds verification phase timeout protection)
+      if (isVerificationAction && (Date.now() - this.currentPhaseTimestamp > 15000)) {
+        Logger.warn("VM", `[Provisioning FSM] Discarded stale verification marker '${action}' exceeding TTL`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
 
       // Validate transitions
       let transitionAllowed = false;
       const oldState = this.state;
+      let rejectionReason = "";
 
       if (action === "BEGIN") {
-        if (this.state === "IDLE" || execId !== this.currentExecId) {
-          this.currentExecId = execId;
+        if (this.state === "IDLE") {
           this.state = "VERIFY_BEGIN";
           transitionAllowed = true;
+        } else {
+          rejectionReason = `FSM state not IDLE (current state: ${this.state})`;
         }
       } else if (action === "FILE_VISIBLE") {
-        if (this.state === "VERIFY_BEGIN" && execId === this.currentExecId) {
+        if (this.state === "VERIFY_BEGIN") {
           this.state = "FILE_VISIBLE";
           transitionAllowed = true;
+        } else {
+          rejectionReason = `FSM state not VERIFY_BEGIN (current state: ${this.state})`;
         }
       } else if (action === "VERIFY_END") {
-        if ((this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE") && execId === this.currentExecId) {
+        if (this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE") {
           this.state = "VERIFY_END";
           transitionAllowed = true;
+        } else {
+          rejectionReason = `FSM state not VERIFY_BEGIN or FILE_VISIBLE (current state: ${this.state})`;
         }
       } else if (action === "EXEC_START") {
-        if ((this.state === "IDLE" || this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_END") && execId === this.currentExecId) {
+        if (this.state === "IDLE" || this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_END") {
           this.state = "EXEC_START";
           results.push({ type: "exec_start", id: execId });
           transitionAllowed = true;
+        } else {
+          rejectionReason = `FSM state not IDLE/VERIFY_BEGIN/FILE_VISIBLE/VERIFY_END (current state: ${this.state})`;
         }
       } else if (action === "HEARTBEAT") {
-        if (this.state === "EXEC_START" && execId === this.currentExecId) {
+        if (this.state === "EXEC_START") {
           results.push({ type: "heartbeat", id: execId });
           transitionAllowed = true;
+        } else {
+          rejectionReason = `FSM state not EXEC_START (current state: ${this.state})`;
         }
       } else if (action === "EXEC_COMPLETE") {
-        if ((this.state === "EXEC_START" || this.state === "VERIFY_END" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_BEGIN") && execId === this.currentExecId) {
+        if (this.state === "EXEC_START" || this.state === "VERIFY_END" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_BEGIN") {
           this.state = "SUCCESS";
           results.push({ type: "complete", id: execId });
           transitionAllowed = true;
+        } else {
+          rejectionReason = `FSM state not EXEC_START/VERIFY_END/FILE_VISIBLE/VERIFY_BEGIN (current state: ${this.state})`;
         }
       } else if (action === "FAIL") {
-        if (this.state !== "SUCCESS" && this.state !== "FAIL" && execId === this.currentExecId) {
+        if (this.state !== "SUCCESS" && this.state !== "FAIL") {
           this.state = "FAIL";
           results.push({ type: "failed", id: execId });
           transitionAllowed = true;
           Logger.error("VM", `[Provisioning FSM] Transitioned to FAIL for execId=${execId}. Reason: ${reason}`);
+        } else {
+          rejectionReason = `FSM state already SUCCESS or FAIL (current state: ${this.state})`;
         }
       } else if (action === "SHELL_READY") {
-        if (this.state === "SUCCESS" && execId === this.currentExecId) {
+        if (this.state === "SUCCESS") {
           results.push({ type: "shell_ready", id: execId });
           transitionAllowed = true;
+        } else {
+          rejectionReason = `FSM state not SUCCESS (current state: ${this.state})`;
         }
+      } else {
+        rejectionReason = `Unknown action type: ${action}`;
       }
 
       if (transitionAllowed) {
+        if (action !== "HEARTBEAT") {
+          this.processedPackets.add(packetKey);
+          this.lastProcessedSequence = sequence;
+        }
+        this.currentPhaseTimestamp = Date.now();
+        if (action === "EXEC_START" || this.state === "SUCCESS" || this.state === "FAIL") {
+          this.isExecutionMode = true;
+        }
         if (oldState !== this.state) {
-          Logger.info("VM", `[Provisioning FSM] State: ${oldState} -> ${this.state} for execId=${execId}`);
+          Logger.info("VM", `[Provisioning FSM] State transition SUCCESS: ${oldState} -> ${this.state} for execId=${execId} (seq: ${sequence}, incoming frame: ${action})`);
         }
       } else {
-        Logger.warn("VM", `[Provisioning FSM] Rejected transition: ${this.state} -> ${action} for execId=${execId} (current=${this.currentExecId})`);
+        Logger.warn("VM", `[Provisioning FSM] Transition REJECTED: ${this.state} -> ${action} for execId=${execId} (seq: ${sequence}, currentExecId=${this.currentExecId}). Reason: ${rejectionReason}`);
       }
 
       // Remove the raw matched token from the original buffer
@@ -122,10 +203,24 @@ export class ProvisioningCompletionParser {
     return str.replace(ansiRegex, "").replace(/\r/g, "");
   }
 
+  public enterExecutionMode(): void {
+    Logger.info("VM", `[Provisioning FSM] Explicitly entering EXECUTION_MODE. Ignoring all future verification markers.`);
+    this.isExecutionMode = true;
+  }
+
+  public flush(): void {
+    Logger.info("VM", `[Provisioning FSM] Flushing parser buffer. Current state: ${this.state}, execId: ${this.currentExecId}`);
+    this.buffer = "";
+  }
+
   public reset(): void {
     this.buffer = "";
     this.state = "IDLE";
     this.currentExecId = -1;
+    this.processedPackets.clear();
+    this.lastProcessedSequence = 0;
+    this.isExecutionMode = false;
+    this.currentPhaseTimestamp = Date.now();
   }
 }
 
@@ -417,29 +512,29 @@ _provision_completed=0
 trap '
   _exit_code=$?
   if [ "$_provision_completed" -eq 0 ]; then
-    echo "<<<PROTO:FAIL:${executionId}:exit_code_\$_exit_code>>>" > /dev/ttyS0
+    echo "<<<PROTO:${executionId}:7:FAIL:exit_code_\$_exit_code>>>" > /dev/ttyS0
   fi
 ' EXIT
 
-echo "<<<PROTO:EXEC_START:${executionId}>>>" > /dev/ttyS0
+echo "<<<PROTO:${executionId}:4:EXEC_START>>>" > /dev/ttyS0
 echo "[PROVISIONING] Started execution ID: ${executionId}"
-echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
+echo "<<<PROTO:${executionId}:5:HEARTBEAT>>>" > /dev/ttyS0
 
 hostname linlearn
 mkdir -p /home/user/Projects /home/user/.config /home/user/workspace
 adduser -D -h /home/user -s /bin/sh user 2>/dev/null || true
 
-echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
+echo "<<<PROTO:${executionId}:5:HEARTBEAT>>>" > /dev/ttyS0
 
 ${restoreCmd}
 
-echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
+echo "<<<PROTO:${executionId}:5:HEARTBEAT>>>" > /dev/ttyS0
 
 cat << 'PROFILE_EOF' > /home/user/.profile
 export HOME=/home/user
 export PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\$ '
 cd /home/user
-echo "<<<PROTO:SHELL_READY:${executionId}>>>"
+echo "<<<PROTO:${executionId}:8:SHELL_READY>>>"
 PROFILE_EOF
 
 cat << 'INSPECT_EOF' > /usr/bin/linlearn-inspect
@@ -450,7 +545,7 @@ chmod +x /usr/bin/linlearn-inspect
 chown -R user:user /home/user
 chown user /dev/ttyS0
 
-echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
+echo "<<<PROTO:${executionId}:5:HEARTBEAT>>>" > /dev/ttyS0
 
 ${backgroundMonitorScript}
 
@@ -461,7 +556,7 @@ echo "" > /dev/ttyS0
 sync
 sleep 1
 
-echo "<<<PROTO:EXEC_COMPLETE:${executionId}>>>" > /dev/ttyS0
+echo "<<<PROTO:${executionId}:6:EXEC_COMPLETE>>>" > /dev/ttyS0
 sync
 
 while read -r ack_line; do
@@ -614,6 +709,10 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       `Sending PROVISION_EXECUTE...`
     );
     this.transitionTransportTo("awaiting_execute");
+
+    // Flush serial parser buffer and enter execution mode (Requirement 5, 10, 14)
+    this.completionParser.flush();
+    this.completionParser.enterExecutionMode();
 
     // Start timer waiting for execution to start
     this._startExecStartTimer(ready.execId);
