@@ -66,7 +66,7 @@ export class RecoveryPolicyEngine {
     reason: string
   ): { decision: RecoveryActionDecision; reason: string } {
     const isBootingOrLoading = health.runtimeState === "loading" || health.runtimeState === "booting";
-    const isProvisioning = health.runtimeState === "provisioning";
+    const isProvisioning = health.runtimeState === "provisioning" || health.runtimeState === "shell_ready" || health.runtimeState === "terminal_ready";
     
     // Active boot protection: during loading/booting/provisioning, limit destructive actions
     if (isBootingOrLoading || isProvisioning) {
@@ -306,7 +306,7 @@ export class RecoveryOrchestrator {
     health: VMHealthStatus,
     reason: string
   ): void {
-    const isProvisioningOnly = health.runtimeState === "provisioning" && health.workerResponding && health.cpuRunning;
+    const isProvisioningOnly = (health.runtimeState === "provisioning" || health.runtimeState === "shell_ready" || health.runtimeState === "terminal_ready") && health.workerResponding && health.cpuRunning;
     const preventedDestructive = (decision !== "vm_soft_reboot" && decision !== "cold_boot_fallback") && 
       (requestedStage === RecoveryStage.VM_SOFT_REBOOT || requestedStage === RecoveryStage.COLD_BOOT_FALLBACK);
 

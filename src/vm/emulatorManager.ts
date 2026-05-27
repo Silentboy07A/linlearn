@@ -28,6 +28,57 @@ class AsyncMutex {
   }
 }
 
+export class RuntimeSteadyStateValidator {
+  constructor(private controller: VMController) {}
+
+  public async validate(): Promise<{ passed: boolean; reason?: string }> {
+    const health = this.controller.getHealthStatus();
+    
+    // 1. Worker alive & responding
+    if (!health.workerResponding) {
+      return { passed: false, reason: "Worker is not responding or not in READY state." };
+    }
+    
+    // 2. Bridge ready
+    if (health.workerState !== WorkerBridgeState.READY) {
+      return { passed: false, reason: `Bridge is not in READY state. Current state: ${health.workerState}` };
+    }
+
+    // 3. Shell responsive
+    const shellResponsive = await this.controller.probeShellResponsiveness();
+    if (!shellResponsive) {
+      return { passed: false, reason: "Shell failed responsiveness probe." };
+    }
+
+    // 4. Terminal interactive (listeners registered)
+    const fullState = this.controller.getFullLifecycleState();
+    if (fullState.terminal !== "attached" && fullState.terminal !== "interactive" && fullState.terminal !== "recovering") {
+      return { passed: false, reason: `Terminal state is not active. Current: ${fullState.terminal}` };
+    }
+
+    // 5. Active generation valid
+    const access = this.controller as unknown as { transport: TransportCoordinator };
+    const activeGen = access.transport.getGenerationManager().getActiveGeneration();
+    if (!activeGen || !activeGen.isValid) {
+      return { passed: false, reason: "Active worker generation is invalid." };
+    }
+
+    // 6. No pending recovery
+    const accessOrch = this.controller as unknown as { orchestrator: RecoveryOrchestrator };
+    if (accessOrch.orchestrator.getStage() !== RecoveryStage.NONE) {
+      return { passed: false, reason: `Recovery orchestrator is actively executing recovery stage: ${RecoveryStage[accessOrch.orchestrator.getStage()]}` };
+    }
+
+    // 7. Provisioning completed
+    if (fullState.provisioning !== "completed" && fullState.provisioning !== "recovering" && fullState.provisioning !== "waiting_completion") {
+      return { passed: false, reason: `Provisioning state is not completed. Current: ${fullState.provisioning}` };
+    }
+
+    return { passed: true };
+  }
+}
+
+
 // ─── Emulator Action Types ──────────────────────────────────────────────────
 // Every lifecycle intent is expressed as a typed action dispatched through
 // the central gate. No subsystem may mutate lifecycle state directly.
@@ -45,7 +96,7 @@ export type EmulatorAction =
 // Maps each action type to the set of lifecycle states from which it is valid.
 const ACTION_VALID_FROM: Record<EmulatorAction["type"], Set<VMStateName> | "always" | "alive"> = {
   START:         new Set<VMStateName>(["idle", "stopped", "error"]),
-  STOP:          new Set<VMStateName>(["loading", "booting", "provisioning", "running", "stopping"]),
+  STOP:          new Set<VMStateName>(["loading", "booting", "provisioning", "shell_ready", "terminal_ready", "running", "stopping"]),
   RECOVER_SHELL: "alive",
   SOFT_REBOOT:   "alive",
   COLD_BOOT:     "alive",
@@ -109,7 +160,7 @@ export class VMController {
   constructor(config: Partial<VMSessionConfig> = {}) {
     this.transport = new TransportCoordinator(() => {
       const state = this.lifecycle.getState().state;
-      return state !== "loading" && state !== "booting" && state !== "provisioning";
+      return state !== "loading" && state !== "booting" && state !== "provisioning" && state !== "shell_ready" && state !== "terminal_ready";
     });
     this.lifecycle = new VMLifecycleManager();
     this.config = ResourceLimitsValidator.validate(config);
@@ -229,7 +280,7 @@ export class VMController {
     token: number
   ): Promise<void> {
     const state = this.lifecycle.getState().state;
-    if (this.initPromise || state === "loading" || state === "booting" || state === "provisioning" || state === "running") {
+    if (this.initPromise || state === "loading" || state === "booting" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "running") {
       Logger.warn("VM", `[START IGNORED] VM is already starting, booting, or active (state: ${state}). Ignoring duplicate START.`);
       this.orchestrator.recordDuplicateStartSuppression();
       return;
@@ -649,10 +700,20 @@ export class VMController {
         const provState = this.provisioning.getState();
         if (provState === "executing" || provState === "waiting_completion") {
           this.timeouts.cancel("provisioning_watchdog");
-          Logger.info("VM", `[PROVISIONING] Completion marker parsed for execId=${execId}. Starting handshake/readiness check.`);
-          void this.executeTerminalReadinessHandshake(execId, activeGenId);
+          Logger.info("VM", `[PROVISIONING] Completion marker parsed for execId=${execId}. Transitioning to shell_ready & starting handshake.`);
+          this.transitionState("shell_ready", "handleSerialLifecycle");
+          void this.executeTerminalReadinessHandshake(execId);
         } else {
           Logger.warn("VM", `[PROVISIONING] Completion marker parsed but state is '${provState}' (not executing/waiting_completion). execId=${execId}`);
+        }
+      } else if (event.type === "shell_ready") {
+        const state = this.lifecycle.getState().state;
+        if (state === "shell_ready") {
+          Logger.info("VM", `[Handshake] Deterministic SHELL_READY parsed for execId=${execId}. Transitioning to terminal_ready.`);
+          this.transitionState("terminal_ready", "handleSerialLifecycle");
+          void this.resolveTerminalReadinessConvergence(execId, activeGenId);
+        } else {
+          Logger.warn("VM", `[Handshake] SHELL_READY parsed but VM state is '${state}' (not shell_ready). execId=${execId}`);
         }
       }
     }
@@ -855,39 +916,90 @@ export class VMController {
     });
   }
 
-  private async executeTerminalReadinessHandshake(execId: number, activeGenId: number): Promise<void> {
+  private async executeTerminalReadinessHandshake(execId: number): Promise<void> {
     Logger.info("VM", `[Handshake] Sending PROVISIONING_ACK for execId=${execId}...`);
     
-    // 1. Send ACK to guest VM so it exits the read loop and starts user login shell
+    // Register the handshake_watchdog timeout (5s)
+    this.timeouts.register("handshake_watchdog", 5000, () => {
+      const state = this.lifecycle.getState().state;
+      if (state === "shell_ready") {
+        Logger.error("VM", `[Handshake] Handshake watchdog fired! SHELL_READY marker was not received within 5 seconds for execId=${execId}.`);
+        this.dumpConvergenceDiagnostics("Handshake watchdog timeout");
+        this.orchestrator.triggerRecovery("provisioning completion handshake timed out");
+      }
+    });
+
+    // Send ACK to guest VM so it exits the read loop and starts user login shell
     await this.sendProgrammaticInput(0, `PROVISIONING_ACK:${execId}\n`);
-    
-    // 2. Wait up to 5 seconds for the shell to start and respond to probe
-    let shellResponsive = false;
-    
-    for (let attempt = 1; attempt <= 10; attempt++) {
-      if (!this.lifecycle.isAlive() || this.provisioning.getState() === "completed") {
+  }
+
+  private async resolveTerminalReadinessConvergence(execId: number, activeGenId: number): Promise<void> {
+    const startTime = Date.now();
+    Logger.info("VM", `[Convergence] Resolving terminal readiness convergence. execId=${execId}, activeGenId=${activeGenId}`);
+
+    // 1. Idle stabilization window (Requirement 11): 500ms
+    Logger.info("VM", "[Convergence] Waiting for 500ms stabilization window...");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    if (!this.lifecycle.isAlive() || this.lifecycle.getState().state !== "terminal_ready") {
+      Logger.warn("VM", "[Convergence] VM left terminal_ready state during stabilization window.");
+      return;
+    }
+
+    // 2. Terminal attach synchronization barrier (Requirement 4)
+    // Wait for xterm attached, serial listeners active, stdin routing ready, output parser ready
+    const listenersActive = this.onSerialOutput !== null && this.onStateChange !== null;
+    const transportReady = this.transport.getGenerationManager().getActiveGeneration()?.isValid || false;
+    const parserReady = !!this.provisioning.getCompletionParser();
+
+    if (!listenersActive || !transportReady || !parserReady) {
+      Logger.warn("VM", `[Convergence] Terminal attach barrier failed: listenersActive=${listenersActive}, transportReady=${transportReady}, parserReady=${parserReady}`);
+      // Attempt non-destructive terminal recovery (Requirement 9)
+      await this.attemptNonDestructiveTerminalRecovery();
+      
+      // Recheck once after recovery
+      const recheckListeners = this.onSerialOutput !== null && this.onStateChange !== null;
+      if (!recheckListeners) {
+        this.dumpConvergenceDiagnostics("Terminal attach barrier failure");
+        this.orchestrator.triggerRecovery("terminal attach barrier failed after recovery");
         return;
       }
-      
-      Logger.info("VM", `[Handshake] Probing shell responsiveness (attempt ${attempt}/10)...`);
-      
-      const probeResult = await this.probeShellResponsiveness();
-      if (probeResult) {
-        shellResponsive = true;
-        break;
-      }
-      
-      await new Promise(resolve => setTimeout(resolve, 500));
     }
-    
-    if (shellResponsive) {
-      Logger.info("VM", `[Handshake] Shell responded successfully! Handshake complete.`);
-      
-      // Finalize provisioning
-      this.provisioning.handleProvisioningComplete(execId, activeGenId);
-      
-      this.transitionState("running", "executeTerminalReadinessHandshake");
-      this.lifecycle.transitionTerminalTo("interactive", "executeTerminalReadinessHandshake");
+
+    // 3. Lifecycle quiet-state stabilization (Requirement 10)
+    // No pending dispatches, no active recovery escalation, no bridge recreation pending
+    const hasPendingDispatches = (this.lifecycleMutex as unknown as { queue: Promise<void> }).queue !== Promise.resolve();
+    const activeRecovery = this.orchestrator.getRecoveryState() === "recovering";
+    const bridgeRecreationPending = this.transport.getGenerationManager().getActiveGeneration()?.bridge.getState() === WorkerBridgeState.UNINITIALIZED;
+
+    if (hasPendingDispatches || activeRecovery || bridgeRecreationPending) {
+      Logger.warn("VM", `[Convergence] Quiet-state validation failed: activeRecovery=${activeRecovery}, bridgeRecreationPending=${bridgeRecreationPending}`);
+      this.dumpConvergenceDiagnostics("Quiet-state stabilization failure");
+      this.orchestrator.triggerRecovery("quiet-state stabilization failed");
+      return;
+    }
+
+    // 4. Runtime steady-state validation (Requirement 5)
+    const validator = new RuntimeSteadyStateValidator(this);
+    const validationResult = await validator.validate();
+    if (!validationResult.passed) {
+      Logger.error("VM", `[Convergence] Steady-state validation failed: ${validationResult.reason}`);
+      this.dumpConvergenceDiagnostics(`Steady-state validation failure: ${validationResult.reason}`);
+      this.orchestrator.triggerRecovery(`steady-state validation failed: ${validationResult.reason}`);
+      return;
+    }
+
+    // 5. Buffered stdout drain (Requirement 6)
+    // Flush serial queue, drain stdout buffer, synchronize parser state
+    this.drainStdoutBuffers();
+
+    // 6. Transition to running
+    // Finalize provisioning
+    this.provisioning.handleProvisioningComplete(execId, activeGenId);
+
+    const isTransitioned = this.transitionState("running", "resolveTerminalReadinessConvergence");
+    if (isTransitioned) {
+      this.lifecycle.transitionTerminalTo("interactive", "resolveTerminalReadinessConvergence");
       
       if (this.onSerialOutput) {
         this.onSerialOutput("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
@@ -895,13 +1007,66 @@ export class VMController {
         this.onSerialOutput(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
         this.onSerialOutput("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
       }
-      
+
       this.orchestrator.reportHealthy();
       this.startHealthMonitoring();
+
+      // Track structured convergence telemetry (Requirement 12)
+      const duration = Date.now() - startTime;
+      Logger.info("VM", `[Telemetry] Convergence completed successfully. Duration: ${duration}ms. execId: ${execId}, activeGenId: ${activeGenId}`);
     } else {
-      Logger.error("VM", `[Handshake] Shell failed to respond to probes after 5s. Triggering recovery callback.`);
-      this.orchestrator.triggerRecovery("provisioning completion handshake timed out");
+      Logger.error("VM", "[Convergence] State transition to running failed.");
+      this.dumpConvergenceDiagnostics("State transition to running failed");
+      this.orchestrator.triggerRecovery("running transition failed");
     }
+  }
+
+  private drainStdoutBuffers(): void {
+    Logger.info("VM", "[Convergence] Draining stdout/serial buffers...");
+    this.provisioningSearchBuffer = "";
+    this.provisioning.getCompletionParser().reset();
+  }
+
+  public async attemptNonDestructiveTerminalRecovery(): Promise<void> {
+    Logger.info("VM", "[Recovery] Initiating non-destructive terminal recovery...");
+
+    // 1. Reset parser
+    this.provisioning.getCompletionParser().reset();
+
+    // 2. Listener rebind & xterm reconnect
+    this.transport.reconnectSerial();
+    if (this.onSerialOutput && this.onStateChange) {
+      this._dispatchReattach(this.onSerialOutput, this.onStateChange);
+    }
+
+    // 3. TTY refresh
+    if (this.transport.hasSerial1Support()) {
+      Logger.info("VM", "[Recovery] Refreshing TTY settings via serial1...");
+      await this.sendProgrammaticInput(1, "RECOVER_TTY\n");
+    } else {
+      Logger.info("VM", "[Recovery] Refreshing TTY settings via serial0...");
+      await this.sendProgrammaticInput(0, "\x03\rreset\r");
+    }
+
+    Logger.info("VM", "[Recovery] Non-destructive terminal recovery complete.");
+  }
+
+  private dumpConvergenceDiagnostics(reason: string): void {
+    const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+    const activeGenId = activeGen ? activeGen.id : 0;
+    const parserBuffer = (this.provisioning.getCompletionParser() as unknown as { buffer: string }).buffer;
+    const termAttached = this.onSerialOutput !== null && this.onStateChange !== null;
+    const hasPendingDispatches = (this.lifecycleMutex as unknown as { queue: Promise<void> }).queue !== Promise.resolve();
+
+    Logger.error("VM", `=== CONVERGENCE DIAGNOSTICS: ${reason} ===`);
+    Logger.error("VM", `  - Current Runtime State: ${this.lifecycle.getState().state}`);
+    Logger.error("VM", `  - Provisioning State: ${this.provisioning.getState()}`);
+    Logger.error("VM", `  - Terminal Attach State: ${termAttached ? "attached" : "detached"}`);
+    Logger.error("VM", `  - Parser State: buffer length = ${parserBuffer ? parserBuffer.length : 0}`);
+    Logger.error("VM", `  - Active Generation: ${activeGenId}`);
+    Logger.error("VM", `  - Pending Lifecycle Actions: ${hasPendingDispatches}`);
+    Logger.error("VM", `  - Last 128 chars of serial: ${JSON.stringify(this.provisioningSearchBuffer.slice(-128))}`);
+    Logger.error("VM", `=========================================`);
   }
 
   private arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -948,7 +1113,7 @@ export class VMController {
     // Interactivity is decoupled: keyboard input allowed when VM is booting/provisioning/running
     // sendInput does NOT mutate lifecycle — no dispatch() needed.
     const status = this.lifecycle.getState().state;
-    if (status !== "running" && status !== "booting" && status !== "provisioning") {
+    if (status !== "running" && status !== "booting" && status !== "provisioning" && status !== "shell_ready" && status !== "terminal_ready") {
       Logger.warn("VM", `Refusing input: VM in state: ${status}`);
       return;
     }
@@ -969,7 +1134,7 @@ export class VMController {
 
   public sendProgrammaticInput(port: number, data: string): Promise<void> {
     const stateName = this.lifecycle.getState().state;
-    if (stateName !== "running" && stateName !== "booting" && stateName !== "provisioning") {
+    if (stateName !== "running" && stateName !== "booting" && stateName !== "provisioning" && stateName !== "shell_ready" && stateName !== "terminal_ready") {
       Logger.warn("VM", `Refusing programmatic input in non-interactive state: ${stateName}`);
       return Promise.resolve();
     }

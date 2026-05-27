@@ -36,7 +36,9 @@ export class VMLifecycleManager {
     idle:         new Set<VMStateName>(["loading", "stopped"]),
     loading:      new Set<VMStateName>(["booting", "running", "error", "stopped"]),
     booting:      new Set<VMStateName>(["provisioning", "running", "error", "stopped"]),
-    provisioning: new Set<VMStateName>(["running", "error", "stopped"]),
+    provisioning: new Set<VMStateName>(["shell_ready", "running", "error", "stopped"]),
+    shell_ready:  new Set<VMStateName>(["terminal_ready", "error", "stopped"]),
+    terminal_ready: new Set<VMStateName>(["running", "error", "stopped"]),
     running:      new Set<VMStateName>(["stopping", "stopped", "error"]),
     stopping:     new Set<VMStateName>(["stopped", "error"]),
     stopped:      new Set<VMStateName>(["idle", "loading", "booting"]),
@@ -215,7 +217,9 @@ export class VMLifecycleManager {
     return (
       this.currentState.state === "loading" ||
       this.currentState.state === "booting" ||
-      this.currentState.state === "provisioning"
+      this.currentState.state === "provisioning" ||
+      this.currentState.state === "shell_ready" ||
+      this.currentState.state === "terminal_ready"
     );
   }
 }

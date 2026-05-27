@@ -1034,7 +1034,7 @@ export function TerminalSimulator({
           }
           if (!v86EmulatorRef.current) return;
           const vmState = v86EmulatorRef.current.getLifecycleState().state;
-          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
+          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready") {
             console.warn("[xterm DEBUG] onData ignored: VM not in interactive state:", vmState);
             return;
           }
@@ -1082,7 +1082,7 @@ export function TerminalSimulator({
           }
           if (!v86EmulatorRef.current) return false;
           const vmState = v86EmulatorRef.current.getLifecycleState().state;
-          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting") {
+          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready") {
             console.warn("[xterm DEBUG] attachCustomKeyEventHandler rejected: VM not in interactive state:", vmState);
             return false;
           }
@@ -1498,6 +1498,8 @@ export function TerminalSimulator({
               vmStateName === "loading" || 
               vmStateName === "booting" || 
               vmStateName === "provisioning" || 
+              vmStateName === "shell_ready" || 
+              vmStateName === "terminal_ready" || 
               vmStateName === "idle" || 
               vmStateName === "stopping" ||
               recoveryState === "recovering" ||
@@ -1511,6 +1513,8 @@ export function TerminalSimulator({
                    vmStateName === "loading" ? "Downloading WebAssembly & Linux Kernel..." :
                    vmStateName === "booting" ? "Booting Real Linux Kernel in WASM..." :
                    vmStateName === "provisioning" ? "Provisioning User Environment Silently..." :
+                   vmStateName === "shell_ready" ? "Verifying Shell Readiness..." :
+                   vmStateName === "terminal_ready" ? "Synchronizing Terminal Interface..." :
                    "Initializing Virtual Machine..."}
                 </span>
                 <span className="text-xs font-mono text-gray-600">
@@ -1519,6 +1523,8 @@ export function TerminalSimulator({
                    vmStateName === "loading" ? "Downloading Buildroot disk image (~10MB)" :
                    vmStateName === "booting" ? "Decompressing kernel & starting x86 CPU" :
                    vmStateName === "provisioning" ? "Configuring user login & inspect hooks" :
+                   vmStateName === "shell_ready" ? "Establishing deterministic login shell handshake" :
+                   vmStateName === "terminal_ready" ? "Draining stdout buffers & running health checks" :
                    "Configuring virtual resources (96MB RAM)"}
                 </span>
               </div>
@@ -1536,7 +1542,7 @@ export function TerminalSimulator({
                       recoveryState === "crashloop" ? "bg-rose-600 animate-ping" :
                       recoveryState === "recovering" ? "bg-amber-500 animate-ping" :
                       vmStateName === "running" ? "bg-emerald-500 animate-pulse" : 
-                      (vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "loading") ? "bg-amber-500 animate-pulse" : 
+                      (vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "loading" || vmStateName === "shell_ready" || vmStateName === "terminal_ready") ? "bg-amber-500 animate-pulse" : 
                       vmStateName === "stopping" ? "bg-orange-500 animate-pulse" :
                       vmStateName === "error" ? "bg-rose-500 animate-pulse" : "bg-gray-500"
                     }`} />

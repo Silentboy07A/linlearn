@@ -5,13 +5,13 @@ import { ProvisioningState } from "./vmLifecycle";
 export class ProvisioningCompletionParser {
   private buffer = "";
   
-  public feed(data: string): { type: "complete" | "failed" | "heartbeat"; id: number }[] {
+  public feed(data: string): { type: "complete" | "failed" | "heartbeat" | "shell_ready"; id: number }[] {
     this.buffer += data;
     if (this.buffer.length > 4096) {
       this.buffer = this.buffer.slice(-4096);
     }
     
-    const results: { type: "complete" | "failed" | "heartbeat"; id: number }[] = [];
+    const results: { type: "complete" | "failed" | "heartbeat" | "shell_ready"; id: number }[] = [];
     
     // Look for isolated markers
     const completeRegex = /\*\*LLVM_PROVISION_COMPLETE\*\*:(\d+)/g;
@@ -29,12 +29,18 @@ export class ProvisioningCompletionParser {
     while ((match = heartbeatRegex.exec(this.buffer)) !== null) {
       results.push({ type: "heartbeat", id: parseInt(match[1], 10) });
     }
+
+    const shellReadyRegex = /\*\*SHELL_READY\*\*:(\d+)/g;
+    while ((match = shellReadyRegex.exec(this.buffer)) !== null) {
+      results.push({ type: "shell_ready", id: parseInt(match[1], 10) });
+    }
     
     if (results.length > 0) {
       this.buffer = this.buffer
         .replace(/\*\*LLVM_PROVISION_COMPLETE\*\*:(\d+)/g, "")
         .replace(/PROVISIONING_FAILED:(\d+)/g, "")
-        .replace(/PROVISIONING_HEARTBEAT:(\d+)/g, "");
+        .replace(/PROVISIONING_HEARTBEAT:(\d+)/g, "")
+        .replace(/\*\*SHELL_READY\*\*:(\d+)/g, "");
     }
     
     return results;
@@ -218,6 +224,7 @@ cat << 'PROFILE_EOF' > /home/user/.profile
 export HOME=/home/user
 export PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\\\$ '
 cd /home/user
+echo "**SHELL_READY**:${executionId}"
 PROFILE_EOF
 
 cat << 'INSPECT_EOF' > /usr/bin/linlearn-inspect
