@@ -218,6 +218,12 @@ export class TransportCoordinator {
     recreatePromise: null
   };
 
+  private serialAttachedChecker: (() => boolean) | null = null;
+
+  public setSerialAttachedChecker(checker: () => boolean): void {
+    this.serialAttachedChecker = checker;
+  }
+
   private isRecreationAllowed: () => boolean;
   private lastInitGenerationId = 0;
 
@@ -347,23 +353,35 @@ export class TransportCoordinator {
       // 3. Initialize and wait for WORKER_READY handshake
       Logger.info("VM", `[TransportCoordinator] Initializing fresh bridge generation ${newGen.id}`);
       try {
-        await newBridge.initializeBridge(config.workerUrl, (type, payload) => {
-          const currentActive = this.generationManager.getActiveGeneration();
-          if (!currentActive || currentActive.id !== newGen.id || !currentActive.isValid) {
-            Logger.warn("VM", `[TransportCoordinator] Dropping callback message '${type}' from stale bridge generation ${newGen.id}`);
-            this.generationManager.recordStaleAsyncInvalidation();
-            return;
-          }
+        await newBridge.initializeBridge(
+          config.workerUrl,
+          (type, payload) => {
+            const currentActive = this.generationManager.getActiveGeneration();
+            if (!currentActive || currentActive.id !== newGen.id || !currentActive.isValid) {
+              Logger.warn("VM", `[TransportCoordinator] Dropping callback message '${type}' from stale bridge generation ${newGen.id}`);
+              this.generationManager.recordStaleAsyncInvalidation();
+              return;
+            }
 
-          if (type === "INIT_SUCCESS") {
-            const initPayload = payload as { hasSerial1?: boolean } | undefined;
-            this.state.hasSerial1 = !!(initPayload && initPayload.hasSerial1);
-          }
+            if (type === "INIT_SUCCESS") {
+              const initPayload = payload as { hasSerial1?: boolean } | undefined;
+              this.state.hasSerial1 = !!(initPayload && initPayload.hasSerial1);
+            }
 
-          if (config.onMessageCallback) {
-            config.onMessageCallback(type, payload);
+            if (config.onMessageCallback) {
+              config.onMessageCallback(type, payload);
+            }
+          },
+          {
+            isSerialAttached: () => {
+              return this.serialAttachedChecker ? this.serialAttachedChecker() : false;
+            },
+            isGenerationCommitted: (genId: number) => {
+              const active = this.generationManager.getActiveGeneration();
+              return active !== null && active.id === genId && active.isValid;
+            }
           }
-        });
+        );
       } catch (err) {
         if (LifecycleErrorClassifier.isFatal(err)) {
           throw err;
@@ -424,7 +442,12 @@ export class TransportCoordinator {
       }
 
       const currentBridge = this.getBridge();
-      await currentBridge.waitUntilReady();
+      await currentBridge.waitUntilFullyReady();
+
+      if (type === "INIT" && currentBridge.getState() !== WorkerBridgeState.READY) {
+        throw new WorkerBridgeError(`Refusing to dispatch INIT: bridge state is not READY (${currentBridge.getState()})`);
+      }
+
       currentBridge.post(type, payload);
     } catch (err) {
       if (LifecycleErrorClassifier.isFatal(err)) {

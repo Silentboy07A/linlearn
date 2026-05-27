@@ -169,6 +169,9 @@ export class VMController {
       const state = this.lifecycle.getState().state;
       return state !== "loading" && state !== "booting" && state !== "provisioning" && state !== "shell_ready" && state !== "terminal_ready";
     });
+    this.transport.setSerialAttachedChecker(() => {
+      return this.lifecycle.getFullState().terminal !== "detached";
+    });
     this.lifecycle = new VMLifecycleManager();
     this.config = ResourceLimitsValidator.validate(config);
 
@@ -510,7 +513,7 @@ export class VMController {
     this.provisioningSearchBuffer = "";
 
     this.transitionState("loading", "VMController.start");
-    this.lifecycle.transitionTerminalTo("detached", "VMController.start");
+    this.lifecycle.transitionTerminalTo("attached", "VMController.start");
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
@@ -682,10 +685,22 @@ export class VMController {
         }
       }).then(() => {
         if (abortSignal.aborted) return;
-        Logger.info("VM", "Worker is ready. Dispatching INIT configuration...");
-        
+
         const activeGen = this.transport.getGenerationManager().getActiveGeneration();
         const activeGenId = activeGen ? activeGen.id : 0;
+        const bridgeDiagnostics = activeGen?.bridge.getReadinessDiagnostics();
+
+        Logger.info("VM", "[INIT PREFLIGHT DIAGNOSTICS]", {
+          bridgeState: activeGen?.bridge.getState(),
+          listenersAttached: bridgeDiagnostics?.listenersAttached,
+          serialAttachState: this.lifecycle.getFullState().terminal,
+          generationCommitted: bridgeDiagnostics?.generationCommitted,
+          ownershipToken: activeGen?.ownershipToken,
+          transportState: (this.transport as unknown as { state: unknown }).state,
+          ts: Date.now()
+        });
+
+        Logger.info("VM", "Worker is ready. Dispatching INIT configuration...");
         
         this.initDispatchTimestamp = Date.now();
         
@@ -717,11 +732,26 @@ export class VMController {
   private dumpInitDiagnostics(activeGenId: number): void {
     const currentState = this.lifecycle.getState().state;
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+    const bridgeDiagnostics = activeGen?.bridge.getReadinessDiagnostics();
+
+    // Determine which conditions failed
+    const failedConditions: string[] = [];
+    if (bridgeDiagnostics) {
+      if (!bridgeDiagnostics.handshakeReceived) failedConditions.push("worker_handshake");
+      if (!bridgeDiagnostics.listenersAttached) failedConditions.push("listeners_attached");
+      if (!bridgeDiagnostics.serialInitialized) failedConditions.push("serial_initialized");
+      if (!bridgeDiagnostics.generationCommitted) failedConditions.push("generation_committed");
+    } else {
+      failedConditions.push("no_active_bridge");
+    }
+
     Logger.error("VM", "[INIT TIMEOUT DIAGNOSTICS]", {
       workerState: "loading",
       runtimeState: currentState,
       bridgeGeneration: activeGenId,
       bridgeState: activeGen?.bridge.getState(),
+      failedReadinessConditions: failedConditions,
+      bridgeReadinessDetails: bridgeDiagnostics,
       pendingDispatches: this.initPromise !== null,
       activeListeners: {
         hasSerialOutputListener: !!this.onSerialOutput,

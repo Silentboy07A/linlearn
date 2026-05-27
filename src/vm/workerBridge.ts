@@ -4,12 +4,20 @@ import { Logger } from "../lib/logger";
 export enum WorkerBridgeState {
   UNINITIALIZED = "uninitialized",
   INITIALIZING = "initializing",
+  ATTACHING_LISTENERS = "attaching_listeners",
+  INITIALIZING_SERIAL = "initializing_serial",
+  COMMITTING_GENERATION = "committing_generation",
   READY = "ready",
   DEGRADED = "degraded",
   FAILED = "failed",
   TERMINATING = "terminating",
   TERMINATED = "terminated",
   RECOVERING = "recovering"
+}
+
+export interface BridgeReadinessValidator {
+  isSerialAttached: () => boolean;
+  isGenerationCommitted: (genId: number) => boolean;
 }
 
 export class WorkerBridgeError extends Error {
@@ -60,6 +68,19 @@ export class WorkerBridge {
   private queuedCount = 0;
   private droppedCount = 0;
   private errorCount = 0;
+
+  // Readiness barrier flags
+  private handshakeReceived = false;
+  private listenersAttached = false;
+  private serialInitialized = false;
+  private generationCommitted = false;
+
+  // Telemetry timestamps
+  private handshakeReceivedAt = 0;
+  private listenersAttachedAt = 0;
+  private serialInitializedAt = 0;
+  private fsmReadyCommittedAt = 0;
+  private initDispatchedAt = 0;
 
   constructor(generationId: number = 0, ownershipToken: string = "") {
     this.generationId = generationId;
@@ -129,9 +150,18 @@ export class WorkerBridge {
     }
   }
 
-  public initializeBridge(workerUrl: string, onMessage: (type: string, payload: unknown) => void): Promise<void> {
-    if (this.state === WorkerBridgeState.INITIALIZING) {
-      Logger.warn("VM", `[WorkerBridge ${this.generationId}] Initialization already in progress.`);
+  public initializeBridge(
+    workerUrl: string, 
+    onMessage: (type: string, payload: unknown) => void,
+    validator: BridgeReadinessValidator
+  ): Promise<void> {
+    if (
+      this.state === WorkerBridgeState.INITIALIZING ||
+      this.state === WorkerBridgeState.ATTACHING_LISTENERS ||
+      this.state === WorkerBridgeState.INITIALIZING_SERIAL ||
+      this.state === WorkerBridgeState.COMMITTING_GENERATION
+    ) {
+      Logger.warn("VM", `[WorkerBridge ${this.generationId}] Initialization already in progress (state: ${this.state}).`);
       return this.waitUntilReady();
     }
 
@@ -146,13 +176,32 @@ export class WorkerBridge {
     this.onMessageCallback = onMessage;
     this.deferredQueue = [];
 
+    // Reset barrier flags
+    this.handshakeReceived = false;
+    this.listenersAttached = false;
+    this.serialInitialized = false;
+    this.generationCommitted = false;
+
+    // Reset telemetry
+    this.handshakeReceivedAt = 0;
+    this.listenersAttachedAt = 0;
+    this.serialInitializedAt = 0;
+    this.fsmReadyCommittedAt = 0;
+    this.initDispatchedAt = 0;
+
     return new Promise<void>((resolve, reject) => {
       // Setup timeout for worker initialization: 10 seconds max
       const initTimeout = setTimeout(() => {
-        if (this.state === WorkerBridgeState.INITIALIZING && this.isValid) {
-          Logger.error("VM", `[WorkerBridge ${this.generationId}] Initialization timed out after 10s.`);
+        if (
+          (this.state === WorkerBridgeState.INITIALIZING ||
+           this.state === WorkerBridgeState.ATTACHING_LISTENERS ||
+           this.state === WorkerBridgeState.INITIALIZING_SERIAL ||
+           this.state === WorkerBridgeState.COMMITTING_GENERATION) && 
+          this.isValid
+        ) {
+          Logger.error("VM", `[WorkerBridge ${this.generationId}] Initialization timed out after 10s at state: ${this.state}`);
           this.transitionTo(WorkerBridgeState.FAILED);
-          reject(new WorkerBridgeError("Worker initialization timed out"));
+          reject(new WorkerBridgeError(`Worker initialization timed out at state: ${this.state}`));
         }
       }, 10000);
 
@@ -175,20 +224,64 @@ export class WorkerBridge {
           if (type === "WORKER_READY") {
             clearTimeout(initTimeout);
             this.readyAt = Date.now();
-            this.transitionTo(WorkerBridgeState.READY);
-            Logger.info("VM", `[WorkerBridge ${this.generationId}] Handshake received. Ready in ${this.readyAt - this.initStartedAt}ms`);
             
-            // Resolve the handshake promise
-            resolve();
-            if (this.readyResolver) {
-              const res = this.readyResolver;
-              this.readyResolver = null;
-              this.readyRejecter = null;
-              res();
+            // 1. Handshake received
+            this.handshakeReceived = true;
+            this.handshakeReceivedAt = Date.now();
+            this.transitionTo(WorkerBridgeState.ATTACHING_LISTENERS);
+            Logger.info("VM", `[WorkerBridge ${this.generationId}] Handshake received. Transitioning to ATTACHING_LISTENERS`);
+            
+            // 2. Attach listeners
+            if (this.onMessageCallback) {
+              this.listenersAttached = true;
+              this.listenersAttachedAt = Date.now();
+              this.transitionTo(WorkerBridgeState.INITIALIZING_SERIAL);
+              Logger.info("VM", `[WorkerBridge ${this.generationId}] Listeners confirmed. Transitioning to INITIALIZING_SERIAL`);
+            } else {
+              Logger.error("VM", `[WorkerBridge ${this.generationId}] Listener verification failed: onMessageCallback is missing!`);
+              this.transitionTo(WorkerBridgeState.FAILED);
+              reject(new WorkerBridgeError("Listener verification failed"));
+              return;
             }
 
-            // Flush deferred queue
-            this.flushQueue();
+            // 3. Initialize serial
+            if (validator.isSerialAttached()) {
+              this.serialInitialized = true;
+              this.serialInitializedAt = Date.now();
+              this.transitionTo(WorkerBridgeState.COMMITTING_GENERATION);
+              Logger.info("VM", `[WorkerBridge ${this.generationId}] Serial confirmed initialized. Transitioning to COMMITTING_GENERATION`);
+            } else {
+              Logger.error("VM", `[WorkerBridge ${this.generationId}] Serial initialization check failed: serial is detached.`);
+              this.transitionTo(WorkerBridgeState.FAILED);
+              reject(new WorkerBridgeError("Serial initialization check failed"));
+              return;
+            }
+
+            // 4. Commit generation
+            if (validator.isGenerationCommitted(this.generationId)) {
+              this.generationCommitted = true;
+              
+              // Flush deferred queue
+              this.flushQueue();
+
+              // 5. Commit state READY
+              this.transitionTo(WorkerBridgeState.READY);
+              this.fsmReadyCommittedAt = Date.now();
+              Logger.info("VM", `[WorkerBridge ${this.generationId}] All readiness barriers satisfied. State is now READY.`);
+              
+              resolve();
+              if (this.readyResolver) {
+                const res = this.readyResolver;
+                this.readyResolver = null;
+                this.readyRejecter = null;
+                res();
+              }
+            } else {
+              Logger.error("VM", `[WorkerBridge ${this.generationId}] Generation commit check failed for genId ${this.generationId}.`);
+              this.transitionTo(WorkerBridgeState.FAILED);
+              reject(new WorkerBridgeError("Generation commit check failed"));
+              return;
+            }
             return;
           }
 
@@ -205,7 +298,12 @@ export class WorkerBridge {
           this.errorCount++;
           Logger.error("VM", `[WorkerBridge ${this.generationId}] Worker thread error`, err);
           
-          if (this.state === WorkerBridgeState.INITIALIZING) {
+          if (
+            this.state === WorkerBridgeState.INITIALIZING ||
+            this.state === WorkerBridgeState.ATTACHING_LISTENERS ||
+            this.state === WorkerBridgeState.INITIALIZING_SERIAL ||
+            this.state === WorkerBridgeState.COMMITTING_GENERATION
+          ) {
             this.transitionTo(WorkerBridgeState.FAILED);
             reject(err);
           } else if (this.state === WorkerBridgeState.READY) {
@@ -257,12 +355,21 @@ export class WorkerBridge {
   }
 
   public post(type: string, payload?: unknown): void {
+    if (type === "INIT") {
+      this.initDispatchedAt = Date.now();
+    }
     if (this.state === WorkerBridgeState.READY && this.worker) {
-      this.worker.postMessage({ type, payload });
+      this.worker.postMessage({ type, payload, generation: this.generationId });
       return;
     }
 
-    if (this.state === WorkerBridgeState.INITIALIZING || this.state === WorkerBridgeState.UNINITIALIZED) {
+    if (
+      this.state === WorkerBridgeState.UNINITIALIZED ||
+      this.state === WorkerBridgeState.INITIALIZING ||
+      this.state === WorkerBridgeState.ATTACHING_LISTENERS ||
+      this.state === WorkerBridgeState.INITIALIZING_SERIAL ||
+      this.state === WorkerBridgeState.COMMITTING_GENERATION
+    ) {
       this.queuedCount++;
       Logger.info("VM", `[WorkerBridge ${this.generationId}] Queueing message: ${type} (state: ${this.state})`);
       this.deferredQueue.push({ type, payload });
@@ -271,6 +378,35 @@ export class WorkerBridge {
 
     this.droppedCount++;
     Logger.warn("VM", `[WorkerBridge ${this.generationId}] Dropped message: ${type} (state is ${this.state})`);
+  }
+
+  public waitUntilFullyReady(): Promise<void> {
+    if (this.state === WorkerBridgeState.READY) {
+      // Validate all readiness invariants before resolving
+      if (!this.handshakeReceived || !this.listenersAttached || !this.serialInitialized || !this.generationCommitted) {
+        return Promise.reject(new WorkerBridgeError("Readiness invariants violated in READY state"));
+      }
+      return Promise.resolve();
+    }
+    return this.waitUntilReady();
+  }
+
+  public getReadinessDiagnostics() {
+    return {
+      generationId: this.generationId,
+      state: this.state,
+      handshakeReceived: this.handshakeReceived,
+      listenersAttached: this.listenersAttached,
+      serialInitialized: this.serialInitialized,
+      generationCommitted: this.generationCommitted,
+      telemetry: {
+        handshakeReceivedAt: this.handshakeReceivedAt,
+        listenersAttachedAt: this.listenersAttachedAt,
+        serialInitializedAt: this.serialInitializedAt,
+        fsmReadyCommittedAt: this.fsmReadyCommittedAt,
+        initDispatchedAt: this.initDispatchedAt
+      }
+    };
   }
 
   private flushQueue(): void {
