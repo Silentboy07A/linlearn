@@ -295,6 +295,12 @@ var WorkerProvisioner = {
   totalExpected: 0,
   receivedCount: 0,
   active: false,
+  state: "idle", // idle, assembling, validating_fs, writing, verifying, executable, executing, completed, failed
+
+  transitionTo: function(newState) {
+    log("info", "[WorkerProvisioner] FSM State: " + this.state + " -> " + newState);
+    this.state = newState;
+  },
 
   /**
    * Compute simple XOR checksum (matches provisioningProtocol.ts).
@@ -320,6 +326,7 @@ var WorkerProvisioner = {
     this.chunks = new Array(payload.totalChunks);
     this.receivedCount = 0;
     this.active = true;
+    this.transitionTo("assembling");
     log("info", "[WorkerProvisioner] Session started. execId=" + this.execId + ", totalChunks=" + this.totalExpected + ", totalBytes=" + payload.totalBytes);
   },
 
@@ -379,47 +386,178 @@ var WorkerProvisioner = {
   },
 
   /**
-   * Write the assembled script to the VM filesystem using create_file().
-   * Returns a Promise.
+   * Helper to dynamically create parent directories in 9p filesystem.
    */
-  writeFile: async function(emu, filePath) {
+  ensureParentDirectories: function(emu, filePath) {
+    var c = emu.fs9p;
+    if (!c) return;
+
+    var path = filePath.replace(/\/\/+/g, "/");
+    var parts = path.split("/");
+    if (parts[0] === "") {
+      parts.shift();
+    }
+    if (parts.length > 0) {
+      parts.pop(); // Remove the filename to get just directory paths
+    }
+
+    var currentId = 0; // Root directory in 9p
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      if (part === "" || part === "." || part === "..") continue;
+
+      var nextId = c.Search(currentId, part);
+      if (nextId === -1) {
+        log("info", "[WorkerProvisioner] Creating directory '" + part + "' in 9p filesystem under node " + currentId);
+        currentId = c.CreateDirectory(part, currentId);
+      } else {
+        currentId = nextId;
+      }
+    }
+  },
+
+  /**
+   * Log comprehensive filesystem diagnostics.
+   */
+  logDiagnostics: function(emu, filePath) {
+    var fs = emu.fs9p;
+    log("info", "[WorkerProvisioner DIAGNOSTICS] Target Path: " + filePath + 
+               " | Emulator Status: " + (emu ? "initialized" : "null") +
+               " | Lifecycle State: " + lifecycleState +
+               " | FS Ready State: " + (fs ? "mounted" : "not_mounted") +
+               " | Mount Tag: host9p" +
+               " | Total Mounts: " + (fs && fs.mounts ? fs.mounts.length : 0));
+  },
+
+  /**
+   * Await filesystem mounting/ready status with retries.
+   */
+  waitAndValidateFS: async function(emu, filePath) {
+    var retries = 5;
+    var delay = 200;
+
+    this.transitionTo("validating_fs");
+    this.logDiagnostics(emu, filePath);
+
+    // Barrier 1: emulator check
     if (!emu) {
-      throw new Error("[WorkerProvisioner] Emulator not available for file write.");
+      throw new Error("Emulator not initialized");
+    }
+
+    // Barrier 2: lifecycle state check
+    if (lifecycleState !== "booting" && lifecycleState !== "running") {
+      throw new Error("Cannot write file when lifecycleState is " + lifecycleState);
+    }
+
+    // Barrier 3: fs9p readiness check with retry loop
+    for (var i = 0; i < retries; i++) {
+      if (emu.fs9p && typeof emu.create_file === "function") {
+        log("info", "[WorkerProvisioner] Filesystem ready on attempt " + (i + 1));
+        return true;
+      }
+      log("warn", "[WorkerProvisioner] Filesystem not ready. Retrying in " + delay + "ms... (attempt " + (i + 1) + "/" + retries + ")");
+      await new Promise(function(resolve) { setTimeout(resolve, delay); });
+    }
+
+    // Diagnostics if it failed
+    this.logDiagnostics(emu, filePath);
+    if (!emu.fs9p) {
+      throw new Error("fs9p (9p filesystem layer) is not initialized on emulator");
     }
     if (typeof emu.create_file !== "function") {
-      throw new Error("[WorkerProvisioner] emulator.create_file() is not available.");
+      throw new Error("emulator.create_file() function is missing");
     }
+  },
+
+  /**
+   * Write the assembled script to the VM filesystem using create_file() with validation.
+   */
+  writeFile: async function(emu, filePath) {
+    var startTime = Date.now();
+    await this.waitAndValidateFS(emu, filePath);
+
+    this.transitionTo("writing");
+    this.ensureParentDirectories(emu, filePath);
+
     var script = this.assembleScript();
     log("info", "[WorkerProvisioner] Writing " + script.length + " bytes to " + filePath + " via create_file()");
+
     var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
     var bytes;
     if (encoder) {
       bytes = encoder.encode(script);
     } else {
-      // Fallback for older environments
       bytes = new Uint8Array(script.length);
       for (var i = 0; i < script.length; i++) {
         bytes[i] = script.charCodeAt(i) & 0xFF;
       }
     }
+
     await emu.create_file(filePath, bytes);
-    log("info", "[WorkerProvisioner] File written successfully: " + filePath);
+    
+    // Integrity verification FSM step
+    this.transitionTo("verifying");
+    var fs = emu.fs9p;
+    var search = fs.SearchPath(filePath);
+    
+    if (search.id === -1) {
+      throw new Error("Verification failed: File not found in 9p filesystem after write");
+    }
+    
+    var inode = fs.GetInode(search.id);
+    if (inode.size !== bytes.length) {
+      throw new Error("Verification failed: File size mismatch. Wrote " + bytes.length + ", got " + inode.size);
+    }
+
+    // Try reading it back to verify readability
+    var readData = await emu.read_file(filePath);
+    if (!readData || readData.length !== bytes.length) {
+      throw new Error("Verification failed: File could not be read back or length mismatch");
+    }
+
+    this.transitionTo("executable");
+    var writeLatency = Date.now() - startTime;
+    log("info", "[WorkerProvisioner] File write verified successfully. Latency: " + writeLatency + "ms");
+
+    // Return structured telemetry
+    return {
+      fsReadyTimestamp: startTime,
+      writeLatencyMs: writeLatency,
+      filePath: filePath,
+      fileSize: bytes.length,
+      verified: true
+    };
   },
 
   /**
-   * Write a binary blob directly to the VM filesystem.
-   * Used for the user home backup tar.gz transfer.
+   * Write a binary blob directly to the VM filesystem with validation.
    */
   writeBinaryFile: async function(emu, filePath, data) {
-    if (!emu) {
-      throw new Error("[WorkerProvisioner] Emulator not available for binary file write.");
-    }
-    if (typeof emu.create_file !== "function") {
-      throw new Error("[WorkerProvisioner] emulator.create_file() is not available.");
-    }
+    var startTime = Date.now();
+    await this.waitAndValidateFS(emu, filePath);
+
+    this.transitionTo("writing");
+    this.ensureParentDirectories(emu, filePath);
+
     log("info", "[WorkerProvisioner] Writing binary blob of " + data.byteLength + " bytes to " + filePath + " via create_file()");
     await emu.create_file(filePath, data);
-    log("info", "[WorkerProvisioner] Binary file written successfully: " + filePath);
+
+    // Verify
+    this.transitionTo("verifying");
+    var fs = emu.fs9p;
+    var search = fs.SearchPath(filePath);
+    if (search.id === -1) {
+      throw new Error("Verification failed: Binary file not found in 9p filesystem after write");
+    }
+
+    var inode = fs.GetInode(search.id);
+    if (inode.size !== data.byteLength) {
+      throw new Error("Verification failed: Binary file size mismatch. Wrote " + data.byteLength + ", got " + inode.size);
+    }
+
+    this.transitionTo("executable");
+    var writeLatency = Date.now() - startTime;
+    log("info", "[WorkerProvisioner] Binary file write verified successfully. Latency: " + writeLatency + "ms");
   },
 
   /**
@@ -432,6 +570,7 @@ var WorkerProvisioner = {
     this.receivedCount = 0;
     this.totalExpected = 0;
     this.execId = 0;
+    this.transitionTo("idle");
   }
 };
 
@@ -772,11 +911,12 @@ self.onmessage = async function (e) {
       var writeExecId = payload.execId;
       var writeFilePath = payload.filePath;
       try {
-        await WorkerProvisioner.writeFile(emulator, writeFilePath);
+        var telemetry = await WorkerProvisioner.writeFile(emulator, writeFilePath);
         postToHost("PROVISION_READY", {
           execId: writeExecId,
           generation: payload.generation,
-          filePath: writeFilePath
+          filePath: writeFilePath,
+          telemetry: telemetry
         });
       } catch (writeErr) {
         log("error", "[WorkerProvisioner] create_file() failed: " + (writeErr.message || String(writeErr)));
@@ -818,13 +958,24 @@ self.onmessage = async function (e) {
       var execFilePath = payload.filePath;
       var execExecId = payload.execId;
       log("info", "[WorkerProvisioner] Triggering script execution via serial: sh " + execFilePath);
-      // Disable echo first, then execute atomically
-      var triggerCmd = "stty -echo; sh " + execFilePath + "\n";
+      WorkerProvisioner.transitionTo("executing");
+      
+      // Build a robust trigger command: mount virtio-9p, copy script locally, and run
+      var triggerCmd = 
+        "stty -echo\n" +
+        "mkdir -p /mnt/9p /tmp\n" +
+        "mount -t 9p host9p /mnt/9p -o trans=virtio,version=9p2000.L 2>/dev/null\n" +
+        "cp /mnt/9p" + execFilePath + " " + execFilePath + " 2>/dev/null\n" +
+        "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null\n" +
+        "chmod +x " + execFilePath + " 2>/dev/null\n" +
+        "sh " + execFilePath + "\n";
+
       var sent = SerialChannelManager.send(0, triggerCmd);
       if (sent) {
         postToHost("PROVISION_ACK", { type: "execute", execId: execExecId });
       } else {
         postToHost("PROVISION_NACK", { execId: execExecId, reason: "serial_send_failed" });
+        WorkerProvisioner.transitionTo("failed");
       }
       break;
     }

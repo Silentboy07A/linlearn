@@ -98,6 +98,13 @@ export interface ProvisionReadyPayload {
   execId: number;
   generation: number;
   filePath: string;
+  telemetry?: {
+    fsReadyTimestamp: number;
+    writeLatencyMs: number;
+    filePath: string;
+    fileSize: number;
+    verified: boolean;
+  };
 }
 
 // ─── Utility: XOR checksum ─────────────────────────────────────────────────

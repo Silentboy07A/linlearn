@@ -172,6 +172,7 @@ export class ProvisioningController {
     this.isLocked = true;
     this.currentExecutionId++;
     const executionId = this.currentExecutionId;
+    const filePath = `/tmp/provision_${executionId}.sh`;
     this.executionStartTimestamp = Date.now();
     this.lastHeartbeatTimestamp = 0;
     this.activeBridgeGeneration = bridgeGeneration;
@@ -340,7 +341,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     this.onPostMessage("PROVISION_WRITE", {
       execId: executionId,
       generation: bridgeGeneration,
-      filePath: "/tmp/p.sh",
+      filePath: filePath,
     });
     // PROVISION_READY is handled by handleProvisionAck() below
 
@@ -438,6 +439,14 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     if (bridgeGeneration !== this.activeBridgeGeneration) {
       Logger.warn("VM", `[PROVISIONING] Stale PROVISION_READY from generation ${bridgeGeneration}. Ignoring.`);
       return;
+    }
+    if (ready.telemetry) {
+      Logger.info(
+        "VM",
+        `[PROVISIONING TELEMETRY] FS Ready: ${ready.telemetry.fsReadyTimestamp}, ` +
+        `Write Latency: ${ready.telemetry.writeLatencyMs}ms, Path: ${ready.telemetry.filePath}, ` +
+        `Size: ${ready.telemetry.fileSize} bytes, Verified: ${ready.telemetry.verified}`
+      );
     }
     Logger.info("VM", `[PROVISIONING] PROVISION_READY received. File ${ready.filePath} written to VM FS. Sending PROVISION_EXECUTE...`);
     this.transitionTransportTo("awaiting_execute");
