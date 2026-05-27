@@ -818,7 +818,9 @@ export class VMController {
 
     const hasRootPrompt = this.provisioningSearchBuffer.endsWith("~% ") || 
                           this.provisioningSearchBuffer.endsWith("# ") || 
-                          this.provisioningSearchBuffer.endsWith("~# ");
+                          this.provisioningSearchBuffer.endsWith("~# ") ||
+                          this.provisioningSearchBuffer.endsWith("root% ") ||
+                          this.provisioningSearchBuffer.endsWith("% ");
 
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
     const activeGenId = activeGen ? activeGen.id : 0;
@@ -831,6 +833,15 @@ export class VMController {
         if (execId === this.provisioning.getExecutionId()) {
           this.provisioning.recordHeartbeat();
           // Extend the watchdog since the script is actively running
+          this.timeouts.cancel("provisioning_watchdog");
+          this.timeouts.register("provisioning_watchdog", 45000, () => {
+            this._onProvisioningWatchdogFired();
+          });
+        }
+      } else if (event.type === "exec_start") {
+        if (execId === this.provisioning.getExecutionId()) {
+          this.provisioning.handleExecStart(execId);
+          // Extend the watchdog
           this.timeouts.cancel("provisioning_watchdog");
           this.timeouts.register("provisioning_watchdog", 45000, () => {
             this._onProvisioningWatchdogFired();
@@ -869,6 +880,11 @@ export class VMController {
     // ── Boot ready: root prompt detected, start provisioning ──
     if (hasRootPrompt && this.provisioning.getState() === "idle") {
       this.timeouts.cancel("boot_watchdog");
+      
+      // Disable echo and canonical mode immediately to isolate the stream
+      Logger.info("VM", "[PROVISIONING] Disabling serial echo and line discipline (stty -echo -icanon) immediately...");
+      void this.sendProgrammaticInput(0, "stty -echo -icanon\n");
+
       this.transitionState("provisioning", "handleSerialLifecycle");
       this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
 
@@ -1035,8 +1051,7 @@ export class VMController {
       this._dispatchReattach(this.onSerialOutput, this.onStateChange);
     }
     
-    // 2. Inspect shell responsiveness & verify execution alive
-    const queryCmd = `\n[ -f /tmp/p.sh ] && (ps | grep -v grep | grep -q "p.sh" && echo "PROVISIONING_HEARTBEAT:${execId}" || ([ -f /tmp/provision_complete ] && echo "**LLVM_PROVISION_COMPLETE**:${execId}" || echo "PROVISIONING_FAILED:${execId}")) || echo "PROVISIONING_IDLE:${execId}"\n`;
+    const queryCmd = `\nstty -echo; if [ -f /tmp/provision_${execId}.sh ]; then if ps | grep -v grep | grep -q "provision_${execId}.sh"; then echo "<<<PROTO:HEARTBEAT:${execId}>>>"; elif [ -f /tmp/provision_complete ]; then echo "<<<PROTO:EXEC_COMPLETE:${execId}>>>"; else echo "<<<PROTO:FAIL:${execId}:recovery_script_terminated>>>"; fi; else echo "<<<PROTO:FAIL:${execId}:recovery_script_not_found>>>"; fi\n`;
     
     // Send the query on serial0
     void this.sendProgrammaticInput(0, queryCmd);

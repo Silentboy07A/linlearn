@@ -683,9 +683,9 @@ var WorkerProvisioner = {
         var sanitized = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
         
         // Process FSM states
-        var beginMarker = "<<<VERIFY_BEGIN:" + execId + ">>>";
-        var visibleMarker = "<<<FILE_VISIBLE:" + execId + ">>>";
-        var endMarker = "<<<VERIFY_END:" + execId + ">>>";
+        var beginMarker = "<<<PROTO:BEGIN:" + execId + ">>>";
+        var visibleMarker = "<<<PROTO:FILE_VISIBLE:" + execId + ">>>";
+        var endMarker = "<<<PROTO:VERIFY_END:" + execId + ">>>";
         
         if (parserState === "awaiting_verify_begin") {
           var beginIdx = sanitized.indexOf(beginMarker);
@@ -727,7 +727,7 @@ var WorkerProvisioner = {
       
       // Build mount, copy, and test command wrapped in a single non-interactive sh -c block
       var testCmd = 
-        "sh -c 'PS1=\"\"; stty -echo; echo \"<<<VERIFY_BEGIN:" + execId + ">>>\"; " +
+        "sh -c 'PS1=\"\"; stty -echo; echo \"<<<PROTO:BEGIN:" + execId + ">>>\"; " +
         "mkdir -p /mnt/9p /tmp 2>/dev/null; " +
         "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
         "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
@@ -735,8 +735,8 @@ var WorkerProvisioner = {
         "cp /mnt/9p" + filePath + " " + filePath + " 2>/dev/null; " +
         "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null; " +
         "chmod +x " + filePath + " 2>/dev/null; " +
-        "if [ -f " + filePath + " ]; then echo \"<<<FILE_VISIBLE:" + execId + ">>>\"; fi; " +
-        "echo \"<<<VERIFY_END:" + execId + ">>>\"'\n";
+        "if [ -f " + filePath + " ]; then echo \"<<<PROTO:FILE_VISIBLE:" + execId + ">>>\"; fi; " +
+        "echo \"<<<PROTO:VERIFY_END:" + execId + ">>>\"'\n";
         
       SerialChannelManager.send(0, testCmd);
       

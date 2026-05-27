@@ -18,49 +18,114 @@ import {
 
 export class ProvisioningCompletionParser {
   private buffer = "";
+  private state: "IDLE" | "VERIFY_BEGIN" | "FILE_VISIBLE" | "VERIFY_END" | "EXEC_START" | "SUCCESS" | "FAIL" = "IDLE";
+  private currentExecId = -1;
 
-  public feed(data: string): { type: "complete" | "failed" | "heartbeat" | "shell_ready"; id: number }[] {
+  public feed(data: string): { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] {
     this.buffer += data;
-    if (this.buffer.length > 4096) {
-      this.buffer = this.buffer.slice(-4096);
+    if (this.buffer.length > 8192) {
+      this.buffer = this.buffer.slice(-8192);
     }
 
-    const results: { type: "complete" | "failed" | "heartbeat" | "shell_ready"; id: number }[] = [];
+    const results: { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] = [];
 
-    const completeRegex = /\*\*LLVM_PROVISION_COMPLETE\*\*:(\d+)/g;
+    // Sanitize buffer for parsing
+    const cleaned = this.sanitize(this.buffer);
+
+    // Regex to match <<<PROTO:ACTION:execId(:reason)>>>
+    const protoRegex = /<<<PROTO:([A-Z_]+):(\d+)(?::([^>]*))?>>>/g;
     let match;
-    while ((match = completeRegex.exec(this.buffer)) !== null) {
-      results.push({ type: "complete", id: parseInt(match[1], 10) });
+
+    // Use a temporary array of matched items
+    const matchesToReplace: { raw: string; action: string; execId: number; reason?: string }[] = [];
+
+    while ((match = protoRegex.exec(cleaned)) !== null) {
+      const raw = match[0];
+      const action = match[1];
+      const execId = parseInt(match[2], 10);
+      const reason = match[3];
+
+      matchesToReplace.push({ raw, action, execId, reason });
     }
 
-    const failedRegex = /PROVISIONING_FAILED:(\d+)/g;
-    while ((match = failedRegex.exec(this.buffer)) !== null) {
-      results.push({ type: "failed", id: parseInt(match[1], 10) });
-    }
+    for (const item of matchesToReplace) {
+      const { raw, action, execId, reason } = item;
 
-    const heartbeatRegex = /PROVISIONING_HEARTBEAT:(\d+)/g;
-    while ((match = heartbeatRegex.exec(this.buffer)) !== null) {
-      results.push({ type: "heartbeat", id: parseInt(match[1], 10) });
-    }
+      // Validate transitions
+      let transitionAllowed = false;
+      const oldState = this.state;
 
-    const shellReadyRegex = /\*\*SHELL_READY\*\*:(\d+)/g;
-    while ((match = shellReadyRegex.exec(this.buffer)) !== null) {
-      results.push({ type: "shell_ready", id: parseInt(match[1], 10) });
-    }
+      if (action === "BEGIN") {
+        if (this.state === "IDLE" || execId !== this.currentExecId) {
+          this.currentExecId = execId;
+          this.state = "VERIFY_BEGIN";
+          transitionAllowed = true;
+        }
+      } else if (action === "FILE_VISIBLE") {
+        if (this.state === "VERIFY_BEGIN" && execId === this.currentExecId) {
+          this.state = "FILE_VISIBLE";
+          transitionAllowed = true;
+        }
+      } else if (action === "VERIFY_END") {
+        if ((this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE") && execId === this.currentExecId) {
+          this.state = "VERIFY_END";
+          transitionAllowed = true;
+        }
+      } else if (action === "EXEC_START") {
+        if ((this.state === "IDLE" || this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_END") && execId === this.currentExecId) {
+          this.state = "EXEC_START";
+          results.push({ type: "exec_start", id: execId });
+          transitionAllowed = true;
+        }
+      } else if (action === "HEARTBEAT") {
+        if (this.state === "EXEC_START" && execId === this.currentExecId) {
+          results.push({ type: "heartbeat", id: execId });
+          transitionAllowed = true;
+        }
+      } else if (action === "EXEC_COMPLETE") {
+        if ((this.state === "EXEC_START" || this.state === "VERIFY_END" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_BEGIN") && execId === this.currentExecId) {
+          this.state = "SUCCESS";
+          results.push({ type: "complete", id: execId });
+          transitionAllowed = true;
+        }
+      } else if (action === "FAIL") {
+        if (this.state !== "SUCCESS" && this.state !== "FAIL" && execId === this.currentExecId) {
+          this.state = "FAIL";
+          results.push({ type: "failed", id: execId });
+          transitionAllowed = true;
+          Logger.error("VM", `[Provisioning FSM] Transitioned to FAIL for execId=${execId}. Reason: ${reason}`);
+        }
+      } else if (action === "SHELL_READY") {
+        if (this.state === "SUCCESS" && execId === this.currentExecId) {
+          results.push({ type: "shell_ready", id: execId });
+          transitionAllowed = true;
+        }
+      }
 
-    if (results.length > 0) {
-      this.buffer = this.buffer
-        .replace(/\*\*LLVM_PROVISION_COMPLETE\*\*:(\d+)/g, "")
-        .replace(/PROVISIONING_FAILED:(\d+)/g, "")
-        .replace(/PROVISIONING_HEARTBEAT:(\d+)/g, "")
-        .replace(/\*\*SHELL_READY\*\*:(\d+)/g, "");
+      if (transitionAllowed) {
+        if (oldState !== this.state) {
+          Logger.info("VM", `[Provisioning FSM] State: ${oldState} -> ${this.state} for execId=${execId}`);
+        }
+      } else {
+        Logger.warn("VM", `[Provisioning FSM] Rejected transition: ${this.state} -> ${action} for execId=${execId} (current=${this.currentExecId})`);
+      }
+
+      // Remove the raw matched token from the original buffer
+      this.buffer = this.buffer.replace(raw, "");
     }
 
     return results;
   }
 
+  private sanitize(str: string): string {
+    const ansiRegex = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+    return str.replace(ansiRegex, "").replace(/\r/g, "");
+  }
+
   public reset(): void {
     this.buffer = "";
+    this.state = "IDLE";
+    this.currentExecId = -1;
   }
 }
 
@@ -82,6 +147,12 @@ export class ProvisioningController {
   private lastHeartbeatTimestamp = 0;
   private activeBridgeGeneration = 0;
   private completionParser = new ProvisioningCompletionParser();
+
+  // Fine-grained timeouts
+  private writeTimer: NodeJS.Timeout | null = null;
+  private execStartTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private execCompleteTimer: NodeJS.Timeout | null = null;
 
   // ACK-gated streaming state
   private pendingChunkIndex = -1;
@@ -110,9 +181,92 @@ export class ProvisioningController {
   public getLastHeartbeatTimestamp(): number { return this.lastHeartbeatTimestamp; }
   public getCompletionParser(): ProvisioningCompletionParser { return this.completionParser; }
 
+  // ─── Timeout Management ────────────────────────────────────────────────────
+  private _startWriteTimer(execId: number): void {
+    this._cancelWriteTimer();
+    this.writeTimer = setTimeout(() => {
+      Logger.error("VM", `[PROVISIONING TIMEOUT] Worker failed to report PROVISION_READY (write/verify guest visibility) within 15 seconds for execId=${execId}`);
+      this.handleProvisioningFailed(execId, this.activeBridgeGeneration);
+    }, 15000);
+  }
+
+  private _cancelWriteTimer(): void {
+    if (this.writeTimer) {
+      clearTimeout(this.writeTimer);
+      this.writeTimer = null;
+    }
+  }
+
+  private _startExecStartTimer(execId: number): void {
+    this._cancelExecStartTimer();
+    this.execStartTimer = setTimeout(() => {
+      Logger.error("VM", `[PROVISIONING TIMEOUT] Script failed to output <<<PROTO:EXEC_START:${execId}>>> within 15 seconds for execId=${execId}`);
+      this.handleProvisioningFailed(execId, this.activeBridgeGeneration);
+    }, 15000);
+  }
+
+  private _cancelExecStartTimer(): void {
+    if (this.execStartTimer) {
+      clearTimeout(this.execStartTimer);
+      this.execStartTimer = null;
+    }
+  }
+
+  private _startHeartbeatTimer(execId: number): void {
+    this._cancelHeartbeatTimer();
+    // Check every 5 seconds, fail if no heartbeat for 20 seconds
+    this.heartbeatTimer = setInterval(() => {
+      const age = this.lastHeartbeatTimestamp ? Date.now() - this.lastHeartbeatTimestamp : Date.now() - (this.executionStartTimestamp ?? Date.now());
+      if (age > 20000) {
+        Logger.error("VM", `[PROVISIONING TIMEOUT] Heartbeat stalled for execId=${execId} (age=${age}ms)`);
+        this._cancelHeartbeatTimer();
+        this.handleProvisioningFailed(execId, this.activeBridgeGeneration);
+      }
+    }, 5000);
+  }
+
+  private _cancelHeartbeatTimer(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private _startExecCompleteTimer(execId: number): void {
+    this._cancelExecCompleteTimer();
+    // Absolute max execution time: 90 seconds
+    this.execCompleteTimer = setTimeout(() => {
+      Logger.error("VM", `[PROVISIONING TIMEOUT] Script execution timed out (exceeded 90s) for execId=${execId}`);
+      this.handleProvisioningFailed(execId, this.activeBridgeGeneration);
+    }, 90000);
+  }
+
+  private _cancelExecCompleteTimer(): void {
+    if (this.execCompleteTimer) {
+      clearTimeout(this.execCompleteTimer);
+      this.execCompleteTimer = null;
+    }
+  }
+
+  private _cancelAllTimers(): void {
+    this._cancelChunkTimer();
+    this._cancelWriteTimer();
+    this._cancelExecStartTimer();
+    this._cancelHeartbeatTimer();
+    this._cancelExecCompleteTimer();
+  }
+
   public recordHeartbeat(): void {
     this.lastHeartbeatTimestamp = Date.now();
-    Logger.debug("VM", `[PROVISIONING] Heartbeat received for execId ${this.currentExecutionId}`);
+    Logger.info("VM", `[PROVISIONING] Heartbeat received for execId ${this.currentExecutionId}`);
+  }
+
+  public handleExecStart(execId: number): void {
+    if (execId !== this.currentExecutionId) return;
+    Logger.info("VM", `[PROVISIONING] Script execution started for execId=${execId}`);
+    this._cancelExecStartTimer();
+    this._startHeartbeatTimer(execId);
+    this._startExecCompleteTimer(execId);
   }
 
   public transitionTo(newState: ProvisioningState): void {
@@ -133,7 +287,7 @@ export class ProvisioningController {
     this.transportState = "idle";
     this.isLocked = false;
     this.checkpoint = 0;
-    this._cancelChunkTimer();
+    this._cancelAllTimers();
     this.chunksToSend = [];
     this.completionParser.reset();
   }
@@ -261,29 +415,31 @@ exec >/tmp/provision_exec.log 2>&1
 
 _provision_completed=0
 trap '
+  _exit_code=$?
   if [ "$_provision_completed" -eq 0 ]; then
-    echo "PROVISIONING_FAILED:${executionId}" > /dev/ttyS0
+    echo "<<<PROTO:FAIL:${executionId}:exit_code_\$_exit_code>>>" > /dev/ttyS0
   fi
 ' EXIT
 
+echo "<<<PROTO:EXEC_START:${executionId}>>>" > /dev/ttyS0
 echo "[PROVISIONING] Started execution ID: ${executionId}"
-echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
+echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
 
 hostname linlearn
 mkdir -p /home/user/Projects /home/user/.config /home/user/workspace
 adduser -D -h /home/user -s /bin/sh user 2>/dev/null || true
 
-echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
+echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
 
 ${restoreCmd}
 
-echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
+echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
 
 cat << 'PROFILE_EOF' > /home/user/.profile
 export HOME=/home/user
 export PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\$ '
 cd /home/user
-echo "**SHELL_READY**:${executionId}"
+echo "<<<PROTO:SHELL_READY:${executionId}>>>"
 PROFILE_EOF
 
 cat << 'INSPECT_EOF' > /usr/bin/linlearn-inspect
@@ -294,7 +450,7 @@ chmod +x /usr/bin/linlearn-inspect
 chown -R user:user /home/user
 chown user /dev/ttyS0
 
-echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
+echo "<<<PROTO:HEARTBEAT:${executionId}>>>" > /dev/ttyS0
 
 ${backgroundMonitorScript}
 
@@ -305,7 +461,7 @@ echo "" > /dev/ttyS0
 sync
 sleep 1
 
-echo "**LLVM_PROVISION_COMPLETE**:${executionId}" > /dev/ttyS0
+echo "<<<PROTO:EXEC_COMPLETE:${executionId}>>>" > /dev/ttyS0
 sync
 
 while read -r ack_line; do
@@ -343,6 +499,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       generation: bridgeGeneration,
       filePath: filePath,
     });
+    this._startWriteTimer(executionId);
     // PROVISION_READY is handled by handleProvisionAck() below
 
     return true;
@@ -440,6 +597,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       Logger.warn("VM", `[PROVISIONING] Stale PROVISION_READY from generation ${bridgeGeneration}. Ignoring.`);
       return;
     }
+    this._cancelWriteTimer();
     if (ready.telemetry) {
       Logger.info(
         "VM",
@@ -456,6 +614,9 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       `Sending PROVISION_EXECUTE...`
     );
     this.transitionTransportTo("awaiting_execute");
+
+    // Start timer waiting for execution to start
+    this._startExecStartTimer(ready.execId);
 
     // Send execution trigger — worker will write single serial command
     this.onPostMessage("PROVISION_EXECUTE", {
@@ -477,6 +638,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       Logger.warn("VM", `[PROVISIONING] Ignored PROVISIONING_COMPLETE from stale generation ${bridgeGeneration}`);
       return;
     }
+    this._cancelAllTimers();
     const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
     Logger.info("VM", `[PROVISIONING] Complete! execId=${id}, bridgeGen=${bridgeGeneration}, elapsed=${elapsed}ms`);
     this.checkpoint = 2;
@@ -494,6 +656,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       Logger.warn("VM", `[PROVISIONING] Ignored PROVISIONING_FAILED from stale generation ${bridgeGeneration}`);
       return;
     }
+    this._cancelAllTimers();
     const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
     Logger.error("VM", `[PROVISIONING] Script exited without completion marker! execId=${id}, elapsed=${elapsed}ms`);
     this.isLocked = false;
@@ -502,7 +665,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
   }
 
   public handleFailure(): void {
-    this._cancelChunkTimer();
+    this._cancelAllTimers();
     this.isLocked = false;
     this.transitionTransportTo("failed");
     this.transitionTo("failed");
@@ -516,7 +679,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
   // ─── Cancel provisioning transport cleanly ────────────────────────────────
   public cancelTransport(): void {
     Logger.info("VM", `[PROVISIONING] Cancelling active transport for execId=${this.currentExecutionId}`);
-    this._cancelChunkTimer();
+    this._cancelAllTimers();
     this.chunksToSend = [];
     this.isLocked = false;
     this.transitionTransportTo("cancelling");
