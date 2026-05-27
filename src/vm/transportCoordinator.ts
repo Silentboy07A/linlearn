@@ -218,7 +218,11 @@ export class TransportCoordinator {
     recreatePromise: null
   };
 
-  constructor() {
+  private isRecreationAllowed: () => boolean;
+  private lastInitGenerationId = 0;
+
+  constructor(isRecreationAllowed?: () => boolean) {
+    this.isRecreationAllowed = isRecreationAllowed || (() => true);
     this.generationManager = new BridgeGenerationManager();
     
     // Start with an initial dummy generation 0
@@ -292,6 +296,11 @@ export class TransportCoordinator {
   }
 
   public async recreateBridge(): Promise<void> {
+    if (!this.isRecreationAllowed()) {
+      Logger.warn("VM", "[TransportCoordinator] Suppressing bridge recreation/VM recreation during active boot lifecycle.");
+      return;
+    }
+
     if (this.state.recreatePromise) {
       Logger.info("VM", "[TransportCoordinator] Bridge recreation already in progress, awaiting existing promise.");
       return this.state.recreatePromise;
@@ -368,6 +377,7 @@ export class TransportCoordinator {
       if (config.lastInitPayload) {
         Logger.info("VM", `[TransportCoordinator] Auto-initializing new worker generation ${newGen.id} with saved config.`);
         newBridge.post("INIT", config.lastInitPayload);
+        this.lastInitGenerationId = newGen.id;
       }
 
       const duration = Date.now() - tStart;
@@ -383,8 +393,18 @@ export class TransportCoordinator {
   }
 
   public async post(type: string, payload?: unknown): Promise<void> {
-    if (type === "INIT" && this.config) {
-      this.config.lastInitPayload = payload;
+    if (type === "INIT") {
+      if (this.config) {
+        this.config.lastInitPayload = payload;
+      }
+      const activeGen = this.generationManager.getActiveGeneration();
+      if (activeGen && this.lastInitGenerationId === activeGen.id) {
+        Logger.info("VM", `[TransportCoordinator] Suppressing duplicate INIT for bridge generation ${activeGen.id}`);
+        return;
+      }
+      if (activeGen) {
+        this.lastInitGenerationId = activeGen.id;
+      }
     }
 
     try {
@@ -452,6 +472,39 @@ export class TransportCoordinator {
     this.state.hasSerial1 = support;
   }
 
+  public reconnectSerial(): void {
+    Logger.info("VM", "[TransportCoordinator] Reconnecting serial transport and rebinding listeners...");
+    const activeGen = this.generationManager.getActiveGeneration();
+    if (activeGen && activeGen.isValid) {
+      const bridge = activeGen.bridge;
+      const worker = (bridge as unknown as { worker: Worker | null }).worker;
+      if (worker && this.config) {
+        const config = this.config;
+        worker.onmessage = (e: MessageEvent) => {
+          if (!bridge.getIsValid() || bridge.getState() === WorkerBridgeState.TERMINATED || bridge.getState() === WorkerBridgeState.TERMINATING) {
+            return;
+          }
+          if (!e.data) return;
+          const { type, payload } = e.data;
+          
+          if (type === "WORKER_READY") {
+            return;
+          }
+          
+          if (type === "INIT_SUCCESS") {
+            const initPayload = payload as { hasSerial1?: boolean } | undefined;
+            this.state.hasSerial1 = !!(initPayload && initPayload.hasSerial1);
+          }
+          
+          if (config.onMessageCallback) {
+            config.onMessageCallback(type, payload);
+          }
+        };
+        Logger.info("VM", `[TransportCoordinator] Rebound message handler for bridge generation ${activeGen.id}`);
+      }
+    }
+  }
+
   public terminate(): void {
     // 1. Clear transient queues
     this.serialQueue.clear();
@@ -466,6 +519,11 @@ export class TransportCoordinator {
       pendingInit: null,
       recreatePromise: null
     };
+
+    if (this.config) {
+      this.config.lastInitPayload = null;
+    }
+    this.lastInitGenerationId = 0;
 
     Logger.info("VM", "[TransportCoordinator] Terminated runtime resources, but preserved immutable configuration.");
   }

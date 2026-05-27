@@ -8,8 +8,9 @@ import { GUEST_INSPECT_SCRIPT } from "./inspect";
 import { TerminalHealthMonitor } from "./healthMonitor";
 import { UnifiedTimeoutManager } from "./timeoutManager";
 import { ProvisioningController } from "./provisioning";
-import { RecoveryOrchestrator, RecoveryStage } from "./recoveryOrchestrator";
+import { RecoveryOrchestrator, RecoveryStage, VMHealthStatus } from "./recoveryOrchestrator";
 import { TransportCoordinator } from "./transportCoordinator";
+import { WorkerBridgeState } from "./workerBridge";
 
 // ─── Async Mutex ────────────────────────────────────────────────────────────
 // Serializes all lifecycle operations into a FIFO queue.
@@ -106,7 +107,10 @@ export class VMController {
   private actionToken = 0;
 
   constructor(config: Partial<VMSessionConfig> = {}) {
-    this.transport = new TransportCoordinator();
+    this.transport = new TransportCoordinator(() => {
+      const state = this.lifecycle.getState().state;
+      return state !== "loading" && state !== "booting" && state !== "provisioning";
+    });
     this.lifecycle = new VMLifecycleManager();
     this.config = ResourceLimitsValidator.validate(config);
 
@@ -123,6 +127,7 @@ export class VMController {
     // Recovery actions are now routed through dispatch() — no direct lifecycle mutation.
     this.orchestrator = new RecoveryOrchestrator(
       this.timeouts,
+      () => this.getHealthStatus(),
       (stage) => this.handleRecoveryAction(stage),
       (state) => this.lifecycle.transitionRecoveryTo(state, "RecoveryOrchestrator")
     );
@@ -223,6 +228,13 @@ export class VMController {
     initialState: ArrayBuffer | undefined,
     token: number
   ): Promise<void> {
+    const state = this.lifecycle.getState().state;
+    if (this.initPromise || state === "loading" || state === "booting" || state === "provisioning" || state === "running") {
+      Logger.warn("VM", `[START IGNORED] VM is already starting, booting, or active (state: ${state}). Ignoring duplicate START.`);
+      this.orchestrator.recordDuplicateStartSuppression();
+      return;
+    }
+
     // If already alive, stop first
     if (this.lifecycle.isAlive()) {
       Logger.warn("VM", "VM already running. Destroying it before starting new session.");
@@ -247,32 +259,29 @@ export class VMController {
   }
 
   private async _dispatchRecoverShell(token: number): Promise<void> {
-    const activeOnSerial = this.onSerialOutput;
-    const activeOnState = this.onStateChange;
-
-    if (activeOnSerial && activeOnState) {
-      await this._internalStop();
-      if (this.isStaleAction(token)) return;
-
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      if (this.isStaleAction(token)) return;
-
-      // Perform fresh initialization
-      this.initAbortController = new AbortController();
-      const abortSignal = this.initAbortController.signal;
-      this.initPromise = this._doStart(
-        window.location.origin,
-        activeOnSerial,
-        activeOnState,
-        this.savedState || undefined,
-        abortSignal
-      );
-      try {
-        await this.initPromise;
-      } finally {
-        this.initPromise = null;
-        this.initAbortController = null;
-      }
+    Logger.info("VM", `[RECOVER_SHELL] Repairing shell session and TTY without restarting emulator runtime (token #${token}).`);
+    
+    // 1. Reconnect terminal (rebind transport listeners and reattach terminal)
+    this.transport.reconnectSerial();
+    if (this.onSerialOutput && this.onStateChange) {
+      this._dispatchReattach(this.onSerialOutput, this.onStateChange);
+    }
+    
+    // 2. Restart TTY and repair shell session
+    if (this.transport.hasSerial1Support()) {
+      Logger.info("VM", "[RECOVER_SHELL] Sending RECOVER_TTY and RESTART_SHELL programmatically via serial1...");
+      await this.sendProgrammaticInput(1, "RECOVER_TTY\n");
+      await this.sendProgrammaticInput(1, "RESTART_SHELL\n");
+    } else {
+      Logger.warn("VM", "[RECOVER_SHELL] Serial1 not supported, sending Ctrl+C and resetting TTY via serial0...");
+      this.sendInput("\x03\rreset\r");
+    }
+    
+    // 3. Refresh provisioning channel if in provisioning state
+    const provState = this.provisioning.getState();
+    if (provState !== "idle" && provState !== "completed") {
+      Logger.info("VM", `[RECOVER_SHELL] Active provisioning state detected: '${provState}'. Refreshing provisioning channel...`);
+      this.attemptNonDestructiveProvisioningRecovery();
     }
   }
 
@@ -595,15 +604,33 @@ export class VMController {
     if (this.provisioning.getState() === "completed") return;
 
     this.provisioningSearchBuffer += char;
-    if (this.provisioningSearchBuffer.length > 256) {
-      this.provisioningSearchBuffer = this.provisioningSearchBuffer.substring(this.provisioningSearchBuffer.length - 256);
+    if (this.provisioningSearchBuffer.length > 512) {
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.substring(this.provisioningSearchBuffer.length - 512);
     }
 
     const hasRootPrompt = this.provisioningSearchBuffer.endsWith("~% ") || 
                           this.provisioningSearchBuffer.endsWith("# ") || 
                           this.provisioningSearchBuffer.endsWith("~# ");
     const sentinelMatch = this.provisioningSearchBuffer.match(/PROVISIONING_COMPLETE:(\d+)/);
+    const failureMatch = this.provisioningSearchBuffer.match(/PROVISIONING_FAILED:(\d+)/);
+    const heartbeatMatch = this.provisioningSearchBuffer.match(/PROVISIONING_HEARTBEAT:(\d+)/);
 
+    // ── Heartbeat: reset watchdog timer on activity ──
+    if (heartbeatMatch) {
+      const hbId = parseInt(heartbeatMatch[1], 10);
+      if (hbId === this.provisioning.getExecutionId()) {
+        this.provisioning.recordHeartbeat();
+        // Extend the watchdog since the script is actively running
+        this.timeouts.cancel("provisioning_watchdog");
+        this.timeouts.register("provisioning_watchdog", 45000, () => {
+          this._onProvisioningWatchdogFired();
+        });
+        // Clear the heartbeat from the buffer so it doesn't re-trigger
+        this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace(/PROVISIONING_HEARTBEAT:\d+/, "");
+      }
+    }
+
+    // ── Boot ready: root prompt detected, start provisioning ──
     if (hasRootPrompt && this.provisioning.getState() === "idle") {
       this.timeouts.cancel("boot_watchdog");
       this.transitionState("provisioning", "handleSerialLifecycle");
@@ -627,37 +654,70 @@ export class VMController {
 
       // Provisioning timeout guard: 45 seconds to finish provisioning
       this.timeouts.register("provisioning_watchdog", 45000, () => {
-        const state = this.provisioning.getState();
-        if (state === "preparing" || state === "transferring" || state === "executing" || state === "waiting_completion") {
-          Logger.warn("VM", `Provisioning watchdog triggered. Provisioning stalled in state: ${state}.`);
-          this.provisioning.handleFailure();
-          this.orchestrator.triggerRecovery("provisioning timeout exceeded");
-        }
+        this._onProvisioningWatchdogFired();
       });
 
-      this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.transport.hasSerial1Support());
+      // CRITICAL: await the async provisioning call.
+      // We use void to indicate fire-and-forget but the state transitions
+      // inside startProvisioning happen before the first yield point (the send),
+      // ensuring executing/waiting_completion are set deterministically.
+      void this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.transport.hasSerial1Support());
 
-    } else if (sentinelMatch && this.provisioning.getState() === "waiting_completion") {
-      const execId = parseInt(sentinelMatch[1], 10);
-      this.timeouts.cancel("provisioning_watchdog");
-      this.provisioningSearchBuffer = "";
-
-      this.provisioning.handleProvisioningComplete(execId);
-      this.transitionState("running", "handleSerialLifecycle");
-      this.lifecycle.transitionTerminalTo("interactive", "handleSerialLifecycle");
-
-      Logger.info("VM", "[PROVISIONING] Complete. Guest VM shell running.");
-
-      if (this.onSerialOutput) {
-        this.onSerialOutput("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
-        this.onSerialOutput(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
-        this.onSerialOutput(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
-        this.onSerialOutput("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
+    // ── Failure marker: script exited without completion ──
+    } else if (failureMatch) {
+      const failId = parseInt(failureMatch[1], 10);
+      const provState = this.provisioning.getState();
+      if (provState === "executing" || provState === "waiting_completion") {
+        this.timeouts.cancel("provisioning_watchdog");
+        this.provisioningSearchBuffer = "";
+        Logger.error("VM", `[PROVISIONING] Failure marker detected for execId=${failId}. Script exited without completing.`);
+        this.provisioning.handleProvisioningFailed(failId);
+        this.orchestrator.triggerRecovery("provisioning script exited without completion");
       }
 
-      // Tell orchestrator we are healthy and start health monitor
-      this.orchestrator.reportHealthy();
-      this.startHealthMonitoring();
+    // ── Completion marker: provisioning succeeded ──
+    } else if (sentinelMatch) {
+      const execId = parseInt(sentinelMatch[1], 10);
+      const provState = this.provisioning.getState();
+
+      // Accept completion from executing OR waiting_completion to handle
+      // the race where the VM script completes before the async send resolves
+      if (provState === "executing" || provState === "waiting_completion") {
+        this.timeouts.cancel("provisioning_watchdog");
+        this.provisioningSearchBuffer = "";
+
+        this.provisioning.handleProvisioningComplete(execId);
+        this.transitionState("running", "handleSerialLifecycle");
+        this.lifecycle.transitionTerminalTo("interactive", "handleSerialLifecycle");
+
+        Logger.info("VM", "[PROVISIONING] Complete. Guest VM shell running.");
+
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\x1b[1;36mWelcome to the LinLearn Virtual Training Environment!\x1b[0m\r\n");
+          this.onSerialOutput(" * System Sandbox: \x1b[1;32mActive (100% Secure, No host access)\x1b[0m\r\n");
+          this.onSerialOutput(" * Active Profile: \x1b[1;33muser@linlearn\x1b[0m\r\n\r\n");
+          this.onSerialOutput("Try running: \x1b[1;33mcd Projects\x1b[0m, \x1b[1;33mtouch file.txt\x1b[0m, or explore folders.\r\n\r\n");
+        }
+
+        // Tell orchestrator we are healthy and start health monitor
+        this.orchestrator.reportHealthy();
+        this.startHealthMonitoring();
+      } else {
+        Logger.warn("VM", `[PROVISIONING] Completion marker received but state is '${provState}' (not executing/waiting_completion). execId=${execId}`);
+      }
+    }
+  }
+
+  // ─── Provisioning watchdog handler ─────────────────────────────────────
+  private _onProvisioningWatchdogFired(): void {
+    const state = this.provisioning.getState();
+    if (state === "preparing" || state === "transferring" || state === "executing" || state === "waiting_completion") {
+      const diag = this.provisioning.getDiagnostics();
+      Logger.error("VM", `[PROVISIONING WATCHDOG] Timeout fired. Diagnostics: ${JSON.stringify(diag)}`);
+      Logger.error("VM", `[PROVISIONING WATCHDOG] Last 128 chars of serial buffer: ${JSON.stringify(this.provisioningSearchBuffer.slice(-128))}`);
+      Logger.error("VM", `[PROVISIONING WATCHDOG] Serial forwarding active: ${!!this.onSerialOutput}, Runtime state: ${this.lifecycle.getState().state}`);
+      this.provisioning.handleFailure();
+      this.orchestrator.triggerRecovery("provisioning timeout exceeded");
     }
   }
 
@@ -693,11 +753,21 @@ export class VMController {
         return true;
 
       case RecoveryStage.SERIAL_RECONNECT:
-        Logger.info("VM", "Recovery [Stage 3]: Dispatching RECOVER_SHELL through lifecycle gate...");
+        Logger.info("VM", "Recovery [Stage 3]: Reconnecting serial transport, rebinding listeners, and reattaching terminal...");
         if (this.onSerialOutput) {
-          this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Serial connection stalled. Reconnecting serial worker...\x1b[0m\r\n");
+          this.onSerialOutput("\r\n\x1b[1;33m[Recovery] Reconnecting serial transport...\x1b[0m\r\n");
         }
-        await this.dispatch({ type: "RECOVER_SHELL" });
+        
+        // 1. Reconnect serial transport (rebind listeners in transport layer)
+        this.transport.reconnectSerial();
+        
+        // 2. Reattach terminal listeners (without dispatching or destroying VM)
+        if (this.onSerialOutput && this.onStateChange) {
+          this._dispatchReattach(this.onSerialOutput, this.onStateChange);
+        }
+        
+        // 3. Verify serial responsiveness: Send a PING to check worker CPU and serial message loop
+        this.transport.post("PING");
         return true;
 
       case RecoveryStage.VM_SOFT_REBOOT:
@@ -710,12 +780,54 @@ export class VMController {
         await this.dispatch({ type: "COLD_BOOT" });
         return true;
 
+      case RecoveryStage.PROVISIONING_RECOVERY:
+        Logger.info("VM", "Recovery [Stage 6]: Triggering non-destructive provisioning recovery...");
+        this.attemptNonDestructiveProvisioningRecovery();
+        return true;
+
       case RecoveryStage.NONE:
       default:
         Logger.warn("VM", "Recovery suspended or unknown stage executed.");
         await this.dispatch({ type: "STOP" });
         return false;
     }
+  }
+
+  public getHealthStatus(): VMHealthStatus {
+    const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+    const bridge = activeGen ? activeGen.bridge : null;
+    const workerState = bridge ? bridge.getState() : WorkerBridgeState.UNINITIALIZED;
+    const cpuRunning = this.healthMonitor ? (this.healthMonitor as unknown as { isHealthy: boolean }).isHealthy : true;
+    
+    return {
+      runtimeState: this.lifecycle.getState().state,
+      provisioningState: this.provisioning.getState(),
+      workerState,
+      hasSerial1: this.transport.hasSerial1Support(),
+      lastHeartbeatAgeMs: this.provisioning.getLastHeartbeatTimestamp() ? Date.now() - this.provisioning.getLastHeartbeatTimestamp() : Infinity,
+      lastSerialOutputAgeMs: Date.now() - this.lastSerialOutputTimestamp,
+      lastInputAgeMs: Date.now() - this.lastInputTimestamp,
+      cpuRunning,
+      workerResponding: activeGen ? activeGen.isValid && workerState === WorkerBridgeState.READY : false,
+    };
+  }
+
+  private attemptNonDestructiveProvisioningRecovery(): void {
+    const execId = this.provisioning.getExecutionId();
+    Logger.info("VM", `[Provisioning Recovery] Attempting non-destructive recovery for execution ID ${execId}...`);
+    
+    // 1. Refresh serial listeners
+    this.transport.reconnectSerial();
+    if (this.onSerialOutput && this.onStateChange) {
+      this._dispatchReattach(this.onSerialOutput, this.onStateChange);
+    }
+    
+    // 2. Inspect shell responsiveness & verify execution alive
+    const queryCmd = `\n[ -f /tmp/p.sh ] && (ps | grep -v grep | grep -q "p.sh" && echo "PROVISIONING_HEARTBEAT:${execId}" || (grep -q "PROVISIONING_COMPLETE" /tmp/provision_exec.log 2>/dev/null && echo "PROVISIONING_COMPLETE:${execId}" || echo "PROVISIONING_FAILED:${execId}")) || echo "PROVISIONING_IDLE:${execId}"\n`;
+    
+    // Send the query on serial0
+    void this.sendProgrammaticInput(0, queryCmd);
+    Logger.info("VM", `[Provisioning Recovery] Sent completion query command for execId=${execId}`);
   }
 
   private arrayBufferToBase64(buffer: ArrayBuffer): string {

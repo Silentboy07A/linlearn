@@ -7,6 +7,8 @@ export class ProvisioningController {
   private isLocked = false;
   private checkpoint = 0;
   private currentExecutionId = 0;
+  private executionStartTimestamp = 0;
+  private lastHeartbeatTimestamp = 0;
   private onStateChange: (state: ProvisioningState) => void;
   private onSendInput: (port: number, data: string) => Promise<void>;
 
@@ -22,9 +24,26 @@ export class ProvisioningController {
     return this.state;
   }
 
+  public getExecutionId(): number {
+    return this.currentExecutionId;
+  }
+
+  public getExecutionStartTimestamp(): number {
+    return this.executionStartTimestamp;
+  }
+
+  public getLastHeartbeatTimestamp(): number {
+    return this.lastHeartbeatTimestamp;
+  }
+
+  public recordHeartbeat(): void {
+    this.lastHeartbeatTimestamp = Date.now();
+    Logger.debug("VM", `[PROVISIONING] Heartbeat received for execution ID ${this.currentExecutionId}`);
+  }
+
   public transitionTo(newState: ProvisioningState): void {
     if (this.state === newState) return;
-    Logger.info("VM", `State change: ${this.state} -> ${newState}`);
+    Logger.info("VM", `[PROVISIONING] State: ${this.state} -> ${newState} (execId: ${this.currentExecutionId})`);
     this.state = newState;
     this.onStateChange(newState);
   }
@@ -33,6 +52,19 @@ export class ProvisioningController {
     this.state = "idle";
     this.isLocked = false;
     this.checkpoint = 0;
+  }
+
+  public getDiagnostics(): Record<string, unknown> {
+    return {
+      state: this.state,
+      isLocked: this.isLocked,
+      checkpoint: this.checkpoint,
+      executionId: this.currentExecutionId,
+      executionStartTimestamp: this.executionStartTimestamp,
+      lastHeartbeatTimestamp: this.lastHeartbeatTimestamp,
+      elapsedMs: this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0,
+      heartbeatAgeMs: this.lastHeartbeatTimestamp ? Date.now() - this.lastHeartbeatTimestamp : 0,
+    };
   }
 
   public async startProvisioning(restoreCmd: string, inspectScript: string, useSerial1: boolean): Promise<boolean> {
@@ -44,9 +76,13 @@ export class ProvisioningController {
     this.isLocked = true;
     this.currentExecutionId++;
     const executionId = this.currentExecutionId;
+    this.executionStartTimestamp = Date.now();
+    this.lastHeartbeatTimestamp = 0;
 
     this.transitionTo("preparing");
     this.checkpoint = 1;
+
+    Logger.info("VM", `[PROVISIONING] Preparing execution ID ${executionId}. useSerial1=${useSerial1}, restoreCmdLen=${restoreCmd.length}, inspectScriptLen=${inspectScript.length}`);
 
     let backgroundMonitorScript = "";
     if (useSerial1) {
@@ -94,33 +130,59 @@ done
 `;
     }
 
+    // The shell script uses an exit trap to guarantee a completion or failure
+    // signal is emitted to /dev/ttyS0 even if the script exits unexpectedly.
+    // Heartbeat markers are emitted at key checkpoints so the host-side watchdog
+    // can distinguish "still running" from "truly stalled".
     const script = `#!/bin/sh
+# Provisioning script - execution ID: ${executionId}
+# Redirect all stdout/stderr to log file to keep serial clean
 exec >/tmp/provision_exec.log 2>&1
+
+# Exit trap: if script exits without completing, emit failure marker
+_provision_completed=0
+trap '
+  if [ "$_provision_completed" -eq 0 ]; then
+    echo "PROVISIONING_FAILED:${executionId}" > /dev/ttyS0
+  fi
+' EXIT
+
 echo "[PROVISIONING] Started execution ID: ${executionId}"
+echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
 
 hostname linlearn
 mkdir -p /home/user/Projects /home/user/.config /home/user/workspace
 adduser -D -h /home/user -s /bin/sh user 2>/dev/null || true
 
+echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
+
 ${restoreCmd}
 
-cat << 'EOF' > /home/user/.profile
+echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
+
+cat << 'PROFILE_EOF' > /home/user/.profile
 export HOME=/home/user
 export PS1='user@linlearn:\\$(pwd | sed "s|^\\$HOME|~|")\\\\$ '
 cd /home/user
-EOF
+PROFILE_EOF
 
-cat << 'EOF' > /usr/bin/linlearn-inspect
+cat << 'INSPECT_EOF' > /usr/bin/linlearn-inspect
 ${inspectScript}
-EOF
+INSPECT_EOF
 chmod +x /usr/bin/linlearn-inspect
 
 chown -R user:user /home/user
 chown user /dev/ttyS0
 
+echo "PROVISIONING_HEARTBEAT:${executionId}" > /dev/ttyS0
+
 ${backgroundMonitorScript}
 
+# Mark provisioning as completed BEFORE the exec
+_provision_completed=1
 echo "PROVISIONING_COMPLETE:${executionId}" > /dev/ttyS0
+
+# Replace this shell with the user login loop
 exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 > /dev/ttyS0 2>&1
 `;
 
@@ -129,7 +191,6 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     // Convert string to base64 properly
     let base64Script = "";
     if (typeof window !== "undefined" && window.btoa) {
-      // Handle potential unicode characters safely
       const encoder = new TextEncoder();
       const bytes = encoder.encode(script);
       let binary = '';
@@ -138,29 +199,46 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       }
       base64Script = window.btoa(binary);
     } else {
-      // Fallback if not in browser environment
       base64Script = Buffer.from(script, "utf-8").toString("base64");
     }
 
-    Logger.info("VM", `Sending atomic provisioning script (execution ID: ${executionId}, size: ${base64Script.length} bytes)...`);
+    Logger.info("VM", `[PROVISIONING] Atomic script encoded. execId=${executionId}, base64Size=${base64Script.length} chars, rawScriptSize=${script.length} chars`);
 
     const atomicCmd = `stty -echo; echo '${base64Script}' | base64 -d > /tmp/p.sh && chmod +x /tmp/p.sh && exec sh /tmp/p.sh\n`;
 
+    // Transition to executing BEFORE the send so the state is correct
+    // when serial output starts arriving
     this.transitionTo("executing");
     await this.onSendInput(0, atomicCmd);
+
+    // The script is now being processed by the VM. Transition to waiting.
     this.transitionTo("waiting_completion");
+    Logger.info("VM", `[PROVISIONING] Atomic command sent. Now waiting for PROVISIONING_COMPLETE:${executionId}`);
 
     return true;
   }
 
   public handleProvisioningComplete(id: number): void {
     if (id !== this.currentExecutionId) {
-      Logger.warn("VM", `Ignored stale PROVISIONING_COMPLETE marker for execution ID ${id} (current is ${this.currentExecutionId})`);
+      Logger.warn("VM", `[PROVISIONING] Ignored stale PROVISIONING_COMPLETE marker for execution ID ${id} (current is ${this.currentExecutionId})`);
       return;
     }
+    const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
+    Logger.info("VM", `[PROVISIONING] Complete! execId=${id}, elapsed=${elapsed}ms`);
     this.checkpoint = 2;
     this.isLocked = false;
     this.transitionTo("completed");
+  }
+
+  public handleProvisioningFailed(id: number): void {
+    if (id !== this.currentExecutionId) {
+      Logger.warn("VM", `[PROVISIONING] Ignored stale PROVISIONING_FAILED marker for execution ID ${id} (current is ${this.currentExecutionId})`);
+      return;
+    }
+    const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
+    Logger.error("VM", `[PROVISIONING] Script exited without completion marker! execId=${id}, elapsed=${elapsed}ms`);
+    this.isLocked = false;
+    this.transitionTo("failed");
   }
 
   public handleFailure(): void {
