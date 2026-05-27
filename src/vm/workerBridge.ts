@@ -113,6 +113,22 @@ export class WorkerBridge {
     return this.state;
   }
 
+  public getHandshakeReceived(): boolean {
+    return this.handshakeReceived;
+  }
+
+  public getListenersAttached(): boolean {
+    return this.listenersAttached;
+  }
+
+  public getSerialInitialized(): boolean {
+    return this.serialInitialized;
+  }
+
+  public getGenerationCommitted(): boolean {
+    return this.generationCommitted;
+  }
+
   public getTelemetry() {
     return {
       state: this.state,
@@ -189,6 +205,8 @@ export class WorkerBridge {
     this.fsmReadyCommittedAt = 0;
     this.initDispatchedAt = 0;
 
+    Logger.info("VM", `[BRIDGE INIT START] Starting WorkerBridge initialization for generation ${this.generationId}`);
+
     return new Promise<void>((resolve, reject) => {
       // Setup timeout for worker initialization: 10 seconds max
       const initTimeout = setTimeout(() => {
@@ -199,14 +217,27 @@ export class WorkerBridge {
            this.state === WorkerBridgeState.COMMITTING_GENERATION) && 
           this.isValid
         ) {
-          Logger.error("VM", `[WorkerBridge ${this.generationId}] Initialization timed out after 10s at state: ${this.state}`);
+          Logger.error("VM", `[BRIDGE INIT TIMEOUT DIAGNOSTICS] WorkerBridge initialization timed out after 10s. ` +
+            `State: ${this.state}, ` +
+            `workerExists: ${!!this.worker}, ` +
+            `onmessageRegistered: ${typeof this.worker?.onmessage}, ` +
+            `handshakeReceived: ${this.handshakeReceived}, ` +
+            `listenersAttached: ${this.listenersAttached}, ` +
+            `serialInitialized: ${this.serialInitialized}, ` +
+            `generationCommitted: ${this.generationCommitted}`
+          );
           this.transitionTo(WorkerBridgeState.FAILED);
           reject(new WorkerBridgeError(`Worker initialization timed out at state: ${this.state}`));
         }
       }, 10000);
 
       try {
+        Logger.info("VM", `[WorkerBridge ${this.generationId}] [initializeWorker] Instantiating Web Worker...`);
         this.worker = new Worker(workerUrl);
+        Logger.info("VM", `[WORKER CREATED] Web Worker instantiated successfully for generation ${this.generationId}`);
+
+        Logger.info("VM", `[WorkerBridge ${this.generationId}] [awaitHandshake] Registering handshake listener and awaiting WORKER_READY...`);
+        Logger.info("VM", `[HANDSHAKE WAIT] Waiting for WORKER_READY handshake from generation ${this.generationId}`);
 
         this.worker.onmessage = (e: MessageEvent) => {
           if (!this.isValid || this.state === WorkerBridgeState.TERMINATED || this.state === WorkerBridgeState.TERMINATING) {
@@ -222,6 +253,7 @@ export class WorkerBridge {
           }
 
           if (type === "WORKER_READY") {
+            Logger.info("VM", `[HANDSHAKE RECEIVED] Received WORKER_READY handshake for generation ${this.generationId}`);
             clearTimeout(initTimeout);
             this.readyAt = Date.now();
             
@@ -232,54 +264,70 @@ export class WorkerBridge {
             Logger.info("VM", `[WorkerBridge ${this.generationId}] Handshake received. Transitioning to ATTACHING_LISTENERS`);
             
             // 2. Attach listeners
-            if (this.onMessageCallback) {
-              this.listenersAttached = true;
-              this.listenersAttachedAt = Date.now();
-              this.transitionTo(WorkerBridgeState.INITIALIZING_SERIAL);
-              Logger.info("VM", `[WorkerBridge ${this.generationId}] Listeners confirmed. Transitioning to INITIALIZING_SERIAL`);
-            } else {
-              Logger.error("VM", `[WorkerBridge ${this.generationId}] Listener verification failed: onMessageCallback is missing!`);
+            try {
+              if (this.onMessageCallback) {
+                this.listenersAttached = true;
+                this.listenersAttachedAt = Date.now();
+                this.transitionTo(WorkerBridgeState.INITIALIZING_SERIAL);
+                Logger.info("VM", `[LISTENERS ATTACHED] Listeners attached and verified for generation ${this.generationId}`);
+              } else {
+                throw new Error("onMessageCallback is missing");
+              }
+            } catch (attachErr) {
+              const attachErrMsg = attachErr instanceof Error ? attachErr.message : String(attachErr);
+              Logger.error("VM", `[WorkerBridge ${this.generationId}] [LISTENERS ATTACHED FAILED] Listener verification failed: ${attachErrMsg}`);
               this.transitionTo(WorkerBridgeState.FAILED);
-              reject(new WorkerBridgeError("Listener verification failed"));
+              reject(new WorkerBridgeError(`Listener verification failed: ${attachErrMsg}`));
               return;
             }
 
             // 3. Initialize serial
-            if (validator.isSerialAttached()) {
-              this.serialInitialized = true;
-              this.serialInitializedAt = Date.now();
-              this.transitionTo(WorkerBridgeState.COMMITTING_GENERATION);
-              Logger.info("VM", `[WorkerBridge ${this.generationId}] Serial confirmed initialized. Transitioning to COMMITTING_GENERATION`);
-            } else {
-              Logger.error("VM", `[WorkerBridge ${this.generationId}] Serial initialization check failed: serial is detached.`);
+            try {
+              if (validator.isSerialAttached()) {
+                this.serialInitialized = true;
+                this.serialInitializedAt = Date.now();
+                this.transitionTo(WorkerBridgeState.COMMITTING_GENERATION);
+                Logger.info("VM", `[SERIAL INITIALIZED] Serial port validation succeeded for generation ${this.generationId}`);
+              } else {
+                throw new Error("serial is detached");
+              }
+            } catch (serialErr) {
+              const serialErrMsg = serialErr instanceof Error ? serialErr.message : String(serialErr);
+              Logger.error("VM", `[WorkerBridge ${this.generationId}] [SERIAL INITIALIZED FAILED] Serial initialization check failed: ${serialErrMsg}`);
               this.transitionTo(WorkerBridgeState.FAILED);
-              reject(new WorkerBridgeError("Serial initialization check failed"));
+              reject(new WorkerBridgeError(`Serial initialization check failed: ${serialErrMsg}`));
               return;
             }
 
             // 4. Commit generation
-            if (validator.isGenerationCommitted(this.generationId)) {
-              this.generationCommitted = true;
-              
-              // Flush deferred queue
-              this.flushQueue();
+            try {
+              if (validator.isGenerationCommitted(this.generationId)) {
+                this.generationCommitted = true;
+                Logger.info("VM", `[GENERATION COMMITTED] Generation ${this.generationId} committed successfully`);
+                
+                // Flush deferred queue
+                this.flushQueue();
 
-              // 5. Commit state READY
-              this.transitionTo(WorkerBridgeState.READY);
-              this.fsmReadyCommittedAt = Date.now();
-              Logger.info("VM", `[WorkerBridge ${this.generationId}] All readiness barriers satisfied. State is now READY.`);
-              
-              resolve();
-              if (this.readyResolver) {
-                const res = this.readyResolver;
-                this.readyResolver = null;
-                this.readyRejecter = null;
-                res();
+                // 5. Commit state READY
+                this.transitionTo(WorkerBridgeState.READY);
+                this.fsmReadyCommittedAt = Date.now();
+                Logger.info("VM", `[BRIDGE READY] All readiness barriers satisfied. State is now READY for generation ${this.generationId}`);
+                
+                resolve();
+                if (this.readyResolver) {
+                  const res = this.readyResolver;
+                  this.readyResolver = null;
+                  this.readyRejecter = null;
+                  res();
+                }
+              } else {
+                throw new Error(`Generation commit check failed for genId ${this.generationId}`);
               }
-            } else {
-              Logger.error("VM", `[WorkerBridge ${this.generationId}] Generation commit check failed for genId ${this.generationId}.`);
+            } catch (genErr) {
+              const genErrMsg = genErr instanceof Error ? genErr.message : String(genErr);
+              Logger.error("VM", `[WorkerBridge ${this.generationId}] [GENERATION COMMITTED FAILED] Generation commit check failed: ${genErrMsg}`);
               this.transitionTo(WorkerBridgeState.FAILED);
-              reject(new WorkerBridgeError("Generation commit check failed"));
+              reject(new WorkerBridgeError(`Generation commit check failed: ${genErrMsg}`));
               return;
             }
             return;
@@ -316,6 +364,8 @@ export class WorkerBridge {
         };
 
       } catch (err) {
+        const createErrMsg = err instanceof Error ? err.message : String(err);
+        Logger.error("VM", `[WorkerBridge ${this.generationId}] [WORKER CREATED FAILED] Worker creation/setup failed: ${createErrMsg}`);
         clearTimeout(initTimeout);
         this.transitionTo(WorkerBridgeState.FAILED);
         reject(err);
@@ -357,6 +407,19 @@ export class WorkerBridge {
   public post(type: string, payload?: unknown): void {
     if (type === "INIT") {
       this.initDispatchedAt = Date.now();
+      if (
+        this.state !== WorkerBridgeState.READY ||
+        !this.handshakeReceived ||
+        !this.listenersAttached ||
+        !this.serialInitialized ||
+        !this.generationCommitted
+      ) {
+        const errorMsg = `Refusing to dispatch INIT: bridge state or readiness invariants violated (state: ${this.state}, ` +
+          `handshake: ${this.handshakeReceived}, listeners: ${this.listenersAttached}, ` +
+          `serial: ${this.serialInitialized}, generation: ${this.generationCommitted})`;
+        Logger.error("VM", `[WorkerBridge ${this.generationId}] ${errorMsg}`);
+        throw new WorkerBridgeError(errorMsg);
+      }
     }
     if (this.state === WorkerBridgeState.READY && this.worker) {
       this.worker.postMessage({ type, payload, generation: this.generationId });

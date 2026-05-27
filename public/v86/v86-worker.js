@@ -10,6 +10,8 @@
 
 "use strict";
 
+console.log("[WORKER STARTUP]");
+
 // Generation management
 var workerGeneration = 0;
 
@@ -107,6 +109,7 @@ function flushSerialBuffer() {
  */
 function setLifecycleState(newState) {
   if (lifecycleState !== newState) {
+    console.log("[WORKER STATE_CHANGED EMISSION]", newState);
     var oldState = lifecycleState;
     lifecycleState = newState;
     console.log("[STATE_CHANGED EMIT]", {
@@ -365,6 +368,12 @@ self.onmessage = async function (e) {
 
   switch (type) {
     case "INIT":
+      console.log("[WORKER INIT RECEIVED]", {
+        generation: workerGeneration,
+        runtimeState: payload.initial_state ? "restoring" : "cold_boot",
+        workerState: lifecycleState,
+        ts: Date.now()
+      });
       console.log("[INIT START]", {
         generation: workerGeneration,
         runtimeState: payload.initial_state ? "restoring" : "cold_boot",
@@ -492,6 +501,7 @@ self.onmessage = async function (e) {
       log("warn", "Unknown message type received: " + type);
   }
 };
+console.log("[WORKER ONMESSAGE REGISTERED]");
 
 /**
  * Initialize the v86 emulator inside this worker.
@@ -587,4 +597,5 @@ async function handleInit(payload) {
 }
 
 // Post message that the worker script is fully loaded and ready to accept commands
+console.log("[WORKER HANDSHAKE EMITTED]");
 postToHost("WORKER_READY");

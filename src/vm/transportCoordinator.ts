@@ -291,7 +291,7 @@ export class TransportCoordinator {
 
     this.state.pendingInit = (async () => {
       this.serialQueue.clear();
-      await this.recreateBridge();
+      await this.recreateBridge(true);
     })();
 
     try {
@@ -301,8 +301,8 @@ export class TransportCoordinator {
     }
   }
 
-  public async recreateBridge(): Promise<void> {
-    if (!this.isRecreationAllowed()) {
+  public async recreateBridge(force = false): Promise<void> {
+    if (!force && !this.isRecreationAllowed()) {
       Logger.warn("VM", "[TransportCoordinator] Suppressing bridge recreation/VM recreation during active boot lifecycle.");
       return;
     }
@@ -444,8 +444,20 @@ export class TransportCoordinator {
       const currentBridge = this.getBridge();
       await currentBridge.waitUntilFullyReady();
 
-      if (type === "INIT" && currentBridge.getState() !== WorkerBridgeState.READY) {
-        throw new WorkerBridgeError(`Refusing to dispatch INIT: bridge state is not READY (${currentBridge.getState()})`);
+      if (type === "INIT") {
+        if (
+          currentBridge.getState() !== WorkerBridgeState.READY ||
+          !currentBridge.getHandshakeReceived() ||
+          !currentBridge.getListenersAttached() ||
+          !currentBridge.getSerialInitialized() ||
+          !currentBridge.getGenerationCommitted()
+        ) {
+          throw new WorkerBridgeError(
+            `Refusing to dispatch INIT: bridge state or readiness invariants violated (state: ${currentBridge.getState()}, ` +
+            `handshake: ${currentBridge.getHandshakeReceived()}, listeners: ${currentBridge.getListenersAttached()}, ` +
+            `serial: ${currentBridge.getSerialInitialized()}, generation: ${currentBridge.getGenerationCommitted()})`
+          );
+        }
       }
 
       currentBridge.post(type, payload);
