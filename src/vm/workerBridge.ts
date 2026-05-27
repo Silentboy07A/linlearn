@@ -164,7 +164,13 @@ export class WorkerBridge {
             return;
           }
           if (!e.data) return;
-          const { type, payload } = e.data;
+          console.log("[WORKER MESSAGE]", e.data);
+          const { type, payload, generation } = e.data;
+
+          if (generation !== undefined && generation !== 0 && generation !== this.generationId) {
+            Logger.warn("VM", `[WorkerBridge ${this.generationId}] Dropping message '${type}' from stale worker generation ${generation}`);
+            return;
+          }
 
           if (type === "WORKER_READY") {
             clearTimeout(initTimeout);
@@ -275,7 +281,7 @@ export class WorkerBridge {
     this.deferredQueue = [];
     
     for (const msg of queue) {
-      this.worker.postMessage(msg);
+      this.worker.postMessage({ ...msg, generation: this.generationId });
     }
   }
 

@@ -10,6 +10,49 @@
 
 "use strict";
 
+// Generation management
+var workerGeneration = 0;
+
+/**
+ * Post a message back to the main thread, automatically attaching the active generation ID.
+ * @param {string} type
+ * @param {any} [payload]
+ * @param {any[]} [transferables]
+ */
+function postToHost(type, payload, transferables) {
+  var msg = {
+    type: type,
+    payload: payload,
+    generation: workerGeneration
+  };
+  console.log("[WORKER MESSAGE SENT]", msg);
+  if (transferables) {
+    self.postMessage(msg, transferables);
+  } else {
+    self.postMessage(msg);
+  }
+}
+
+// Global Exception Guards
+self.onerror = function (message, source, lineno, colno, error) {
+  var errInfo = "Uncaught worker exception: " + message + " at " + source + ":" + lineno + ":" + colno;
+  if (error && error.stack) {
+    errInfo += "\nStack: " + error.stack;
+  }
+  log("error", errInfo);
+  postToHost("INIT_FAILURE", errInfo);
+};
+
+self.addEventListener("unhandledrejection", function (event) {
+  var reason = event.reason;
+  var errInfo = "Unhandled promise rejection in worker: " + (reason && (reason.message || String(reason)));
+  if (reason && reason.stack) {
+    errInfo += "\nStack: " + reason.stack;
+  }
+  log("error", errInfo);
+  postToHost("INIT_FAILURE", errInfo);
+});
+
 // ─── 1. LOGGER MODULE ────────────────────────────────────────────────────────
 /**
  * Post a log message back to the main thread with standardized prefixing.
@@ -23,7 +66,7 @@ function log(level, msg) {
   if (msg.indexOf(prefix) !== 0) {
     cleanMsg = prefix + " " + msg;
   }
-  self.postMessage({ type: "LOG", payload: { level: level.toLowerCase(), msg: cleanMsg } });
+  postToHost("LOG", { level: level.toLowerCase(), msg: cleanMsg });
 }
 
 // ─── 2. VM LIFECYCLE STATE MACHINE MODULE ────────────────────────────────────
@@ -45,13 +88,13 @@ function flushSerialBuffer() {
     if (utf8Decoder) {
       var uint8 = new Uint8Array(serialSendBuffer);
       var str = utf8Decoder.decode(uint8, { stream: true });
-      self.postMessage({ type: "SERIAL_OUT", payload: str });
+      postToHost("SERIAL_OUT", str);
     } else {
       var str = "";
       for (var i = 0; i < serialSendBuffer.length; i++) {
         str += String.fromCharCode(serialSendBuffer[i]);
       }
-      self.postMessage({ type: "SERIAL_OUT", payload: str });
+      postToHost("SERIAL_OUT", str);
     }
     serialSendBuffer = [];
   }
@@ -66,8 +109,15 @@ function setLifecycleState(newState) {
   if (lifecycleState !== newState) {
     var oldState = lifecycleState;
     lifecycleState = newState;
+    console.log("[STATE_CHANGED EMIT]", {
+      from: oldState,
+      to: newState,
+      source: "setLifecycleState",
+      generation: workerGeneration,
+      ts: Date.now()
+    });
     log("debug", "Lifecycle state transitioned: " + oldState + " -> " + newState);
-    self.postMessage({ type: "STATE_CHANGED", payload: newState });
+    postToHost("STATE_CHANGED", newState);
   }
 }
 
@@ -265,7 +315,7 @@ async function createEmulator(config, win) {
 
     // Bridge serial1 output (invisible heartbeat channel)
     emulator.add_listener("serial1-output-byte", function (byte) {
-      self.postMessage({ type: "SERIAL1_OUT", payload: byte });
+      postToHost("SERIAL1_OUT", byte);
     });
 
     log("info", "v86 emulator successfully created.");
@@ -303,18 +353,46 @@ self.onmessage = async function (e) {
   var data = e.data;
   if (!data) return;
   
+  console.log("[WORKER MESSAGE RECEIVED]", data);
+
   var type = data.type;
   var payload = data.payload;
+  var gen = data.generation;
+
+  if (gen !== undefined) {
+    workerGeneration = gen;
+  }
 
   switch (type) {
     case "INIT":
+      console.log("[INIT START]", {
+        generation: workerGeneration,
+        runtimeState: payload.initial_state ? "restoring" : "cold_boot",
+        workerState: lifecycleState,
+        ts: Date.now()
+      });
+      // Acknowledge receipt of INIT configuration immediately
+      postToHost("INIT_ACK", {
+        generation: workerGeneration,
+        ts: Date.now()
+      });
       if (!canInitialize() || isBootingInProgress) {
         log("warn", "Ignored INIT: emulator already initializing or running (state: " + lifecycleState + ")");
         return;
       }
       isBootingInProgress = true;
-      await handleInit(payload);
-      isBootingInProgress = false;
+      try {
+        await handleInit(payload);
+        console.log("[INIT COMPLETE]", {
+          generation: workerGeneration,
+          ts: Date.now()
+        });
+      } catch (err) {
+        log("error", "Uncaught exception in handleInit: " + (err.message || String(err)));
+        postToHost("INIT_FAILURE", "Uncaught exception in handleInit: " + (err.message || String(err)));
+      } finally {
+        isBootingInProgress = false;
+      }
       break;
 
     case "INPUT":
@@ -338,7 +416,7 @@ self.onmessage = async function (e) {
       break;
 
     case "SET_RUNNING":
-      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "provisioning") {
+      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready") {
         setLifecycleState("running");
         log("info", "Emulator successfully transitioned to running state (boot complete)");
       } else {
@@ -357,7 +435,7 @@ self.onmessage = async function (e) {
 
     case "PING": {
       var cpuRunning = emulator ? (typeof emulator.is_cpu_running === "function" ? emulator.is_cpu_running() : true) : false;
-      self.postMessage({ type: "PONG", payload: { cpu_running: cpuRunning } });
+      postToHost("PONG", { cpu_running: cpuRunning });
       break;
     }
 
@@ -389,17 +467,17 @@ self.onmessage = async function (e) {
     case "SAVE_STATE":
       if (!emulator) {
         log("error", "Cannot save state: emulator not initialized.");
-        self.postMessage({ type: "SAVE_STATE_FAILURE", payload: "Emulator not initialized" });
+        postToHost("SAVE_STATE_FAILURE", "Emulator not initialized");
         break;
       }
       try {
         log("info", "Taking guest VM memory snapshot...");
         var state = await emulator.save_state();
-        self.postMessage({ type: "SAVE_STATE_SUCCESS", payload: state }, [state]);
+        postToHost("SAVE_STATE_SUCCESS", state, [state]);
         log("info", "Guest VM snapshot taken successfully.");
       } catch (err) {
         log("error", "Failed to save VM state: " + (err.message || String(err)));
-        self.postMessage({ type: "SAVE_STATE_FAILURE", payload: err.message || String(err) });
+        postToHost("SAVE_STATE_FAILURE", err.message || String(err));
       }
       break;
 
@@ -433,7 +511,7 @@ async function handleInit(payload) {
     var msg = "Failed to load libv86.js: " + (err.message || String(err));
     log("error", msg);
     setLifecycleState("failed");
-    self.postMessage({ type: "INIT_FAILURE", payload: msg });
+    postToHost("INIT_FAILURE", msg);
     return;
   }
 
@@ -441,7 +519,7 @@ async function handleInit(payload) {
     var errMsg = "V86 constructor not found after importScripts";
     log("error", errMsg);
     setLifecycleState("failed");
-    self.postMessage({ type: "INIT_FAILURE", payload: errMsg });
+    postToHost("INIT_FAILURE", errMsg);
     return;
   }
 
@@ -489,11 +567,8 @@ async function handleInit(payload) {
     log("info", "Step 4/4: Creating v86 emulator instance...");
     await createEmulator(config, self);
 
-    self.postMessage({
-      type: "INIT_SUCCESS",
-      payload: {
-        hasSerial1: !!(SerialChannelManager.ports['1'] && SerialChannelManager.ports['1'].ready)
-      }
+    postToHost("INIT_SUCCESS", {
+      hasSerial1: !!(SerialChannelManager.ports['1'] && SerialChannelManager.ports['1'].ready)
     });
     if (payload.initial_state) {
       log("info", "v86 emulator successfully restored from snapshot. Transitioning to running...");
@@ -507,9 +582,9 @@ async function handleInit(payload) {
     await destroyEmulator();
     var initErr = "Emulator initialization failed: " + (err.message || String(err));
     log("error", initErr);
-    self.postMessage({ type: "INIT_FAILURE", payload: initErr });
+    postToHost("INIT_FAILURE", initErr);
   }
 }
 
 // Post message that the worker script is fully loaded and ready to accept commands
-self.postMessage({ type: "WORKER_READY" });
+postToHost("WORKER_READY");

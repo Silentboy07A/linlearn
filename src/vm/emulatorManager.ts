@@ -141,6 +141,13 @@ export class VMController {
   private lastRestoreTimestamp = 0;
   private healthMonitor: TerminalHealthMonitor | null = null;
 
+  // INIT path tracing and startup telemetry
+  private firstSerialByteReceived = false;
+  private initDispatchTimestamp = 0;
+  private initCompleteTimestamp = 0;
+  private firstStateChangedTimestamp = 0;
+  private firstSerialOutputTimestamp = 0;
+
   // New modules
   private timeouts: UnifiedTimeoutManager;
   private provisioning: ProvisioningController;
@@ -542,10 +549,31 @@ export class VMController {
         if (abortSignal.aborted) return;
 
         switch (type) {
+          case "INIT_ACK":
+            this.timeouts.cancel("init_watchdog");
+            this.timeouts.register("init_watchdog", 10000, async () => {
+              const currentState = this.lifecycle.getState().state;
+              if (currentState === "loading") {
+                Logger.error("VM", "[INIT TIMEOUT] Worker received INIT but failed to complete asset loading / instantiation within 10s!");
+                const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+                this.dumpInitDiagnostics(activeGen ? activeGen.id : 0);
+              }
+            });
+            Logger.info("VM", `[INIT_ACK] Worker acknowledged INIT receipt for generation ${payload && typeof payload === "object" && "generation" in payload ? (payload as { generation: number }).generation : "unknown"}`);
+            break;
+
           case "INIT_SUCCESS":
+            this.timeouts.cancel("init_watchdog");
+            this.initCompleteTimestamp = Date.now();
+            Logger.info("VM", `[INIT_SUCCESS] Worker successfully initialized emulator. Latency: ${this.initCompleteTimestamp - this.initDispatchTimestamp}ms`);
+            if (!resolved) {
+              resolved = true;
+              resolve();
+            }
             break;
 
           case "INIT_FAILURE":
+            this.timeouts.cancel("init_watchdog");
             this.timeouts.cancel("boot_watchdog");
             this.transitionState("error", "INIT_FAILURE");
             if (!resolved) {
@@ -568,6 +596,11 @@ export class VMController {
             }
 
             this.lastSerialOutputTimestamp = Date.now();
+            if (!this.firstSerialByteReceived) {
+              this.firstSerialByteReceived = true;
+              this.firstSerialOutputTimestamp = Date.now();
+              Logger.info("VM", `[SERIAL FIRST BYTE] First serial byte received: ${JSON.stringify(char)} at ${this.firstSerialOutputTimestamp}`);
+            }
 
             // Match prompt and trigger provisioning
             this.handleSerialLifecycle(char);
@@ -629,6 +662,12 @@ export class VMController {
           case "STATE_CHANGED":
             {
               const rawState = payload as string;
+              if (rawState === "booting" || rawState === "running") {
+                this.timeouts.cancel("init_watchdog");
+              }
+              if (!this.firstStateChangedTimestamp) {
+                this.firstStateChangedTimestamp = Date.now();
+              }
               let mappedState: VMStateName;
               if (rawState === "failed") {
                 mappedState = "error";
@@ -644,12 +683,27 @@ export class VMController {
       }).then(() => {
         if (abortSignal.aborted) return;
         Logger.info("VM", "Worker is ready. Dispatching INIT configuration...");
+        
+        const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+        const activeGenId = activeGen ? activeGen.id : 0;
+        
+        this.initDispatchTimestamp = Date.now();
+        
+        // Register a 5-second watchdog for INIT_ACK
+        this.timeouts.register("init_watchdog", 5000, async () => {
+          const currentState = this.lifecycle.getState().state;
+          if (currentState === "loading") {
+            Logger.error("VM", "[INIT TIMEOUT] VM initialization stalled (no INIT_ACK or INIT_SUCCESS) for more than 5s!");
+            this.dumpInitDiagnostics(activeGenId);
+          }
+        });
+
         this.transport.post("INIT", {
           origin,
           memory_size: this.config.memoryLimitBytes,
           vga_memory_size: this.config.vgaMemoryLimitBytes,
           version: Date.now().toString(),
-          initial_state: undefined,
+          initial_state: this.savedState || undefined,
         });
       }).catch((err) => {
         if (!resolved) {
@@ -657,6 +711,28 @@ export class VMController {
           reject(err);
         }
       });
+    });
+  }
+
+  private dumpInitDiagnostics(activeGenId: number): void {
+    const currentState = this.lifecycle.getState().state;
+    const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+    Logger.error("VM", "[INIT TIMEOUT DIAGNOSTICS]", {
+      workerState: "loading",
+      runtimeState: currentState,
+      bridgeGeneration: activeGenId,
+      bridgeState: activeGen?.bridge.getState(),
+      pendingDispatches: this.initPromise !== null,
+      activeListeners: {
+        hasSerialOutputListener: !!this.onSerialOutput,
+        hasStateChangeListener: !!this.onStateChange,
+      },
+      serialAttachState: this.lifecycle.getFullState().terminal,
+      unresolvedPromises: {
+        hasInitPromise: !!this.initPromise,
+        hasRecreatePromise: !!(this.transport as unknown as { state: { recreatePromise: Promise<void> | null } }).state.recreatePromise
+      },
+      ts: Date.now()
     });
   }
 
