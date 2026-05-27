@@ -445,10 +445,16 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
         "VM",
         `[PROVISIONING TELEMETRY] FS Ready: ${ready.telemetry.fsReadyTimestamp}, ` +
         `Write Latency: ${ready.telemetry.writeLatencyMs}ms, Path: ${ready.telemetry.filePath}, ` +
-        `Size: ${ready.telemetry.fileSize} bytes, Verified: ${ready.telemetry.verified}`
+        `Size: ${ready.telemetry.fileSize} bytes, Verified: ${ready.telemetry.verified}, ` +
+        `GuestVisible: ${ready.telemetry.guestVisible ?? "n/a"}, FallbackRequired: ${ready.telemetry.fallbackRequired ?? "n/a"}`
       );
     }
-    Logger.info("VM", `[PROVISIONING] PROVISION_READY received. File ${ready.filePath} written to VM FS. Sending PROVISION_EXECUTE...`);
+    Logger.info(
+      "VM",
+      `[PROVISIONING] PROVISION_READY received. File ${ready.filePath} written to VM FS. ` +
+      `Fallback mode: ${ready.telemetry?.fallbackRequired ? "ENABLED" : "DISABLED"}. ` +
+      `Sending PROVISION_EXECUTE...`
+    );
     this.transitionTransportTo("awaiting_execute");
 
     // Send execution trigger — worker will write single serial command
@@ -456,6 +462,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       execId: this.currentExecutionId,
       generation: this.activeBridgeGeneration,
       filePath: ready.filePath,
+      fallbackRequired: ready.telemetry?.fallbackRequired || false
     });
   }
 

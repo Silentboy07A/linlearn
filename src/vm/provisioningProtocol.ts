@@ -75,6 +75,7 @@ export interface ProvisionExecutePayload {
   execId: number;
   generation: number;
   filePath: string;
+  fallbackRequired?: boolean;
 }
 
 export interface ProvisionCancelPayload {
@@ -104,6 +105,8 @@ export interface ProvisionReadyPayload {
     filePath: string;
     fileSize: number;
     verified: boolean;
+    guestVisible?: boolean;
+    fallbackRequired?: boolean;
   };
 }
 

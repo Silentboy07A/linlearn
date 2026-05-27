@@ -612,9 +612,14 @@ var WorkerProvisioner = {
       throw new Error("Verification failed: File could not be read back or length mismatch");
     }
 
+    log("info", "[WorkerProvisioner] WorkerFS write verified. Size: " + bytes.length + " bytes. Latency: " + (Date.now() - startTime) + "ms");
+
+    // Guest namespace synchronization & verification step
+    var guestVerification = await this.verifyGuestVisibility(emu, filePath, this.execId);
+    
     this.transitionTo("executable");
     var writeLatency = Date.now() - startTime;
-    log("info", "[WorkerProvisioner] File write verified successfully. Latency: " + writeLatency + "ms");
+    log("info", "[WorkerProvisioner DIAGNOSTICS] WorkerFS File exists: true | GuestFS File exists: " + guestVerification.visible + " | Latency: " + writeLatency + "ms");
 
     // Return structured telemetry
     return {
@@ -622,8 +627,63 @@ var WorkerProvisioner = {
       writeLatencyMs: writeLatency,
       filePath: filePath,
       fileSize: bytes.length,
-      verified: true
+      verified: true,
+      guestVisible: guestVerification.visible,
+      fallbackRequired: !guestVerification.visible
     };
+  },
+
+  /**
+   * Verify if a file is visible inside the guest Linux namespace.
+   */
+  verifyGuestVisibility: function(emu, filePath, execId) {
+    return new Promise(function(resolve) {
+      log("info", "[WorkerProvisioner] Initiating guest-visible verification for: " + filePath);
+      
+      var outputBuffer = "";
+      var listener = function(byte) {
+        outputBuffer += String.fromCharCode(byte);
+        if (outputBuffer.length > 500) {
+          outputBuffer = outputBuffer.slice(-500);
+        }
+      };
+      
+      emu.add_listener("serial0-output-byte", listener);
+      
+      // Build mount, copy, and test command
+      var testCmd = 
+        "stty -echo\n" +
+        "mkdir -p /mnt/9p /tmp\n" +
+        "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+        "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+        "mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+        "cp /mnt/9p" + filePath + " " + filePath + " 2>/dev/null\n" +
+        "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null\n" +
+        "chmod +x " + filePath + " 2>/dev/null\n" +
+        "test -f " + filePath + " && echo \"FILE_VISIBLE_" + execId + "\"\n";
+        
+      SerialChannelManager.send(0, testCmd);
+      
+      var timeout = 4000; // 4 seconds timeout
+      var interval = 100;
+      var elapsed = 0;
+      
+      var checkTimer = setInterval(function() {
+        elapsed += interval;
+        var marker = "FILE_VISIBLE_" + execId;
+        if (outputBuffer.indexOf(marker) !== -1) {
+          clearInterval(checkTimer);
+          emu.remove_listener("serial0-output-byte", listener);
+          log("info", "[WorkerProvisioner] Guest confirmed file visibility successfully after " + elapsed + "ms.");
+          resolve({ visible: true, elapsedMs: elapsed });
+        } else if (elapsed >= timeout) {
+          clearInterval(checkTimer);
+          emu.remove_listener("serial0-output-byte", listener);
+          log("warn", "[WorkerProvisioner] Guest visibility verification timed out. Output buffer: " + JSON.stringify(outputBuffer));
+          resolve({ visible: false, elapsedMs: elapsed, output: outputBuffer });
+        }
+      }, interval);
+    });
   },
 
   /**
@@ -659,7 +719,7 @@ var WorkerProvisioner = {
 
     this.transitionTo("executable");
     var writeLatency = Date.now() - startTime;
-    log("info", "[WorkerProvisioner] Binary file write verified successfully. Latency: " + writeLatency + "ms");
+    log("info", "[WorkerProvisioner] Binary file write verified successfully on WorkerFS. Latency: " + writeLatency + "ms");
   },
 
   /**
@@ -1055,22 +1115,35 @@ self.onmessage = async function (e) {
     }
 
     case "PROVISION_EXECUTE": {
-      // Send a single short serial command to trigger script execution.
-      // This is the ONLY serial write during the entire provisioning flow.
       var execFilePath = payload.filePath;
       var execExecId = payload.execId;
-      log("info", "[WorkerProvisioner] Triggering script execution via serial: sh " + execFilePath);
+      var fallbackRequired = payload.fallbackRequired;
       WorkerProvisioner.transitionTo("executing");
       
-      // Build a robust trigger command: mount virtio-9p, copy script locally, and run
-      var triggerCmd = 
-        "stty -echo\n" +
-        "mkdir -p /mnt/9p /tmp\n" +
-        "mount -t 9p host9p /mnt/9p -o trans=virtio,version=9p2000.L 2>/dev/null\n" +
-        "cp /mnt/9p" + execFilePath + " " + execFilePath + " 2>/dev/null\n" +
-        "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null\n" +
-        "chmod +x " + execFilePath + " 2>/dev/null\n" +
-        "sh " + execFilePath + "\n";
+      var triggerCmd;
+      if (fallbackRequired) {
+        log("warn", "[WorkerProvisioner] Guest visibility failed. Using serial streaming fallback mode.");
+        var scriptContent = WorkerProvisioner.assembleScript();
+        // Disable echo first, then stream script directly using a heredoc block.
+        // We write the script line-by-line using standard shell redirection.
+        triggerCmd = 
+          "stty -echo\n" +
+          "sh << 'EOF_PROVISION'\n" +
+          scriptContent + "\n" +
+          "EOF_PROVISION\n";
+      } else {
+        log("info", "[WorkerProvisioner] Guest visibility verified. Using local file execution mode: " + execFilePath);
+        triggerCmd = 
+          "stty -echo\n" +
+          "mkdir -p /mnt/9p /tmp\n" +
+          "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+          "cp /mnt/9p" + execFilePath + " " + execFilePath + " 2>/dev/null\n" +
+          "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null\n" +
+          "chmod +x " + execFilePath + " 2>/dev/null\n" +
+          "sh " + execFilePath + "\n";
+      }
 
       var sent = SerialChannelManager.send(0, triggerCmd);
       if (sent) {
