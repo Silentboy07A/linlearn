@@ -14,6 +14,70 @@ console.log("[WORKER STARTUP]");
 
 // Generation management
 var workerGeneration = 0;
+var workerTerminating = false;
+var activeEmulatorInstances = new Set();
+
+// Wrap timers for clean teardown tracking
+var activeTimeouts = new Set();
+var activeIntervals = new Set();
+
+var originalSetTimeout = self.setTimeout;
+var originalClearTimeout = self.clearTimeout;
+var originalSetInterval = self.setInterval;
+var originalClearInterval = self.clearInterval;
+
+self.setTimeout = function(callback, delay, ...args) {
+  var id;
+  var wrappedCallback = function() {
+    activeTimeouts.delete(id);
+    if (workerTerminating) return;
+    callback(...args);
+  };
+  id = originalSetTimeout(wrappedCallback, delay);
+  activeTimeouts.add(id);
+  return id;
+};
+
+self.clearTimeout = function(id) {
+  activeTimeouts.delete(id);
+  originalClearTimeout(id);
+};
+
+self.setInterval = function(callback, delay, ...args) {
+  var id;
+  var wrappedCallback = function() {
+    if (workerTerminating) {
+      originalClearInterval(id);
+      activeIntervals.delete(id);
+      return;
+    }
+    callback(...args);
+  };
+  id = originalSetInterval(wrappedCallback, delay);
+  activeIntervals.add(id);
+  return id;
+};
+
+self.clearInterval = function(id) {
+  activeIntervals.delete(id);
+  originalClearInterval(id);
+};
+
+function clearAllTrackedTimers() {
+  if (typeof log === "function") {
+    log("info", "Clearing all tracked timers: " + activeTimeouts.size + " timeouts, " + activeIntervals.size + " intervals");
+  } else {
+    console.log("Clearing all tracked timers: " + activeTimeouts.size + " timeouts, " + activeIntervals.size + " intervals");
+  }
+  for (var id of activeTimeouts) {
+    originalClearTimeout(id);
+  }
+  activeTimeouts.clear();
+  for (var id of activeIntervals) {
+    originalClearInterval(id);
+  }
+  activeIntervals.clear();
+}
 
 /**
  * Post a message back to the main thread, automatically attaching the active generation ID.
@@ -22,6 +86,10 @@ var workerGeneration = 0;
  * @param {any[]} [transferables]
  */
 function postToHost(type, payload, transferables) {
+  if (workerTerminating) {
+    console.warn("[WORKER MESSAGE DROPPED (TERMINATING)]", type);
+    return;
+  }
   var msg = {
     type: type,
     payload: payload,
@@ -808,82 +876,6 @@ var WorkerProvisioner = {
 };
 
 
-var SerialChannelManager = {
-  ports: {},
-  logThrottle: {},
-
-  init: function(emu) {
-    this.ports = {};
-    this.logThrottle = {};
-    if (!emu) return;
-
-    var keys = Object.keys(emu);
-    log("info", "[SerialManager] Auditing emulator capabilities. Keys: " + keys.filter(function(k) {
-      return k.indexOf("serial") !== -1 || k.indexOf("adapter") !== -1;
-    }).join(", "));
-
-    this.ports['0'] = {
-      hasSend: typeof emu.serial0_send === "function",
-      ready: true
-    };
-
-    this.ports['1'] = {
-      hasSend: typeof emu.serial1_send === "function",
-      ready: typeof emu.serial_send_bytes === "function"
-    };
-
-    log("info", "[SerialManager] Port 0 capability: hasSend=" + this.ports['0'].hasSend);
-    log("info", "[SerialManager] Port 1 capability: hasSend=" + this.ports['1'].hasSend + ", hasSendBytes=" + this.ports['1'].ready);
-  },
-
-  send: function(port, data) {
-    if (!emulator) {
-      this.logThrottled("send_no_emu", "error", "[SerialManager] Cannot send: emulator not initialized.");
-      return false;
-    }
-
-    if (port === 1) {
-      if (typeof emulator.serial1_send === "function") {
-        emulator.serial1_send(data);
-        return true;
-      } else if (typeof emulator.serial_send_bytes === "function") {
-        var bytes = new Uint8Array(data.length);
-        for (var i = 0; i < data.length; i++) {
-          bytes[i] = data.charCodeAt(i);
-        }
-        emulator.serial_send_bytes(1, bytes);
-        return true;
-      } else {
-        this.logThrottled("serial1_unsupported", "warn", "[SerialManager] serial1 is unsupported by the emulator. Dropping payload.");
-        return false;
-      }
-    } else {
-      if (typeof emulator.serial0_send === "function") {
-        emulator.serial0_send(data);
-        return true;
-      } else if (typeof emulator.serial_send_bytes === "function") {
-        var bytes = new Uint8Array(data.length);
-        for (var i = 0; i < data.length; i++) {
-          bytes[i] = data.charCodeAt(i);
-        }
-        emulator.serial_send_bytes(0, bytes);
-        return true;
-      } else {
-        this.logThrottled("serial0_unsupported", "error", "[SerialManager] serial0 is unsupported! Dropping payload.");
-        return false;
-      }
-    }
-  },
-
-  logThrottled: function(key, level, msg) {
-    var now = Date.now();
-    if (!this.logThrottle[key] || now - this.logThrottle[key] > 5000) {
-      this.logThrottle[key] = now;
-      log(level, msg);
-    }
-  }
-};
-
 // ─── 4. EMULATOR MANAGER MODULE ──────────────────────────────────────────────
 /** @type {object|null} */
 var emulator = null;
@@ -911,10 +903,16 @@ async function createEmulator(config, win) {
     log("debug", "Configuring VM: RAM=" + (finalConfig.memory_size / (1024 * 1024)) + "MB, VGA RAM=" + (finalConfig.vga_memory_size / (1024 * 1024)) + "MB");
 
     emulator = new win.V86(finalConfig);
+    // Stamp generation and destroyed flag for ownership tracking
+    emulator.generation = workerGeneration;
+    emulator.destroyed = false;
+    activeEmulatorInstances.add(emulator);
     SerialChannelManager.init(emulator);
 
     // Bridge serial output with batch buffering
+    var capturedEmulator = emulator;
     emulator.add_listener("serial0-output-byte", function (byte) {
+      if (capturedEmulator.destroyed) return;
       serialSendBuffer.push(byte);
       if (serialSendBuffer.length >= 1024) {
         if (serialTimeoutId) {
@@ -928,10 +926,11 @@ async function createEmulator(config, win) {
 
     // Bridge serial1 output (invisible heartbeat channel)
     emulator.add_listener("serial1-output-byte", function (byte) {
+      if (capturedEmulator.destroyed) return;
       postToHost("SERIAL1_OUT", byte);
     });
 
-    log("info", "v86 emulator successfully created.");
+    log("info", "v86 emulator successfully created. Generation: " + emulator.generation);
   } catch (err) {
     emulator = null;
     var msg = "Failed to create emulator instance: " + (err.message || String(err));
@@ -945,7 +944,19 @@ async function createEmulator(config, win) {
  */
 async function destroyEmulator() {
   if (emulator) {
-    log("info", "Destroying active emulator instance...");
+    log("info", "Destroying active emulator instance (generation=" + emulator.generation + ")...");
+    // Mark destroyed FIRST so that any stale tick callbacks that fire during teardown exit safely
+    emulator.destroyed = true;
+    if (emulator._v86_val) {
+      emulator._v86_val.destroyed = true;
+    }
+    activeEmulatorInstances.delete(emulator);
+    // Flush and clear serial buffer before destroy
+    if (serialTimeoutId) {
+      clearTimeout(serialTimeoutId);
+      serialTimeoutId = null;
+    }
+    serialSendBuffer = [];
     try {
       if (typeof emulator.destroy === "function") {
         await emulator.destroy();
@@ -965,19 +976,31 @@ async function destroyEmulator() {
 self.onmessage = async function (e) {
   var data = e.data;
   if (!data) return;
-  
-  console.log("[WORKER MESSAGE RECEIVED]", data);
 
   var type = data.type;
   var payload = data.payload;
   var gen = data.generation;
 
+  // 5. Add worker termination barrier
+  if (workerTerminating) {
+    console.warn("[WORKER] Message ignored - worker is terminating: " + type);
+    return;
+  }
+
+  // 2. Add generation ownership guards
   if (gen !== undefined) {
+    if (type !== "INIT" && type !== "DESTROY" && gen !== workerGeneration) {
+      log("warn", "[onmessage GUARD] Dropping message type '" + type + "' because payload generation (" + gen + ") doesn't match worker generation (" + workerGeneration + ")");
+      return;
+    }
     workerGeneration = gen;
   }
 
+  console.log("[WORKER MESSAGE RECEIVED]", data);
+
   switch (type) {
     case "INIT":
+      workerTerminating = false;
       console.log("[WORKER INIT RECEIVED]", {
         generation: workerGeneration,
         runtimeState: payload.initial_state ? "restoring" : "cold_boot",
@@ -1102,6 +1125,9 @@ self.onmessage = async function (e) {
 
     case "DESTROY":
       log("info", "Destroying emulator worker context...");
+      // 4. Add teardown cleanup - set barrier first so all pending callbacks exit
+      workerTerminating = true;
+      clearAllTrackedTimers();
       setLifecycleState("destroyed");
       await destroyEmulator();
       self.close();
@@ -1237,6 +1263,235 @@ self.onmessage = async function (e) {
 };
 console.log("[WORKER ONMESSAGE REGISTERED]");
 
+
+// ─── 6. INTERCEPT AND WRAP V86 INTERNALS FOR LIFE-CYCLE SECURITY ──────────────
+
+function wrapV86Constructor() {
+  if (typeof self.V86 === "undefined") {
+    log("error", "Cannot wrap V86: self.V86 is undefined");
+    return;
+  }
+  
+  if (self.V86._isWrapped) {
+    log("info", "V86 constructor is already wrapped.");
+    return;
+  }
+  
+  log("info", "Wrapping V86 constructor and prototype to intercept ticking loop...");
+
+  var OriginalV86 = self.V86;
+
+  var WrappedV86 = function(config) {
+    this.generation = workerGeneration;
+    this.destroyed = false;
+    log("info", "[V86 Constructor Wrapper] New V86 instance instantiated for generation: " + this.generation);
+    var inst = new OriginalV86(config);
+    inst.generation = this.generation;
+    inst.destroyed = false;
+    
+    // Explicitly trace the new instance and register it
+    activeEmulatorInstances.add(inst);
+
+    return inst;
+  };
+
+  // Copy prototype and static properties
+  WrappedV86.prototype = OriginalV86.prototype;
+  Object.assign(WrappedV86, OriginalV86);
+  WrappedV86._isWrapped = true;
+  self.V86 = WrappedV86;
+
+  // Let's add a setter for 'v86' on OriginalV86.prototype to intercept internal ticker 'F'
+  Object.defineProperty(OriginalV86.prototype, "v86", {
+    configurable: true,
+    enumerable: true,
+    get: function() {
+      return this._v86_val;
+    },
+    set: function(val) {
+      this._v86_val = val;
+      if (val) {
+        log("info", "Intercepted internal ticker F instance creation. Applying safe tick ownership and guards.");
+        val.emuInstance = this; // Bind the V86 instance to the ticker!
+        patchTickerInstance(val);
+      }
+    }
+  });
+
+  // Track add_listener / remove_listener on OriginalV86.prototype to safely detach callbacks
+  var originalAddListener = OriginalV86.prototype.add_listener;
+  OriginalV86.prototype.add_listener = function(name, callback) {
+    if (!this._registeredListeners) {
+      this._registeredListeners = [];
+    }
+    this._registeredListeners.push({ name: name, callback: callback });
+    return originalAddListener.call(this, name, callback);
+  };
+
+  var originalRemoveListener = OriginalV86.prototype.remove_listener;
+  OriginalV86.prototype.remove_listener = function(name, callback) {
+    if (this._registeredListeners) {
+      this._registeredListeners = this._registeredListeners.filter(function(l) {
+        return !(l.name === name && l.callback === callback);
+      });
+    }
+    return originalRemoveListener.call(this, name, callback);
+  };
+
+  // Override N.prototype.destroy to cleanly teardown
+  var originalDestroy = OriginalV86.prototype.destroy;
+  OriginalV86.prototype.destroy = async function() {
+    log("info", "V86 instance destroy called for generation: " + this.generation);
+    this.destroyed = true;
+    if (this._v86_val) {
+      this._v86_val.destroyed = true;
+    }
+    
+    activeEmulatorInstances.delete(this);
+    teardownTimersAndCallbacks(this);
+
+    // Detach all listeners
+    if (this._registeredListeners) {
+      log("info", "Detaching " + this._registeredListeners.length + " serial/device callbacks...");
+      var selfRef = this;
+      this._registeredListeners.forEach(function(l) {
+        try {
+          originalRemoveListener.call(selfRef, l.name, l.callback);
+        } catch (err) {
+          // ignore
+        }
+      });
+      this._registeredListeners = [];
+    }
+
+    if (originalDestroy) {
+      try {
+        await originalDestroy.call(this);
+      } catch (err) {
+        log("warn", "Error in original V86 destroy: " + err.message);
+      }
+    }
+  };
+}
+
+function patchTickerInstance(ticker) {
+  var FProto = Object.getPrototypeOf(ticker);
+  
+  if (FProto._patched) {
+    return;
+  }
+  FProto._patched = true;
+
+  log("info", "Applying lifecycle guards and safe tick ownership model to F.prototype");
+
+  var originalDoTick = FProto.do_tick;
+  var originalYieldCallback = FProto.yield_callback;
+
+  FProto.do_tick = function() {
+    var emuInstance = this.emuInstance;
+    var tickGen = emuInstance ? emuInstance.generation : -1;
+    var activeGen = workerGeneration;
+    var emu = emulator;
+
+    // 6. Add do_tick instrumentation
+    if (typeof doTickLogCount === "undefined") {
+      globalThis.doTickLogCount = 0;
+    }
+    globalThis.doTickLogCount++;
+    if (globalThis.doTickLogCount % 50000 === 0) {
+      log("debug", "[do_tick Instrumentation] Gen: " + tickGen + 
+                 " | ActiveGen: " + activeGen +
+                 " | Worker State: " + lifecycleState + 
+                 " | Worker Terminating? " + workerTerminating +
+                 " | Emu Destroyed? " + !!(emuInstance && emuInstance.destroyed));
+    }
+
+    // 2. Add generation ownership guards
+    if (tickGen !== activeGen) {
+      if (!this._warnedStaleGen) {
+        this._warnedStaleGen = true;
+        log("warn", "[do_tick GUARD] Rejected tick: Stale generation. Ticker gen: " + tickGen + ", Active gen: " + activeGen);
+      }
+      return;
+    }
+
+    // 5. Add worker termination barrier
+    if (workerTerminating) {
+      if (!this._warnedTerminating) {
+        this._warnedTerminating = true;
+        log("warn", "[do_tick GUARD] Rejected tick: Worker is terminating/destroyed.");
+      }
+      return;
+    }
+
+    // 7. Add destroyed-instance guards
+    if (!emuInstance || emuInstance.destroyed || !emu || emu.destroyed) {
+      if (!this._warnedDestroyed) {
+        this._warnedDestroyed = true;
+        log("warn", "[do_tick GUARD] Rejected tick: Emulator instance is destroyed/null.");
+      }
+      return;
+    }
+
+    // 3. Prevent double tick scheduling
+    if (this.isTickingNow) {
+      if (!this._warnedDoubleTick) {
+        this._warnedDoubleTick = true;
+        log("warn", "[do_tick GUARD] Rejected tick: Double tick loop detected.");
+      }
+      return;
+    }
+
+    this.isTickingNow = true;
+    try {
+      originalDoTick.call(this);
+    } finally {
+      this.isTickingNow = false;
+    }
+  };
+
+  FProto.yield_callback = function(tickCount) {
+    var emuInstance = this.emuInstance;
+    var tickGen = emuInstance ? emuInstance.generation : -1;
+    var activeGen = workerGeneration;
+    var emu = emulator;
+
+    // 2. Add generation ownership guards
+    if (tickGen !== activeGen) {
+      if (!this._warnedStaleYieldGen) {
+        this._warnedStaleYieldGen = true;
+        log("warn", "[yield_callback GUARD] Rejected yield: Stale generation. Ticker gen: " + tickGen + ", Active gen: " + activeGen);
+      }
+      return;
+    }
+
+    // 5. Add worker termination barrier
+    if (workerTerminating) {
+      return;
+    }
+
+    // 7. Add destroyed-instance guards
+    if (!emuInstance || emuInstance.destroyed || !emu || emu.destroyed) {
+      if (!this._warnedYieldDestroyed) {
+        this._warnedYieldDestroyed = true;
+        log("warn", "[yield_callback GUARD] Rejected yield: Emulator instance is destroyed/null.");
+      }
+      return;
+    }
+
+    originalYieldCallback.call(this, tickCount);
+  };
+}
+
+function teardownTimersAndCallbacks(emuInstance) {
+  log("info", "Tearing down timers and callbacks for emulator instance of generation " + emuInstance.generation);
+  if (serialTimeoutId) {
+    clearTimeout(serialTimeoutId);
+    serialTimeoutId = null;
+  }
+  serialSendBuffer = [];
+}
+
 /**
  * Initialize the v86 emulator inside this worker.
  * @param {{ origin: string, version?: string, memory_size?: number, cmdline?: string }} payload
@@ -1266,6 +1521,10 @@ async function handleInit(payload) {
     postToHost("INIT_FAILURE", errMsg);
     return;
   }
+
+  // Immediately wrap V86 constructor to intercept the internal ticker loop (F.prototype)
+  // and install generation ownership guards, double-tick prevention, and destroyed-instance checks.
+  wrapV86Constructor();
 
   log("info", "Step 1/4 completed: libv86.js loaded in " + (Date.now() - t0) + "ms");
 

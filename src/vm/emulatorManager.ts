@@ -492,24 +492,15 @@ export class VMController {
     this.onSerialOutput = onSerial;
     this.onStateChange = onState;
 
-    // Validate snapshot integrity before restore (gzip magic bytes: 0x1F 0x8B)
+    // STABILITY FIX: Temporarily disable snapshot restore to isolate emulator boot lifecycle.
+    // Corrupted snapshots can poison WASM memory and cause RuntimeError: unreachable traps.
+    // Re-enable once emulator ticking loop stability is validated.
     if (initialState && initialState.byteLength > 2) {
-      const bytes = new Uint8Array(initialState);
-      if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
-        this.wasRestoredFromSnapshot = true;
-        this.savedState = initialState;
-        this.lastRestoreTimestamp = Date.now();
-        Logger.info("VM", `Valid snapshot found (gzip magic 0x1F 0x8B): size ${initialState.byteLength} bytes.`);
-      } else {
-        Logger.warn("VM", "Invalid snapshot magic bytes (expected gzip 0x1F 0x8B). Discarding corrupted state safely.");
-        this.wasRestoredFromSnapshot = false;
-        this.savedState = null;
-      }
-    } else {
-      this.wasRestoredFromSnapshot = false;
-      this.savedState = null;
-      Logger.info("VM", "No snapshot found or empty snapshot. Clean cold boot.");
+      Logger.warn("VM", "[STABILITY FIX] Snapshot restore DISABLED for stability testing. Forcing clean cold boot.");
     }
+    this.wasRestoredFromSnapshot = false;
+    this.savedState = null;
+    Logger.info("VM", "Cold boot mode active (snapshot restore disabled for stability).");
 
     this.provisioning.reset();
     this.provisioningSearchBuffer = "";
