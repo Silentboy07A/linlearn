@@ -634,55 +634,124 @@ var WorkerProvisioner = {
   },
 
   /**
+   * Strip ANSI escape codes and carriage returns from a string.
+   */
+  sanitizeSerialOutput: function(str) {
+    var ansiRegex = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+    var cleaned = str.replace(ansiRegex, "");
+    cleaned = cleaned.replace(/\r/g, "");
+    return cleaned;
+  },
+
+  /**
    * Verify if a file is visible inside the guest Linux namespace.
    */
   verifyGuestVisibility: function(emu, filePath, execId) {
     return new Promise(function(resolve) {
       log("info", "[WorkerProvisioner] Initiating guest-visible verification for: " + filePath);
       
-      var outputBuffer = "";
-      var listener = function(byte) {
-        outputBuffer += String.fromCharCode(byte);
-        if (outputBuffer.length > 500) {
-          outputBuffer = outputBuffer.slice(-500);
+      var rawBuffer = "";
+      var parserState = "awaiting_verify_begin";
+      var visible = false;
+      var finished = false;
+      var startVerifyTime = Date.now();
+      var checkTimer = null;
+      var listener;
+
+      function finalizeVerification(result) {
+        if (finished) return;
+        finished = true;
+        if (checkTimer) {
+          clearInterval(checkTimer);
+        }
+        if (listener) {
+          emu.remove_listener("serial0-output-byte", listener);
+        }
+        log("info", "[WorkerProvisioner] Guest visibility verification finished. Result visible: " + result + " after " + (Date.now() - startVerifyTime) + "ms.");
+        resolve({ visible: result, elapsedMs: Date.now() - startVerifyTime });
+      }
+
+      listener = function(byte) {
+        var char = String.fromCharCode(byte);
+        rawBuffer += char;
+        // Keep rawBuffer size under control to avoid memory leakage/slowdown
+        if (rawBuffer.length > 4096) {
+          rawBuffer = rawBuffer.slice(-4096);
+        }
+        
+        // Strip ANSI escapes and carriage returns for protocol checks
+        var sanitized = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
+        
+        // Process FSM states
+        var beginMarker = "<<<VERIFY_BEGIN:" + execId + ">>>";
+        var visibleMarker = "<<<FILE_VISIBLE:" + execId + ">>>";
+        var endMarker = "<<<VERIFY_END:" + execId + ">>>";
+        
+        if (parserState === "awaiting_verify_begin") {
+          var beginIdx = sanitized.indexOf(beginMarker);
+          if (beginIdx !== -1) {
+            parserState = "awaiting_visibility";
+            log("info", "[WorkerProvisioner] FSM state: awaiting_verify_begin -> awaiting_visibility");
+          }
+        }
+        
+        if (parserState === "awaiting_visibility") {
+          var beginIdx = sanitized.indexOf(beginMarker);
+          var searchArea = beginIdx !== -1 ? sanitized.substring(beginIdx + beginMarker.length) : sanitized;
+          
+          if (searchArea.indexOf(visibleMarker) !== -1) {
+            visible = true;
+            parserState = "awaiting_verify_end";
+            log("info", "[WorkerProvisioner] FSM state: awaiting_visibility -> awaiting_verify_end. Guest file verified.");
+          } else if (searchArea.indexOf(endMarker) !== -1) {
+            visible = false;
+            parserState = "complete";
+            log("info", "[WorkerProvisioner] FSM state: awaiting_visibility -> complete. Guest file not found.");
+            finalizeVerification(visible);
+          }
+        }
+        
+        if (parserState === "awaiting_verify_end") {
+          var beginIdx = sanitized.indexOf(beginMarker);
+          var searchArea = beginIdx !== -1 ? sanitized.substring(beginIdx + beginMarker.length) : sanitized;
+          
+          if (searchArea.indexOf(endMarker) !== -1) {
+            parserState = "complete";
+            log("info", "[WorkerProvisioner] FSM state: awaiting_verify_end -> complete. Verification complete.");
+            finalizeVerification(visible);
+          }
         }
       };
       
       emu.add_listener("serial0-output-byte", listener);
       
-      // Build mount, copy, and test command
+      // Build mount, copy, and test command wrapped in a single non-interactive sh -c block
       var testCmd = 
-        "stty -echo\n" +
-        "mkdir -p /mnt/9p /tmp\n" +
+        "sh -c 'PS1=\"\"; stty -echo; echo \"<<<VERIFY_BEGIN:" + execId + ">>>\"; " +
+        "mkdir -p /mnt/9p /tmp 2>/dev/null; " +
         "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
         "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-        "mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
-        "cp /mnt/9p" + filePath + " " + filePath + " 2>/dev/null\n" +
-        "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null\n" +
-        "chmod +x " + filePath + " 2>/dev/null\n" +
-        "test -f " + filePath + " && echo \"FILE_VISIBLE_" + execId + "\"\n";
+        "mount -t 9p host9p /mnt/9p 2>/dev/null; " +
+        "cp /mnt/9p" + filePath + " " + filePath + " 2>/dev/null; " +
+        "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null; " +
+        "chmod +x " + filePath + " 2>/dev/null; " +
+        "if [ -f " + filePath + " ]; then echo \"<<<FILE_VISIBLE:" + execId + ">>>\"; fi; " +
+        "echo \"<<<VERIFY_END:" + execId + ">>>\"'\n";
         
       SerialChannelManager.send(0, testCmd);
       
-      var timeout = 4000; // 4 seconds timeout
-      var interval = 100;
-      var elapsed = 0;
-      
-      var checkTimer = setInterval(function() {
-        elapsed += interval;
-        var marker = "FILE_VISIBLE_" + execId;
-        if (outputBuffer.indexOf(marker) !== -1) {
-          clearInterval(checkTimer);
-          emu.remove_listener("serial0-output-byte", listener);
-          log("info", "[WorkerProvisioner] Guest confirmed file visibility successfully after " + elapsed + "ms.");
-          resolve({ visible: true, elapsedMs: elapsed });
-        } else if (elapsed >= timeout) {
-          clearInterval(checkTimer);
-          emu.remove_listener("serial0-output-byte", listener);
-          log("warn", "[WorkerProvisioner] Guest visibility verification timed out. Output buffer: " + JSON.stringify(outputBuffer));
-          resolve({ visible: false, elapsedMs: elapsed, output: outputBuffer });
+      var timeout = 6000; // 6 seconds timeout
+      checkTimer = setInterval(function() {
+        var elapsed = Date.now() - startVerifyTime;
+        if (elapsed >= timeout) {
+          var sanitizedOutput = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
+          log("warn", "[WorkerProvisioner] Guest visibility verification timed out. " +
+                      "Raw buffer: " + JSON.stringify(rawBuffer) + " | " +
+                      "Sanitized: " + JSON.stringify(sanitizedOutput) + " | " +
+                      "FSM State: " + parserState);
+          finalizeVerification(false);
         }
-      }, interval);
+      }, 100);
     });
   },
 
@@ -1134,15 +1203,14 @@ self.onmessage = async function (e) {
       } else {
         log("info", "[WorkerProvisioner] Guest visibility verified. Using local file execution mode: " + execFilePath);
         triggerCmd = 
-          "stty -echo\n" +
-          "mkdir -p /mnt/9p /tmp\n" +
+          "sh -c 'stty -echo; mkdir -p /mnt/9p /tmp 2>/dev/null; " +
           "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
-          "cp /mnt/9p" + execFilePath + " " + execFilePath + " 2>/dev/null\n" +
-          "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null\n" +
-          "chmod +x " + execFilePath + " 2>/dev/null\n" +
-          "sh " + execFilePath + "\n";
+          "mount -t 9p host9p /mnt/9p 2>/dev/null; " +
+          "cp /mnt/9p" + execFilePath + " " + execFilePath + " 2>/dev/null; " +
+          "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null; " +
+          "chmod +x " + execFilePath + " 2>/dev/null; " +
+          "exec sh " + execFilePath + "'\n";
       }
 
       var sent = SerialChannelManager.send(0, triggerCmd);
