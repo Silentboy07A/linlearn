@@ -237,14 +237,18 @@ export class TransportCoordinator {
     this.generationManager.createNextGeneration(bridge, token);
 
     // Initialize the serial queue with a dynamic delegate call targeting the current active bridge
-    this.serialQueue = new SerialWriteQueue((type, payload) => {
-      const activeGen = this.generationManager.getActiveGeneration();
-      if (activeGen && activeGen.isValid) {
-        activeGen.bridge.post(type, payload);
-      } else {
-        Logger.warn("VM", "[TransportCoordinator] Serial write dropped: active generation is invalid or null");
-      }
-    });
+    this.serialQueue = new SerialWriteQueue(
+      (type, payload) => {
+        const activeGen = this.generationManager.getActiveGeneration();
+        if (activeGen && activeGen.isValid) {
+          activeGen.bridge.post(type, payload);
+        } else {
+          Logger.warn("VM", "[TransportCoordinator] Serial write dropped: active generation is invalid or null");
+        }
+      },
+      // Backpressure: max 16 pending interactive writes
+      { maxQueueDepth: 16, chunkSize: 64, delayMs: 15 }
+    );
   }
 
   public getBridge(): WorkerBridge {
@@ -470,6 +474,11 @@ export class TransportCoordinator {
     }
   }
 
+  /**
+   * Send a serial write for interactive keyboard input or short programmatic commands.
+   * Uses the SerialWriteQueue with backpressure and chunk pacing.
+   * NOTE: Provisioning script transfer must use postProvision() instead.
+   */
   public async send(port: number, data: string): Promise<void> {
     try {
       const activeGen = this.generationManager.getActiveGeneration();
@@ -497,6 +506,29 @@ export class TransportCoordinator {
       Logger.info("VM", `[TransportCoordinator] Suppressed non-fatal teardown exception during send on port ${port}: ${err}`);
       this.generationManager.recordSuppressedTeardownException();
     }
+  }
+
+  /**
+   * Post a PROVISION_* message directly to the active bridge.
+   * This bypasses the serial write queue entirely — provisioning messages
+   * travel over the postMessage channel, not through ttyS0.
+   *
+   * Use this for all PROVISION_BEGIN / PROVISION_CHUNK / PROVISION_END /
+   * PROVISION_WRITE / PROVISION_WRITE_BINARY / PROVISION_EXECUTE / PROVISION_CANCEL.
+   */
+  public postProvision(type: string, payload: unknown): void {
+    const activeGen = this.generationManager.getActiveGeneration();
+    if (!activeGen || !activeGen.isValid) {
+      Logger.warn("VM", `[TransportCoordinator] postProvision('${type}') dropped: no valid active bridge generation.`);
+      return;
+    }
+    const bridge = activeGen.bridge;
+    if (bridge.getState() !== WorkerBridgeState.READY) {
+      Logger.warn("VM", `[TransportCoordinator] postProvision('${type}') dropped: bridge not in READY state (current: ${bridge.getState()}).`);
+      return;
+    }
+    Logger.debug("VM", `[TransportCoordinator] postProvision('${type}') -> bridge generation ${activeGen.id}`);
+    bridge.post(type, payload);
   }
 
   public hasSerial1Support(): boolean {

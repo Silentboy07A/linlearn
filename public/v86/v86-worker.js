@@ -274,6 +274,244 @@ var SerialChannelManager = {
   }
 };
 
+// ─── 3.6. WORKER PROVISIONER MODULE ─────────────────────────────────────────
+/**
+ * Handles atomic script provisioning on the worker side.
+ *
+ * Protocol:
+ *   Host sends: PROVISION_BEGIN → PROVISION_CHUNK(s) → PROVISION_END
+ *                              → PROVISION_WRITE → PROVISION_EXECUTE
+ *   Worker replies: PROVISION_ACK for each step, PROVISION_NACK on failure.
+ *
+ * The script is assembled entirely in the worker from framed chunks.
+ * It is written to the VM filesystem via emulator.create_file().
+ * Only a single short serial command ("sh /tmp/p.sh\n") is written to ttyS0.
+ * This eliminates serial flooding and PTY echo corruption entirely.
+ */
+var WorkerProvisioner = {
+  execId: 0,
+  generation: 0,
+  chunks: [],
+  totalExpected: 0,
+  receivedCount: 0,
+  active: false,
+
+  /**
+   * Compute simple XOR checksum (matches provisioningProtocol.ts).
+   */
+  computeChecksum: function(data) {
+    var cs = 0;
+    for (var i = 0; i < data.length; i++) {
+      cs ^= data.charCodeAt(i);
+    }
+    return cs;
+  },
+
+  /**
+   * Begin a new provisioning session.
+   */
+  begin: function(payload) {
+    if (this.active) {
+      log("warn", "[WorkerProvisioner] PROVISION_BEGIN received while already active (execId=" + this.execId + "). Resetting.");
+    }
+    this.execId = payload.execId;
+    this.generation = payload.generation;
+    this.totalExpected = payload.totalChunks;
+    this.chunks = new Array(payload.totalChunks);
+    this.receivedCount = 0;
+    this.active = true;
+    log("info", "[WorkerProvisioner] Session started. execId=" + this.execId + ", totalChunks=" + this.totalExpected + ", totalBytes=" + payload.totalBytes);
+  },
+
+  /**
+   * Add and validate a script chunk.
+   * Returns true on success, false on validation failure.
+   */
+  addChunk: function(payload) {
+    if (!this.active || payload.execId !== this.execId) {
+      log("warn", "[WorkerProvisioner] Stale/unexpected PROVISION_CHUNK. Expected execId=" + this.execId + ", got=" + payload.execId);
+      return false;
+    }
+    if (payload.chunkIndex < 0 || payload.chunkIndex >= this.totalExpected) {
+      log("error", "[WorkerProvisioner] Chunk index out of bounds: " + payload.chunkIndex + " / " + this.totalExpected);
+      return false;
+    }
+    // Validate checksum
+    var computed = this.computeChecksum(payload.data);
+    if (computed !== payload.checksum) {
+      log("error", "[WorkerProvisioner] Checksum mismatch for chunk " + payload.chunkIndex + ": expected=" + payload.checksum + ", got=" + computed);
+      return false;
+    }
+    this.chunks[payload.chunkIndex] = payload.data;
+    this.receivedCount++;
+    log("debug", "[WorkerProvisioner] Chunk " + payload.chunkIndex + "/" + (this.totalExpected - 1) + " received OK.");
+    return true;
+  },
+
+  /**
+   * Finalize: verify all chunks are present.
+   */
+  finalize: function(payload) {
+    if (!this.active || payload.execId !== this.execId) {
+      log("warn", "[WorkerProvisioner] Stale PROVISION_END received.");
+      return false;
+    }
+    if (payload.chunkCount !== this.totalExpected) {
+      log("error", "[WorkerProvisioner] PROVISION_END chunkCount mismatch: expected=" + this.totalExpected + ", got=" + payload.chunkCount);
+      return false;
+    }
+    // Verify all slots are filled
+    for (var i = 0; i < this.totalExpected; i++) {
+      if (this.chunks[i] === undefined || this.chunks[i] === null) {
+        log("error", "[WorkerProvisioner] Missing chunk at index " + i);
+        return false;
+      }
+    }
+    log("info", "[WorkerProvisioner] All " + this.totalExpected + " chunks received and validated.");
+    return true;
+  },
+
+  /**
+   * Assemble all chunks into the final script string.
+   */
+  assembleScript: function() {
+    return this.chunks.join("");
+  },
+
+  /**
+   * Write the assembled script to the VM filesystem using create_file().
+   * Returns a Promise.
+   */
+  writeFile: async function(emu, filePath) {
+    if (!emu) {
+      throw new Error("[WorkerProvisioner] Emulator not available for file write.");
+    }
+    if (typeof emu.create_file !== "function") {
+      throw new Error("[WorkerProvisioner] emulator.create_file() is not available.");
+    }
+    var script = this.assembleScript();
+    log("info", "[WorkerProvisioner] Writing " + script.length + " bytes to " + filePath + " via create_file()");
+    var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+    var bytes;
+    if (encoder) {
+      bytes = encoder.encode(script);
+    } else {
+      // Fallback for older environments
+      bytes = new Uint8Array(script.length);
+      for (var i = 0; i < script.length; i++) {
+        bytes[i] = script.charCodeAt(i) & 0xFF;
+      }
+    }
+    await emu.create_file(filePath, bytes);
+    log("info", "[WorkerProvisioner] File written successfully: " + filePath);
+  },
+
+  /**
+   * Write a binary blob directly to the VM filesystem.
+   * Used for the user home backup tar.gz transfer.
+   */
+  writeBinaryFile: async function(emu, filePath, data) {
+    if (!emu) {
+      throw new Error("[WorkerProvisioner] Emulator not available for binary file write.");
+    }
+    if (typeof emu.create_file !== "function") {
+      throw new Error("[WorkerProvisioner] emulator.create_file() is not available.");
+    }
+    log("info", "[WorkerProvisioner] Writing binary blob of " + data.byteLength + " bytes to " + filePath + " via create_file()");
+    await emu.create_file(filePath, data);
+    log("info", "[WorkerProvisioner] Binary file written successfully: " + filePath);
+  },
+
+  /**
+   * Cancel the current provisioning session.
+   */
+  cancel: function() {
+    log("info", "[WorkerProvisioner] Provisioning cancelled for execId=" + this.execId);
+    this.chunks = [];
+    this.active = false;
+    this.receivedCount = 0;
+    this.totalExpected = 0;
+    this.execId = 0;
+  }
+};
+
+
+var SerialChannelManager = {
+  ports: {},
+  logThrottle: {},
+
+  init: function(emu) {
+    this.ports = {};
+    this.logThrottle = {};
+    if (!emu) return;
+
+    var keys = Object.keys(emu);
+    log("info", "[SerialManager] Auditing emulator capabilities. Keys: " + keys.filter(function(k) {
+      return k.indexOf("serial") !== -1 || k.indexOf("adapter") !== -1;
+    }).join(", "));
+
+    this.ports['0'] = {
+      hasSend: typeof emu.serial0_send === "function",
+      ready: true
+    };
+
+    this.ports['1'] = {
+      hasSend: typeof emu.serial1_send === "function",
+      ready: typeof emu.serial_send_bytes === "function"
+    };
+
+    log("info", "[SerialManager] Port 0 capability: hasSend=" + this.ports['0'].hasSend);
+    log("info", "[SerialManager] Port 1 capability: hasSend=" + this.ports['1'].hasSend + ", hasSendBytes=" + this.ports['1'].ready);
+  },
+
+  send: function(port, data) {
+    if (!emulator) {
+      this.logThrottled("send_no_emu", "error", "[SerialManager] Cannot send: emulator not initialized.");
+      return false;
+    }
+
+    if (port === 1) {
+      if (typeof emulator.serial1_send === "function") {
+        emulator.serial1_send(data);
+        return true;
+      } else if (typeof emulator.serial_send_bytes === "function") {
+        var bytes = new Uint8Array(data.length);
+        for (var i = 0; i < data.length; i++) {
+          bytes[i] = data.charCodeAt(i);
+        }
+        emulator.serial_send_bytes(1, bytes);
+        return true;
+      } else {
+        this.logThrottled("serial1_unsupported", "warn", "[SerialManager] serial1 is unsupported by the emulator. Dropping payload.");
+        return false;
+      }
+    } else {
+      if (typeof emulator.serial0_send === "function") {
+        emulator.serial0_send(data);
+        return true;
+      } else if (typeof emulator.serial_send_bytes === "function") {
+        var bytes = new Uint8Array(data.length);
+        for (var i = 0; i < data.length; i++) {
+          bytes[i] = data.charCodeAt(i);
+        }
+        emulator.serial_send_bytes(0, bytes);
+        return true;
+      } else {
+        this.logThrottled("serial0_unsupported", "error", "[SerialManager] serial0 is unsupported! Dropping payload.");
+        return false;
+      }
+    }
+  },
+
+  logThrottled: function(key, level, msg) {
+    var now = Date.now();
+    if (!this.logThrottle[key] || now - this.logThrottle[key] > 5000) {
+      this.logThrottle[key] = now;
+      log(level, msg);
+    }
+  }
+};
+
 // ─── 4. EMULATOR MANAGER MODULE ──────────────────────────────────────────────
 /** @type {object|null} */
 var emulator = null;
@@ -497,6 +735,105 @@ self.onmessage = async function (e) {
       self.close();
       break;
 
+    // ── Provisioning Protocol Handlers ───────────────────────────────────────
+    // These messages travel over the host↔worker message bus, NOT serial.
+    // They implement atomic file transfer to replace base64 serial injection.
+
+    case "PROVISION_BEGIN":
+      WorkerProvisioner.begin(payload);
+      postToHost("PROVISION_ACK", { type: "begin", execId: payload.execId });
+      break;
+
+    case "PROVISION_CHUNK": {
+      var chunkOk = WorkerProvisioner.addChunk(payload);
+      if (chunkOk) {
+        postToHost("PROVISION_ACK", { type: "chunk", execId: payload.execId, chunkIndex: payload.chunkIndex });
+      } else {
+        log("error", "[WorkerProvisioner] Chunk validation failed for index=" + payload.chunkIndex);
+        postToHost("PROVISION_NACK", { execId: payload.execId, chunkIndex: payload.chunkIndex, reason: "checksum_mismatch" });
+      }
+      break;
+    }
+
+    case "PROVISION_END": {
+      var endOk = WorkerProvisioner.finalize(payload);
+      if (endOk) {
+        postToHost("PROVISION_ACK", { type: "end", execId: payload.execId });
+      } else {
+        postToHost("PROVISION_NACK", { execId: payload.execId, reason: "assembly_incomplete" });
+        WorkerProvisioner.cancel();
+      }
+      break;
+    }
+
+    case "PROVISION_WRITE": {
+      // Write the assembled script to the VM filesystem via create_file().
+      // This is the key step that replaces base64 serial injection.
+      var writeExecId = payload.execId;
+      var writeFilePath = payload.filePath;
+      try {
+        await WorkerProvisioner.writeFile(emulator, writeFilePath);
+        postToHost("PROVISION_READY", {
+          execId: writeExecId,
+          generation: payload.generation,
+          filePath: writeFilePath
+        });
+      } catch (writeErr) {
+        log("error", "[WorkerProvisioner] create_file() failed: " + (writeErr.message || String(writeErr)));
+        postToHost("PROVISION_NACK", {
+          execId: writeExecId,
+          reason: "write_failed: " + (writeErr.message || String(writeErr))
+        });
+        WorkerProvisioner.cancel();
+      }
+      break;
+    }
+
+    case "PROVISION_WRITE_BINARY": {
+      // Write the user home backup blob directly to the VM filesystem.
+      // payload.data is a Uint8Array transferred via structured clone (no base64).
+      var binaryExecId = payload.execId;
+      var binaryFilePath = payload.filePath;
+      var binaryData = payload.data; // Uint8Array
+      try {
+        await WorkerProvisioner.writeBinaryFile(emulator, binaryFilePath, binaryData);
+        postToHost("PROVISION_ACK", {
+          type: "write_binary",
+          execId: binaryExecId,
+          filePath: binaryFilePath
+        });
+      } catch (binErr) {
+        log("error", "[WorkerProvisioner] Binary create_file() failed: " + (binErr.message || String(binErr)));
+        postToHost("PROVISION_NACK", {
+          execId: binaryExecId,
+          reason: "binary_write_failed: " + (binErr.message || String(binErr))
+        });
+      }
+      break;
+    }
+
+    case "PROVISION_EXECUTE": {
+      // Send a single short serial command to trigger script execution.
+      // This is the ONLY serial write during the entire provisioning flow.
+      var execFilePath = payload.filePath;
+      var execExecId = payload.execId;
+      log("info", "[WorkerProvisioner] Triggering script execution via serial: sh " + execFilePath);
+      // Disable echo first, then execute atomically
+      var triggerCmd = "stty -echo; sh " + execFilePath + "\n";
+      var sent = SerialChannelManager.send(0, triggerCmd);
+      if (sent) {
+        postToHost("PROVISION_ACK", { type: "execute", execId: execExecId });
+      } else {
+        postToHost("PROVISION_NACK", { execId: execExecId, reason: "serial_send_failed" });
+      }
+      break;
+    }
+
+    case "PROVISION_CANCEL":
+      WorkerProvisioner.cancel();
+      postToHost("PROVISION_ACK", { type: "cancel", execId: payload ? payload.execId : 0 });
+      break;
+
     default:
       log("warn", "Unknown message type received: " + type);
   }
@@ -566,7 +903,9 @@ async function handleInit(payload) {
       vga_bios: { buffer: vgaBiosBuffer },
       bzimage: bzImageBuffer ? { buffer: bzImageBuffer } : undefined,
       initial_state: payload.initial_state ? { buffer: payload.initial_state } : undefined,
-      filesystem: {},
+      // filesystem:{} enables the 9p virtual filesystem, which is required for
+      // create_file() to work. Without this the fs9p field on the emulator is null.
+      filesystem: { baseurl: "", basefs: "" },
       autostart: true,
       cmdline: payload.cmdline || "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
       memory_size: payload.memory_size || 64 * 1024 * 1024,

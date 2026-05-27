@@ -179,9 +179,11 @@ export class VMController {
     this.timeouts = new UnifiedTimeoutManager();
 
     // Initialize provisioning controller
+    // onPostMessage routes PROVISION_* messages directly through the bridge
+    // message channel, bypassing the serial write queue entirely.
     this.provisioning = new ProvisioningController(
       (state) => this.lifecycle.transitionProvisioningTo(state, "ProvisioningController"),
-      (port, data) => this.sendProgrammaticInput(port, data)
+      (type, payload) => this.transport.postProvision(type, payload)
     );
 
     // Initialize recovery orchestrator
@@ -631,6 +633,46 @@ export class VMController {
             }
             break;
 
+          case "PROVISION_ACK": {
+            // Safely type the ACK payload using structural cast
+            const ackTyped = payload as { type: string; execId: number; chunkIndex?: number };
+            const activeGenForAck = this.transport.getGenerationManager().getActiveGeneration();
+            const ackGenId = activeGenForAck ? activeGenForAck.id : 0;
+            this.provisioning.handleProvisionAck(
+              ackTyped as Parameters<typeof this.provisioning.handleProvisionAck>[0],
+              ackGenId
+            );
+            break;
+          }
+
+          case "PROVISION_NACK": {
+            const nackTyped = payload as { execId: number; chunkIndex?: number; reason: string };
+            Logger.error("VM", `[PROVISIONING] PROVISION_NACK received: reason=${nackTyped.reason}, execId=${nackTyped.execId}`);
+            this.provisioning.handleProvisionNack(
+              nackTyped as Parameters<typeof this.provisioning.handleProvisionNack>[0]
+            );
+            // NACK during transfer triggers provisioning recovery
+            const nackProvState = this.provisioning.getState();
+            if (nackProvState === "transferring" || nackProvState === "executing" || nackProvState === "waiting_completion") {
+              this.orchestrator.triggerRecovery("provisioning NACK: " + nackTyped.reason);
+            }
+            break;
+          }
+
+          case "PROVISION_READY": {
+            // Worker has written the script to the VM filesystem.
+            // Signal the provisioning controller to dispatch PROVISION_EXECUTE.
+            const readyTyped = payload as { execId: number; generation: number; filePath: string };
+            const activeGenForReady = this.transport.getGenerationManager().getActiveGeneration();
+            const readyGenId = activeGenForReady ? activeGenForReady.id : 0;
+            Logger.info("VM", `[PROVISIONING] PROVISION_READY received. filePath=${readyTyped.filePath}, execId=${readyTyped.execId}`);
+            this.provisioning.handleProvisionReady(
+              readyTyped as Parameters<typeof this.provisioning.handleProvisionReady>[0],
+              readyGenId
+            );
+            break;
+          }
+
           case "SAVE_STATE_SUCCESS":
             if (this.saveStateResolver) {
               const res = this.saveStateResolver;
@@ -830,20 +872,10 @@ export class VMController {
       this.transitionState("provisioning", "handleSerialLifecycle");
       this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
 
-      Logger.info("VM", "[PROVISIONING] Root prompt detected. Starting environment provisioning...");
+      Logger.info("VM", "[PROVISIONING] Root prompt detected. Starting atomic provisioning via PROVISION_* protocol...");
 
       if (this.onSerialOutput) {
         this.onSerialOutput("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
-      }
-
-      let restoreCmd = "";
-      if (this.savedState) {
-        try {
-          const backupB64 = this.arrayBufferToBase64(this.savedState);
-          restoreCmd = `cat << 'EOF' > /tmp/fs.tar.gz.b64\n${backupB64}\nEOF\nbase64 -d /tmp/fs.tar.gz.b64 | tar -xzf - -C /home/user 2>/dev/null\nrm -f /tmp/fs.tar.gz.b64\n`;
-        } catch (e) {
-          Logger.error("VM", "Failed to generate restore command from backup:", e);
-        }
       }
 
       // Dynamic provisioning timeout
@@ -861,7 +893,15 @@ export class VMController {
         this._onProvisioningWatchdogFired();
       });
 
-      void this.provisioning.startProvisioning(restoreCmd, GUEST_INSPECT_SCRIPT, this.transport.hasSerial1Support(), activeGenId);
+      // Pass the raw savedState ArrayBuffer directly — no base64 encoding.
+      // The ProvisioningController will send it as a binary PROVISION_WRITE_BINARY
+      // message that the worker writes via create_file().
+      void this.provisioning.startProvisioning(
+        this.savedState,
+        GUEST_INSPECT_SCRIPT,
+        this.transport.hasSerial1Support(),
+        activeGenId
+      );
     }
   }
 
