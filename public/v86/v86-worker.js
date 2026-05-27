@@ -288,6 +288,85 @@ var SerialChannelManager = {
  * Only a single short serial command ("sh /tmp/p.sh\n") is written to ttyS0.
  * This eliminates serial flooding and PTY echo corruption entirely.
  */
+/**
+ * Filesystem Access Policy Engine
+ * Coordinates filesystem permissions based on lifecycleState, operation source,
+ * operation type, and execution context.
+ */
+var FilesystemAccessPolicy = {
+  // Sources
+  SOURCES: {
+    USER_TERMINAL: "USER_TERMINAL",
+    PROVISIONING_SYSTEM: "PROVISIONING_SYSTEM",
+    RECOVERY_SYSTEM: "RECOVERY_SYSTEM",
+    INTERNAL_RUNTIME: "INTERNAL_RUNTIME"
+  },
+
+  // Operation Types
+  OPERATIONS: {
+    WRITE_FILE: "WRITE_FILE",
+    WRITE_BINARY: "WRITE_BINARY",
+    CREATE_DIR: "CREATE_DIR",
+    DELETE_FILE: "DELETE_FILE",
+    READ_FILE: "READ_FILE"
+  },
+
+  /**
+   * Determine if a filesystem operation is allowed under the current policy.
+   * @param {{
+   *   lifecycleState: string,
+   *   source: string,
+   *   operationType: string,
+   *   filePath: string
+   * }} params
+   * @returns {{ allowed: boolean, reason?: string }}
+   */
+  checkPermission: function(params) {
+    var state = params.lifecycleState;
+    var source = params.source;
+    var opType = params.operationType;
+    var path = params.filePath;
+
+    // Telemetry log for write policy audit
+    log("info", "[FilesystemAccessPolicy] Audit: source=" + source +
+               " | op=" + opType +
+               " | state=" + state +
+               " | path=" + path);
+
+    // Rule 1: Trusted Internal Operations Bypass (PROVISIONING_SYSTEM, RECOVERY_SYSTEM, INTERNAL_RUNTIME)
+    // Allowed during: booting, provisioning, and running.
+    if (source === this.SOURCES.PROVISIONING_SYSTEM || 
+        source === this.SOURCES.RECOVERY_SYSTEM || 
+        source === this.SOURCES.INTERNAL_RUNTIME) {
+      if (state === "booting" || state === "provisioning" || state === "running") {
+        return { allowed: true };
+      }
+      return {
+        allowed: false,
+        reason: "Trusted internal write denied in inactive lifecycle state: " + state
+      };
+    }
+
+    // Rule 2: User interactive writes (USER_TERMINAL)
+    // Only allowed during "running" (standard VM operation).
+    if (source === this.SOURCES.USER_TERMINAL) {
+      if (state === "running") {
+        return { allowed: true };
+      }
+      return {
+        allowed: false,
+        reason: "User write denied in non-running lifecycle state: " + state
+      };
+    }
+
+    // Policy default: Deny
+    return {
+      allowed: false,
+      reason: "Access denied: Unknown or untrusted operation source '" + source + "'"
+    };
+  }
+};
+
 var WorkerProvisioner = {
   execId: 0,
   generation: 0,
@@ -430,26 +509,39 @@ var WorkerProvisioner = {
   },
 
   /**
-   * Await filesystem mounting/ready status with retries.
+   * Await filesystem mounting/ready status with retries and policy checks.
    */
-  waitAndValidateFS: async function(emu, filePath) {
+  waitAndValidateFS: async function(emu, filePath, source, operationType) {
     var retries = 5;
     var delay = 200;
 
     this.transitionTo("validating_fs");
     this.logDiagnostics(emu, filePath);
 
-    // Barrier 1: emulator check
+    // 1. Filesystem access policy check
+    var policyResult = FilesystemAccessPolicy.checkPermission({
+      lifecycleState: lifecycleState,
+      source: source || FilesystemAccessPolicy.SOURCES.INTERNAL_RUNTIME,
+      operationType: operationType || FilesystemAccessPolicy.OPERATIONS.WRITE_FILE,
+      filePath: filePath
+    });
+
+    if (!policyResult.allowed) {
+      var deniedMsg = "Lifecycle permission denied: " + policyResult.reason + 
+                      " (state: " + lifecycleState + 
+                      ", source: " + source + 
+                      ", op: " + operationType + 
+                      ", path: " + filePath + ")";
+      log("error", "[WorkerProvisioner] " + deniedMsg);
+      throw new Error(deniedMsg);
+    }
+
+    // 2. Barrier: emulator check
     if (!emu) {
       throw new Error("Emulator not initialized");
     }
 
-    // Barrier 2: lifecycle state check
-    if (lifecycleState !== "booting" && lifecycleState !== "running") {
-      throw new Error("Cannot write file when lifecycleState is " + lifecycleState);
-    }
-
-    // Barrier 3: fs9p readiness check with retry loop
+    // 3. Barrier: fs9p readiness check with retry loop
     for (var i = 0; i < retries; i++) {
       if (emu.fs9p && typeof emu.create_file === "function") {
         log("info", "[WorkerProvisioner] Filesystem ready on attempt " + (i + 1));
@@ -474,7 +566,12 @@ var WorkerProvisioner = {
    */
   writeFile: async function(emu, filePath) {
     var startTime = Date.now();
-    await this.waitAndValidateFS(emu, filePath);
+    await this.waitAndValidateFS(
+      emu, 
+      filePath, 
+      FilesystemAccessPolicy.SOURCES.PROVISIONING_SYSTEM, 
+      FilesystemAccessPolicy.OPERATIONS.WRITE_FILE
+    );
 
     this.transitionTo("writing");
     this.ensureParentDirectories(emu, filePath);
@@ -534,7 +631,12 @@ var WorkerProvisioner = {
    */
   writeBinaryFile: async function(emu, filePath, data) {
     var startTime = Date.now();
-    await this.waitAndValidateFS(emu, filePath);
+    await this.waitAndValidateFS(
+      emu, 
+      filePath, 
+      FilesystemAccessPolicy.SOURCES.PROVISIONING_SYSTEM, 
+      FilesystemAccessPolicy.OPERATIONS.WRITE_BINARY
+    );
 
     this.transitionTo("writing");
     this.ensureParentDirectories(emu, filePath);
