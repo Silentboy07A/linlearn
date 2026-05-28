@@ -1622,25 +1622,80 @@ self.onmessage = async function (e) {
           for (var ri = 0; ri < riScript.length; ri++) riBytes[ri] = riScript.charCodeAt(ri) & 0xFF;
         }
 
-        log("info", "[CREATE_FILE_BEGIN] REINJECT writing " + riBytes.length + " bytes to " + reinjectPath);
-        await emulator.create_file(reinjectPath, riBytes);
-
-        // Verify inode after reinjection
         var riFs = emulator.fs9p;
+        
+        // 1. Skip check: if the inode is already verified, stable, and readable, do not rewrite
+        var oldSearch = riFs.SearchPath(reinjectPath);
+        if (oldSearch.id !== -1) {
+          var oldInode = riFs.GetInode(oldSearch.id);
+          if (oldInode && oldInode.size === riBytes.length && (oldInode.mode & 292) !== 0) {
+            log("info", "[PROVISION_REINJECT] file already verified with stable inode=" + oldSearch.id + ". Skipping reinjection.");
+            postToHost("FILE_MATERIALIZATION_VERIFIED", {
+              path: reinjectPath,
+              inodeId: oldSearch.id,
+              size: oldInode.size,
+              mtime: oldInode.mtime,
+              readability: true,
+              isReinject: true,
+              skipped: true
+            });
+            break;
+          }
+        }
+
+        // 2. Temp writing and atomic move
+        var tmpPath = reinjectPath + ".tmp";
+        
+        // Clean up old temp file if any
+        var oldTmp = riFs.SearchPath(tmpPath);
+        if (oldTmp.id !== -1) {
+          log("info", "[PROVISION_REINJECT] Cleaning up stale temp file: " + tmpPath);
+          riFs.DeleteNode(tmpPath);
+        }
+
+        log("info", "[CREATE_FILE_BEGIN] REINJECT writing " + riBytes.length + " bytes to temp file: " + tmpPath);
+        await emulator.create_file(tmpPath, riBytes);
+
+        // Verify temp file
+        var tmpSearch = riFs.SearchPath(tmpPath);
+        if (tmpSearch.id === -1) {
+          throw new Error("Temporary reinjection inode not found in 9p filesystem after write");
+        }
+        var tmpInode = riFs.GetInode(tmpSearch.id);
+        if (!tmpInode || tmpInode.size !== riBytes.length) {
+          throw new Error("Temporary reinjection inode size mismatch: wrote " + riBytes.length + ", got " + (tmpInode ? tmpInode.size : "null"));
+        }
+
+        // Find parent directory ID
+        var parentPath = reinjectPath.substring(0, reinjectPath.lastIndexOf("/"));
+        var parentSearch = riFs.SearchPath(parentPath);
+        if (parentSearch.id === -1) {
+          throw new Error("Parent directory not found for reinjection: " + parentPath);
+        }
+
+        log("info", "[PROVISION_REINJECT] Atomically renaming " + tmpPath + " to " + reinjectPath + " under parent inode: " + parentSearch.id);
+        var renameRes = await riFs.Rename(parentSearch.id, "mount_prepare.sh.tmp", parentSearch.id, "mount_prepare.sh");
+        if (renameRes < 0) {
+          throw new Error("Atomic rename failed with error code: " + renameRes);
+        }
+
+        // Verify final path
         var riSearch = riFs.SearchPath(reinjectPath);
         if (riSearch.id === -1) {
-          throw new Error("Reinjection inode not found in 9p filesystem after write");
+          throw new Error("Reinjection destination not found after rename");
         }
         var riInode = riFs.GetInode(riSearch.id);
         if (!riInode || riInode.size !== riBytes.length) {
-          throw new Error("Reinjection inode size mismatch: wrote " + riBytes.length + ", got " + (riInode ? riInode.size : "null"));
+          throw new Error("Reinjection size mismatch after rename: wrote " + riBytes.length + ", got " + (riInode ? riInode.size : "null"));
         }
 
-        log("info", "[CREATE_FILE_SUCCESS] REINJECT " + reinjectPath + " verified. inode=" + riSearch.id + ", size=" + riInode.size);
+        log("info", "[CREATE_FILE_SUCCESS] REINJECT " + reinjectPath + " verified via atomic mv. inode=" + riSearch.id + ", size=" + riInode.size + ", mtime=" + riInode.mtime);
         postToHost("FILE_MATERIALIZATION_VERIFIED", {
           path: reinjectPath,
           inodeId: riSearch.id,
           size: riInode.size,
+          mtime: riInode.mtime,
+          readability: (riInode.mode & 292) !== 0,
           isReinject: true
         });
       } catch (riErr) {
@@ -1959,13 +2014,15 @@ async function checkAndInitializeFs9p() {
       throw new Error("[CREATE_FILE_FAILURE] mount_prepare.sh host-side verification failed: " + mpFailReason);
     }
 
-    log("info", "[CREATE_FILE_SUCCESS] mount_prepare.sh written and verified. inode=" + mpSearch.id + ", size=" + mpInode.size + " bytes");
+    log("info", "[CREATE_FILE_SUCCESS] mount_prepare.sh written and verified. inode=" + mpSearch.id + ", size=" + mpInode.size + " bytes, mtime=" + mpInode.mtime + ", mode=" + mpInode.mode);
     log("info", "[HOST_FS_SYNC] mount_prepare.sh materialized in 9p inode table. Notifying host.");
 
     postToHost("FILE_MATERIALIZATION_VERIFIED", {
       path: mpPath,
       inodeId: mpSearch.id,
-      size: mpInode.size
+      size: mpInode.size,
+      mtime: mpInode.mtime,
+      readability: (mpInode.mode & 292) !== 0
     });
 
   } catch (mpErr) {

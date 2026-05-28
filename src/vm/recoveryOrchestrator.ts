@@ -229,7 +229,7 @@ export class RecoveryOrchestrator {
     let classification = "UNKNOWN_FAILURE";
     if (reason.includes("split-brain") || reason.includes("coordination") || reason.includes("deadlock") || reason.includes("FSM") || reason.includes("interactive")) {
       classification = "STATE_COORDINATION_FAILURE";
-    } else if (reason.includes("mount") || reason.includes("file") || reason.includes("reinject") || reason.includes("materialization")) {
+    } else if (reason.includes("mount") || reason.includes("file") || reason.includes("reinject") || reason.includes("materialization") || reason.includes("execution") || reason.includes("VFS") || reason.includes("coherence")) {
       classification = "FILESYSTEM_FAILURE";
     }
     Logger.warn("VM", `[RECOVERY_CLASSIFICATION] Classifying recovery trigger "${reason}" as failure category: ${classification}`);

@@ -173,6 +173,11 @@ export class VMController {
   private isProvisioningAttemptStarted = false;
   private provisioningExecutionStarted = false;
   private provisioningExecutionCompleted = false;
+  private verifiedInodeId: number | null = null;
+  private verifiedInodeMtime: number | null = null;
+  private verifiedInodeSize: number | null = null;
+  private verifiedInodeReadability: boolean | null = null;
+  private provisionExecutionInFlight = false;
 
   private lastOrigin: string = "";
   private useMinimalFallback: boolean = false;
@@ -578,6 +583,11 @@ export class VMController {
     this.isProvisioningAttemptStarted = false;
     this.provisioningExecutionStarted = false;
     this.provisioningExecutionCompleted = false;
+    this.verifiedInodeId = null;
+    this.verifiedInodeMtime = null;
+    this.verifiedInodeSize = null;
+    this.verifiedInodeReadability = null;
+    this.provisionExecutionInFlight = false;
 
     // Reset shell readiness preconditions for new session
     this.receivedSerialReady = false;
@@ -895,10 +905,24 @@ export class VMController {
 
           case "FILE_MATERIALIZATION_VERIFIED": {
             // Worker confirmed host-side 9p filesystem write success.
-            // The file exists in the inode table with correct size.
-            // We can proceed directly to executing mount_prepare.sh.
-            const matPayload = payload as { path: string; inodeId: number; size: number; isReinject?: boolean };
-            Logger.info("VM", `[GUEST_FS_VISIBLE] FILE_MATERIALIZATION_VERIFIED: path=${matPayload.path}, inode=${matPayload.inodeId}, size=${matPayload.size}, isReinject=${matPayload.isReinject || false}`);
+            // The file exists in the inode table with verified attributes.
+            const matPayload = payload as { path: string; inodeId: number; size: number; mtime?: number; readability?: boolean; isReinject?: boolean; skipped?: boolean };
+            
+            Logger.info("VM", `[GUEST_FS_VISIBLE] FILE_MATERIALIZATION_VERIFIED: path=${matPayload.path}, inode=${matPayload.inodeId}, size=${matPayload.size}, mtime=${matPayload.mtime || "unknown"}, readability=${matPayload.readability !== false}, isReinject=${matPayload.isReinject || false}, skipped=${matPayload.skipped || false}`);
+            
+            // Invariant guard: once verified, the inode identity must remain stable until execution completes.
+            if (this.provisioningExecutionStarted || this.provisionExecutionInFlight) {
+              if (this.verifiedInodeId !== null && this.verifiedInodeId !== matPayload.inodeId) {
+                Logger.error("VM", `[INVARIANT_VIOLATION] Inode changed from ${this.verifiedInodeId} to ${matPayload.inodeId} after verification while execution is in flight! Ignoring message to maintain VFS stability.`);
+                break;
+              }
+            }
+
+            this.verifiedInodeId = matPayload.inodeId;
+            this.verifiedInodeMtime = matPayload.mtime || null;
+            this.verifiedInodeSize = matPayload.size;
+            this.verifiedInodeReadability = matPayload.readability !== false;
+
             this.mountPrepareVerified = true;
             if (this.pendingMaterializationVerified) {
               const cb = this.pendingMaterializationVerified;
@@ -1064,6 +1088,7 @@ export class VMController {
         this.timeouts.cancel("mount_stabilization_watchdog");
         Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
         this.provisioningExecutionCompleted = true;
+        this.provisionExecutionInFlight = false; // Release lock!
         this.transitionState("provisioning", "handleSerialLifecycle");
         this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
 
@@ -1095,10 +1120,16 @@ export class VMController {
         );
         this.provisioningSearchBuffer = "";
         return;
-      } else if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_FAIL>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_FAILED>>>")) {
+      } else if (
+        this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_FAIL>>>") || 
+        this.provisioningSearchBuffer.includes("<<<MOUNT_FAILED>>>") ||
+        this.provisioningSearchBuffer.includes("[EXECUTION FAILURE]") ||
+        this.provisioningSearchBuffer.includes("[GUEST_STALE_DENTRY_RECOVER_FAIL]")
+      ) {
         this.timeouts.cancel("mount_stabilization_watchdog");
-        Logger.error("VM", "[PROVISIONING] Guest filesystem mount failed.");
-        this.orchestrator.triggerRecovery("guest mount barrier report failure");
+        this.provisionExecutionInFlight = false; // Release lock!
+        Logger.error("VM", `[PROVISIONING] Guest filesystem mount or wrapper execution failed. Buffer: ${this.provisioningSearchBuffer}`);
+        this.orchestrator.triggerRecovery("guest mount barrier report failure or wrapper execution failure");
         this.provisioningSearchBuffer = "";
         return;
       }
@@ -1944,16 +1975,53 @@ export class VMController {
     this.isProvisioningAttemptStarted = true;
 
     const executeMountScript = () => {
-      Logger.info("VM", "[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Executing mount_prepare.sh in guest.");
+      const inodeIdStr = this.verifiedInodeId !== null ? this.verifiedInodeId.toString() : "";
+      Logger.info("VM", `[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Verified inode ID: ${inodeIdStr}. Executing mount_prepare.sh in guest.`);
+      
       this.provisioningExecutionStarted = true;
-      void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+      this.provisionExecutionInFlight = true;
+
+      // Construct a robust guest-side execution wrapper to prevent stale dentries and enforce inode checks
+      const wrapperCmd = 
+        `sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; sleep 1; ` +
+        `GUEST_INODE=\$(stat -c %i /root/.provision/mount_prepare.sh 2>/dev/null || stat -i /root/.provision/mount_prepare.sh 2>/dev/null); ` +
+        `echo "[GUEST_STAT] verified_inode=${inodeIdStr} execution_inode=\$GUEST_INODE"; ` +
+        `stat /root/.provision/mount_prepare.sh 2>/dev/null; ` +
+        `if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then ` +
+        `echo "[GUEST_VERIFY] readability=OK first_line=\$(head -n 1 /root/.provision/mount_prepare.sh)"; ` +
+        `if [ "\$GUEST_INODE" = "${inodeIdStr}" ] || [ -z "${inodeIdStr}" ]; then ` +
+        `sync; sleep 1; exec sh /root/.provision/mount_prepare.sh; ` +
+        `else ` +
+        `echo "[EXECUTION FAILURE] inode mismatch: expected ${inodeIdStr}, got \$GUEST_INODE"; ` +
+        `fi; ` +
+        `else ` +
+        `echo "[EXECUTION FAILURE] file disappeared or not readable before execution"; ` +
+        `if [ ! -z "\$GUEST_INODE" ]; then ` +
+        `echo "[GUEST_STALE_DENTRY] Detected stale dentry. Attempting recovery..."; ` +
+        `cd /; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; sleep 1; ` +
+        `NEW_INODE=\$(stat -c %i /root/.provision/mount_prepare.sh 2>/dev/null || stat -i /root/.provision/mount_prepare.sh 2>/dev/null); ` +
+        `echo "[GUEST_STALE_DENTRY_RECOVER] new_inode=\$NEW_INODE"; ` +
+        `if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then ` +
+        `echo "[GUEST_STALE_DENTRY_RECOVER_SUCCESS] File is now accessible!"; ` +
+        `exec sh /root/.provision/mount_prepare.sh; ` +
+        `else ` +
+        `echo "[GUEST_STALE_DENTRY_RECOVER_FAIL] File still inaccessible after VFS clear."; ` +
+        `fi; ` +
+        `fi; ` +
+        `fi\n`;
+
+      void this.sendProgrammaticInput(0, wrapperCmd);
+
       this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
         if (!this.provisioningExecutionStarted) {
           Logger.warn("VM", "[PROVISIONING] mount_stabilization_watchdog fired, but execution was never actually attempted. Skipping.");
           return;
         }
-        Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
-        this.handleVisibilityFailure();
+        // If execution is in flight or already started, do NOT reinject as it causes inode replacement races.
+        // Instead, escalate to recovery directly which cleanly reboots the VM.
+        Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds. Escating directly to recovery reboot.");
+        this.provisionExecutionInFlight = false;
+        this.orchestrator.triggerRecovery("mount stabilization timeout during execution");
       });
     };
 
@@ -2014,6 +2082,11 @@ export class VMController {
 
     if (!isInteractiveOrBeyond) {
       Logger.warn("VM", `[PROVISIONING] handleVisibilityFailure: FSM in non-interactive state '${stateName}'. Aborting reinjection.`);
+      return;
+    }
+
+    if (this.provisionExecutionInFlight) {
+      Logger.warn("VM", "[PROVISIONING] handleVisibilityFailure: Execution is currently in flight. Aborting reinjection.");
       return;
     }
 
