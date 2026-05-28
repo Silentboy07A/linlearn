@@ -835,17 +835,18 @@ var WorkerProvisioner = {
     var mountScript =
       "#!/bin/sh\n" +
       "set -x\n" +
+      "echo \"[STAGE] mount_verify\" > /dev/ttyS0\n" +
       "stty -echo > /dev/null 2>&1\n" +
-      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"mountScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
+      "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "# Check kernel 9p filesystem support\n" +
       "b_i=0; b_ok=0\n" +
       "while [ \"$b_i\" -lt 30 ]; do\n" +
       "  if [ -f /proc/filesystems ] && grep -q 9p /proc/filesystems && [ -f /proc/mounts ]; then\n" +
       "    b_ok=1; break\n" +
       "  fi\n" +
-      "  sleep 1; b_i=$((b_i+1))\n" +
+      "  sleep 1; b_i=$((b_i + 1))\n" +
       "done\n" +
-      "if [ \"$b_ok\" = \"0\" ]; then\n" +
+      "if [ \"$b_ok\" -eq 0 ]; then\n" +
       "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0; exit 1\n" +
       "fi\n" +
       "# Mount if not already mounted\n" +
@@ -863,7 +864,7 @@ var WorkerProvisioner = {
       "else\n" +
       "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0\n" +
       "fi\n" +
-      "trap - EXIT\n";
+      "trap - ERR\n";
 
     // ── Verify script ──────────────────────────────────────────────────────────
     // Checks that the provisioning file exists and is readable; emits VIS or NOVIS.
@@ -871,8 +872,9 @@ var WorkerProvisioner = {
     var verifyScript =
       "#!/bin/sh\n" +
       "set -x\n" +
+      "echo \"[STAGE] transfer_verify\" > /dev/ttyS0\n" +
       "stty -echo > /dev/null 2>&1\n" +
-      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"verifyScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
+      "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "i=0; ok=0; inode=; size=;\n" +
@@ -885,12 +887,12 @@ var WorkerProvisioner = {
       "    fi\n" +
       "  fi\n" +
       "  sleep 1\n" +
-      "  i=$((i+1))\n" +
+      "  i=$((i + 1))\n" +
       "done\n" +
       "echo '[VERIFY:STAT]' > /dev/ttyS0; stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
       "echo '[VERIFY:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
       "echo '[VERIFY:MODE]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
-      "if [ \"$ok\" = \"1\" ]; then\n" +
+      "if [ \"$ok\" -eq 1 ]; then\n" +
       "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
       "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
       "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
@@ -904,7 +906,7 @@ var WorkerProvisioner = {
       "else\n" +
       "  echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
       "fi\n" +
-      "trap - EXIT\n";
+      "trap - ERR\n";
 
     // ── Remount script ─────────────────────────────────────────────────────────
     // Unmounts and remounts host9p, then emits OK or ERR.
@@ -912,7 +914,7 @@ var WorkerProvisioner = {
       "#!/bin/sh\n" +
       "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
-      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"remountScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
+      "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "umount -f /mnt/9p > /dev/null 2>&1; umount /mnt/9p > /dev/null 2>&1\n" +
       "mkdir -p /mnt/9p > /dev/null 2>&1\n" +
       "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null ||\n" +
@@ -928,14 +930,14 @@ var WorkerProvisioner = {
       "else\n" +
       "  echo '" + makeTag("REMOUNT", "ERR") + "' > /dev/ttyS0\n" +
       "fi\n" +
-      "trap - EXIT\n";
+      "trap - ERR\n";
 
     // ── Diagnostics script ─────────────────────────────────────────────────────
     var diagScript =
       "#!/bin/sh\n" +
       "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
-      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"diagScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
+      "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "echo '[DIAG:MOUNT]' > /dev/ttyS0\n" +
       "mount 2>/dev/null > /dev/ttyS0 || echo 'mount-failed' > /dev/ttyS0\n" +
       "echo '[DIAG:MOUNTPATH]' > /dev/ttyS0\n" +
@@ -951,7 +953,7 @@ var WorkerProvisioner = {
       "echo '[DIAG:MODE]' > /dev/ttyS0\n" +
       "ls -l '" + fp + "' 2>/dev/null > /dev/ttyS0 || echo 'mode-failed' > /dev/ttyS0\n" +
       "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>' > /dev/ttyS0\n" +
-      "trap - EXIT\n";
+      "trap - ERR\n";
 
     // ── Revalidation script ────────────────────────────────────────────────────
     var okMarkerPrefix = "<<<EXEC_REVAL:" + execId + ":OK>>>";
@@ -960,7 +962,7 @@ var WorkerProvisioner = {
       "#!/bin/sh\n" +
       "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
-      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"revalScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
+      "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "echo '[EXEC_DIAG:PWD]' > /dev/ttyS0; pwd > /dev/ttyS0\n" +
@@ -1003,7 +1005,7 @@ var WorkerProvisioner = {
       "    echo '" + failMarker + "' > /dev/ttyS0\n" +
       "  fi\n" +
       "fi\n" +
-      "trap - EXIT\n";
+      "trap - ERR\n";
 
     // Write all helper scripts via create_file() as .tmp files
     try {

@@ -637,7 +637,7 @@ while true; do
       ;;
     RECOVER_TTY)
       stty -F /dev/ttyS0 sane 2>/dev/null
-      echo -e "\\\\033c" > /dev/ttyS0 2>/dev/null
+      printf "\\\\033c" > /dev/ttyS0 2>/dev/null
       echo "RECOVERY_DONE"
       ;;
     RESTART_SHELL)
@@ -659,6 +659,11 @@ done
       : `true`;
 
     const script = `#!/bin/sh
+set -ex
+trap 'echo "[PROVISION_ERROR] line=$LINENO exit=$?" > /dev/ttyS0' ERR
+
+echo "[STAGE] execution_begin"
+
 # Provisioning script - execution ID: ${executionId}
 # Written via create_file() — no base64 serial injection
 exec >/root/.provision/provision_exec.log 2>&1
@@ -725,7 +730,7 @@ done < /dev/ttyS0
 exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 > /dev/ttyS0 2>&1
 `;
 
-    Logger.info("VM", `[PROVISIONING] Script built. execId=${executionId}, scriptSize=${script.length} chars`);
+    Logger.info("VM", `[PROVISIONING] Script built. execId=${executionId}, scriptSize=${script.length} chars. FULL GENERATED SCRIPT:\n${script}`);
 
     // ── Step 3: Send script as framed PROVISION_* chunks ─────────────────────
     this.transitionTo("transferring");
