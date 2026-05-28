@@ -614,7 +614,7 @@ export class ProvisioningController {
     this.isLocked = true;
     this.currentExecutionId++;
     const executionId = this.currentExecutionId;
-    const filePath = `/tmp/provision_${executionId}.sh`;
+    const filePath = `/root/.provision/provision_${executionId}.sh`;
     this.executionStartTimestamp = Date.now();
     this.lastHeartbeatTimestamp = 0;
     this.activeBridgeGeneration = bridgeGeneration;
@@ -635,8 +635,8 @@ export class ProvisioningController {
       Logger.info("VM", `[PROVISIONING] Sending backup blob (${bytes.byteLength} bytes) via PROVISION_WRITE_BINARY...`);
 
       try {
-        await this._sendBinaryFile(executionId, bridgeGeneration, "/tmp/fs.tar.gz", bytes);
-        Logger.info("VM", `[PROVISIONING] Backup blob written to /tmp/fs.tar.gz via create_file().`);
+        await this._sendBinaryFile(executionId, bridgeGeneration, "/root/.provision/fs.tar.gz", bytes);
+        Logger.info("VM", `[PROVISIONING] Backup blob written to /root/.provision/fs.tar.gz via create_file().`);
       } catch (e) {
         Logger.error("VM", `[PROVISIONING] Binary file write failed: ${String(e)}. Continuing without restore.`);
         // Non-fatal: continue without backup restore
@@ -693,13 +693,13 @@ done
     // Restore command now references /tmp/fs.tar.gz which was written by create_file()
     // No base64 heredoc needed — the binary was transferred atomically above.
     const restoreCmd = savedStateBuffer && savedStateBuffer.byteLength > 2
-      ? `[ -f /tmp/fs.tar.gz ] && tar -xzf /tmp/fs.tar.gz -C /home/user 2>/dev/null && rm -f /tmp/fs.tar.gz || true`
+      ? `[ -f /root/.provision/fs.tar.gz ] && tar -xzf /root/.provision/fs.tar.gz -C /home/user 2>/dev/null && rm -f /root/.provision/fs.tar.gz || true`
       : `true`;
 
     const script = `#!/bin/sh
 # Provisioning script - execution ID: ${executionId}
 # Written via create_file() — no base64 serial injection
-exec >/tmp/provision_exec.log 2>&1
+exec >/root/.provision/provision_exec.log 2>&1
 
 _provision_completed=0
 trap '
@@ -743,7 +743,7 @@ echo "<<<PROTO:${executionId}:5:HEARTBEAT>>>" > /dev/ttyS0
 ${backgroundMonitorScript}
 
 _provision_completed=1
-echo "done" > /tmp/provision_complete
+echo "done" > /root/.provision/provision_complete
 
 echo "" > /dev/ttyS0
 sync

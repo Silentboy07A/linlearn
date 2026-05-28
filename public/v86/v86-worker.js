@@ -883,6 +883,7 @@ var WorkerProvisioner = {
           "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p host9p /mnt/9p 2>/dev/null; fi; " +
+          "mkdir -p /root/.provision 2>/dev/null; " +
           "i=0; ok=0; " +
           "while [ $i -lt 15 ]; do " +
           "if check_mnt; then ok=1; break; fi; " +
@@ -908,6 +909,7 @@ var WorkerProvisioner = {
           armTimeout(CMD_TIMEOUT_MS);
           var cmd =
             "stty -echo 2>/dev/null; PS1=''; " +
+            "sync; " +
             "if [ -f '" + filePath + "' ] && stat '" + filePath + "' >/dev/null 2>&1 && ls '" + filePath + "' >/dev/null 2>&1 && cat '" + filePath + "' >/dev/null 2>&1; then " +
             "inode=$(stat -c %i '" + filePath + "' 2>/dev/null || echo 'unknown'); " +
             "echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\"; " +
@@ -930,6 +932,7 @@ var WorkerProvisioner = {
           "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p host9p /mnt/9p 2>/dev/null; then " +
+          "mkdir -p /root/.provision 2>/dev/null; " +
           "i=0; ok=0; " +
           "while [ $i -lt 15 ]; do " +
           "if check_mnt; then ok=1; break; fi; " +
@@ -951,6 +954,7 @@ var WorkerProvisioner = {
           "echo '[DIAG:MOUNT]'; mount 2>/dev/null || echo 'mount-failed'; " +
           "echo '[DIAG:DF]'; df 2>/dev/null || echo 'df-failed'; " +
           "echo '[DIAG:LS]'; ls -la /mnt/9p 2>/dev/null || echo 'ls-failed'; " +
+          "echo '[DIAG:LS_PROVISION]'; ls -la /root/.provision 2>/dev/null || echo 'ls-failed'; " +
           "echo '[DIAG:STAT]'; stat '" + filePath + "' 2>/dev/null || echo 'stat-failed'; " +
           "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>'\n";
           
@@ -1025,15 +1029,17 @@ var WorkerProvisioner = {
     var rawBuffer = "";
     var listener = null;
     var cmdTimeout = null;
+    var startTime = Date.now();
 
     log("info", "[WorkerProvisioner] Starting pre-execution revalidation for: " + filePath + 
                " | Expected Inode: " + expectedInode + " | Exec ID: " + execId);
 
-    // Path telemetry
-    log("info", "[WorkerProvisioner PATH TELEMETRY] Worker Path: " + filePath + 
-               " | Guest Path: " + filePath + 
-               " | Exec Path: " + filePath + 
-               " | Current Mount Namespace: host9p -> /mnt/9p");
+    // Persistence Telemetry (Requirement 7)
+    log("info", "[WorkerProvisioner PERSISTENCE TELEMETRY] Path: " + filePath + 
+               " | Expected Inode: " + expectedInode + 
+               " | Exec ID: " + execId +
+               " | Mount Source: host9p -> /mnt/9p" +
+               " | Start Time: " + startTime);
 
     return new Promise(function(resolve) {
       function done(success, details) {
@@ -1041,6 +1047,12 @@ var WorkerProvisioner = {
         finished = true;
         if (cmdTimeout) clearTimeout(cmdTimeout);
         if (listener) emu.remove_listener("serial0-output-byte", listener);
+        
+        var latency = Date.now() - startTime;
+        log("info", "[WorkerProvisioner PERSISTENCE TELEMETRY] Revalidation complete. Success: " + success +
+                   " | Details: " + details +
+                   " | Timing: " + latency + "ms");
+        
         resolve({ success: success, details: details });
       }
 
@@ -1095,10 +1107,10 @@ var WorkerProvisioner = {
       armTimeout(CMD_TIMEOUT_MS);
       var cmd =
         "stty -echo 2>/dev/null; PS1=''; " +
-        "sync 2>/dev/null; " +
+        "sync; " +
         "echo '[EXEC_DIAG:PWD]'; pwd; " +
-        "echo '[EXEC_DIAG:MOUNTS]'; cat /proc/mounts 2>/dev/null | grep -E '9p|host' || echo 'none'; " +
-        "echo '[EXEC_DIAG:LSTMP]'; ls -la /tmp 2>/dev/null || echo 'ls-failed'; " +
+        "echo '[EXEC_DIAG:MOUNTS]'; cat /proc/mounts 2>/dev/null || echo 'none'; " +
+        "echo '[EXEC_DIAG:LSPROVISION]'; ls -la /root/.provision 2>/dev/null || echo 'ls-failed'; " +
         "echo '[EXEC_DIAG:STAT]'; stat '" + filePath + "' 2>/dev/null || echo 'stat-failed'; " +
         "check_file() { [ -f '" + filePath + "' ] && stat '" + filePath + "' >/dev/null 2>&1 && ls '" + filePath + "' >/dev/null 2>&1 && cat '" + filePath + "' >/dev/null 2>&1; }; " +
         "if check_file; then " +
@@ -1527,15 +1539,15 @@ self.onmessage = async function (e) {
       var triggerCmd =
         "stty -echo 2>/dev/null\n" +
         "sh -c '_exec_completed=0; " +
-        "trap '\''_code=$?; if [ \"$_exec_completed\" -eq 0 ]; then echo \"<<<EXEC_COMPLETE:" + execExecId + ":err_$_code>>>\" > /dev/ttyS0; fi'\'' EXIT INT TERM HUP; " +
-        "echo \"<<<EXEC_START:" + execExecId + ">>>\" > /dev/ttyS0; " +
+        "trap '\''_code=$?; if [ \"$_exec_completed\" -eq 0 ]; then printf \"<<<EXEC_COMPLETE:" + execExecId + ":err_%s>>>\\n\" \"$_code\" > /dev/ttyS0; fi'\'' EXIT INT TERM HUP; " +
+        "printf \"<<<EXEC_START:" + execExecId + ">>>\\n\" > /dev/ttyS0; " +
         "if [ ! -f '\''" + execFilePath + "'\'' ]; then " +
-        "echo \"<<<EXEC_COMPLETE:" + execExecId + ":nofile>>>\" > /dev/ttyS0; " +
+        "printf \"<<<EXEC_COMPLETE:" + execExecId + ":nofile>>>\\n\" > /dev/ttyS0; " +
         "_exec_completed=1; exit 1; " +
         "fi; " +
         "sh '\''" + execFilePath + "'\''; " +
         "_code=$?; " +
-        "echo \"<<<EXEC_COMPLETE:" + execExecId + ":$_code>>>\" > /dev/ttyS0; " +
+        "printf \"<<<EXEC_COMPLETE:" + execExecId + ":%s>>>\\n\" \"$_code\" > /dev/ttyS0; " +
         "_exec_completed=1;' \n";
 
       var sent = SerialChannelManager.send(0, triggerCmd);

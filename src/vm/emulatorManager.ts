@@ -1041,7 +1041,7 @@ export class VMController {
     if (this.onSerialOutput && this.onStateChange) {
       this._dispatchReattach(this.onSerialOutput, this.onStateChange);
     }
-    const queryCmd = `\nstty -echo; if [ -f /tmp/provision_${execId}.sh ]; then if ps | grep -v grep | grep -q "provision_${execId}.sh"; then echo "<<<PROTO:${execId}:5:HEARTBEAT>>>"; elif [ -f /tmp/provision_complete ]; then echo "<<<PROTO:${execId}:6:EXEC_COMPLETE>>>"; else echo "<<<PROTO:${execId}:7:FAIL:recovery_script_terminated>>>"; fi; else echo "<<<PROTO:${execId}:7:FAIL:recovery_script_not_found>>>"; fi\n`;
+    const queryCmd = `\nstty -echo; if [ -f /root/.provision/provision_${execId}.sh ]; then if ps | grep -v grep | grep -q "provision_${execId}.sh"; then echo "<<<PROTO:${execId}:5:HEARTBEAT>>>"; elif [ -f /root/.provision/provision_complete ]; then echo "<<<PROTO:${execId}:6:EXEC_COMPLETE>>>"; else echo "<<<PROTO:${execId}:7:FAIL:recovery_script_terminated>>>"; fi; else echo "<<<PROTO:${execId}:7:FAIL:recovery_script_not_found>>>"; fi\n`;
     
     // Send the query on serial0
     void this.sendProgrammaticInput(0, queryCmd);
