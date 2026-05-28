@@ -934,14 +934,32 @@ export class VMController {
                           this.provisioningSearchBuffer.endsWith("root% ") ||
                           this.provisioningSearchBuffer.endsWith("% ");
 
+    const provisioningActive =
+      this.provisioning.getState() === "preparing" ||
+      this.provisioning.getState() === "transferring" ||
+      this.provisioning.getState() === "executing" ||
+      this.provisioning.getState() === "waiting_completion";
+
+    if (provisioningActive && hasRootPrompt) {
+      Logger.warn("VM", `[PROVISIONING WATCHDOG] Prompt leakage detected: root prompt found in serial stream while provisioning is active. Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
+    }
+
+    if (provisioningActive && (char === "\n" || hasRootPrompt)) {
+      const lastOpen = this.provisioningSearchBuffer.lastIndexOf("<<<");
+      const lastClose = this.provisioningSearchBuffer.lastIndexOf(">>>");
+      if (lastOpen > lastClose) {
+        Logger.warn("VM", `[PROVISIONING WATCHDOG] TTY desync / tag fragmentation detected. Unclosed tag: ${JSON.stringify(this.provisioningSearchBuffer.slice(lastOpen))}`);
+      }
+    }
+
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
     const activeGenId = activeGen ? activeGen.id : 0;
 
     // Check for mount stabilization markers during provision_preparing state
     if (this.lifecycle.getState().state === "provision_preparing") {
-      if (this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
+      if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_OK>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
         this.timeouts.cancel("mount_stabilization_watchdog");
-        Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized. Transitioning to provisioning state.");
+        Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
         this.transitionState("provisioning", "handleSerialLifecycle");
         this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
 
@@ -973,7 +991,7 @@ export class VMController {
         );
         this.provisioningSearchBuffer = "";
         return;
-      } else if (this.provisioningSearchBuffer.includes("<<<MOUNT_FAILED>>>")) {
+      } else if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_FAIL>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_FAILED>>>")) {
         this.timeouts.cancel("mount_stabilization_watchdog");
         Logger.error("VM", "[PROVISIONING] Guest filesystem mount failed.");
         this.orchestrator.triggerRecovery("guest mount barrier report failure");
@@ -1039,12 +1057,6 @@ export class VMController {
     // If ash emits '> ' (PS2 prompt) during provisioning, it means the shell received
     // an incomplete compound command and is waiting for more input. This is a deadlock.
     // Recovery: send Ctrl+C (\x03) to abort, then a newline to clear the line.
-    const provisioningActive =
-      this.provisioning.getState() === "preparing" ||
-      this.provisioning.getState() === "transferring" ||
-      this.provisioning.getState() === "executing" ||
-      this.provisioning.getState() === "waiting_completion";
-
     if (provisioningActive && (
       this.provisioningSearchBuffer.includes("> > >") ||
       this.provisioningSearchBuffer.endsWith("\n> ") ||
@@ -1097,25 +1109,8 @@ export class VMController {
       this.lifecycle.setBootComplete(true);
       this.transitionState("provision_preparing", "handleSerialLifecycle");
       
-      // Disable echo only — keep canonical mode (icanon) so ash can read full newline-terminated lines.
-      // Removing -icanon (raw mode) because it causes ash to receive characters without line buffering,
-      // which breaks long compound shell commands and triggers PS2 continuation prompt (>).
-      Logger.info("VM", "[PROVISIONING] Disabling serial echo (stty -echo) — canonical mode preserved...");
-      void this.sendProgrammaticInput(0, "stty -echo\n");
-
-      Logger.info("VM", "[PROVISIONING] Sending guest filesystem mount stabilization barrier...");
-      const mountCommand = "mkdir -p /mnt/9p\n" +
-        "grep -q host9p /proc/mounts 2>/dev/null || " +
-        "mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
-        "mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
-        "mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
-        "mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
-        "sync\n" +
-        "mkdir -p /mnt/9p/root/.provision\n" +
-        "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
-        "sync\n" +
-        "ls -d /root/.provision >/dev/null 2>&1 && echo '<<<MOUNT_STABILIZED>>>' || echo '<<<MOUNT_FAILED>>>'\n";
-      void this.sendProgrammaticInput(0, mountCommand);
+      Logger.info("VM", "[PROVISIONING] Executing guest mount stabilization helper script...");
+      void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
 
       this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
         Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");

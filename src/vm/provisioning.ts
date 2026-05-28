@@ -97,6 +97,27 @@ export class ProvisioningCompletionParser {
         });
       }
 
+      // Parse standalone STAGE:EXEC_START: <<<STAGE:EXEC_START>>>
+      if (line.includes("<<<STAGE:EXEC_START>>>")) {
+        const oldState = this.state;
+        this.state = "EXEC_START";
+        this.isExecutionMode = true;
+        this.lastMarker = "STAGE:EXEC_START";
+        results.push({ type: "exec_start", id: this.currentExecId });
+        Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (STAGE:EXEC_START): ${oldState} -> EXEC_START for execId=${this.currentExecId}`);
+        line = line.replace("<<<STAGE:EXEC_START>>>", "");
+      }
+
+      // Parse standalone STAGE:PROVISION_READY: <<<STAGE:PROVISION_READY>>>
+      if (line.includes("<<<STAGE:PROVISION_READY>>>")) {
+        const oldState = this.state;
+        this.state = "SUCCESS";
+        this.lastMarker = "STAGE:PROVISION_READY";
+        results.push({ type: "complete", id: this.currentExecId });
+        Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (STAGE:PROVISION_READY): ${oldState} -> SUCCESS for execId=${this.currentExecId}`);
+        line = line.replace("<<<STAGE:PROVISION_READY>>>", "");
+      }
+
       // Parse standalone EXEC_START: <<<EXEC_START:id>>>
       const execStartRegex = /<<<EXEC_START:(\d+)>>>/g;
       let startMatch;
