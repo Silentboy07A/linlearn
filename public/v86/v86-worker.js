@@ -205,7 +205,12 @@ function canInitialize() {
 }
 
 function canSendInput() {
-  return lifecycleState === "ready" || lifecycleState === "terminal_ready";
+  return (
+    lifecycleState === "ready" ||
+    lifecycleState === "terminal_ready" ||
+    lifecycleState === "provision_preparing" ||
+    lifecycleState === "provisioning"
+  );
 }
 
 // ─── 3. ASSET LOADER MODULE ──────────────────────────────────────────────────
@@ -890,7 +895,9 @@ var WorkerProvisioner = {
     var executeScript =
       "#!/bin/sh\n" +
       "export PS1=''\n" +
+      "unset PROMPT_COMMAND\n" +
       "stty -echo\n" +
+      "exec 2>>/root/.provision/provision_exec.log\n" +
       "echo '<<<STAGE:EXEC_START>>>' > /dev/ttyS0\n" +
       "set -x\n" +
       "echo \"[STAGE] execute_verify\" > /dev/ttyS0\n" +
@@ -1003,6 +1010,7 @@ var WorkerProvisioner = {
       "  provision_exit_code=$?\n" +
       "  if [ \"$provision_exit_code\" -eq 0 ]; then\n" +
       "    echo '<<<STAGE:PROVISION_READY>>>' > /dev/ttyS0\n" +
+      "    echo '<<<STAGE:PROVISION_DONE>>>' > /dev/ttyS0\n" +
       "  else\n" +
       "    echo \"<<<PROTO:" + execId + ":7:FAIL:provision_script_exit_code_${provision_exit_code}>>>\" > /dev/ttyS0\n" +
       "  fi\n" +
@@ -1239,6 +1247,8 @@ async function destroyEmulator() {
   }
 }
 
+var inputBuffer = "";
+
 // ─── 5. MESSAGE EVENT HANDLER & ENTRYPOINT ───────────────────────────────────
 /**
  * Handle messages from the main thread.
@@ -1316,7 +1326,21 @@ self.onmessage = async function (e) {
         log("warn", "Ignored serial input in non-interactive state: " + lifecycleState);
         break;
       }
-      SerialChannelManager.send(0, payload);
+      if (lifecycleState === "provision_preparing" || lifecycleState === "provisioning") {
+        inputBuffer += payload;
+        if (inputBuffer.indexOf("\n") !== -1) {
+          var parts = inputBuffer.split("\n");
+          inputBuffer = parts.pop(); // keep the remaining partial command in buffer
+          for (var i = 0; i < parts.length; i++) {
+            var cmd = parts[i] + "\n";
+            log("info", "[Worker] Executing complete buffered command: " + JSON.stringify(cmd));
+            SerialChannelManager.send(0, cmd);
+          }
+        }
+      } else {
+        inputBuffer = "";
+        SerialChannelManager.send(0, payload);
+      }
       break;
 
     case "INPUT1":
@@ -1920,7 +1944,9 @@ async function handleInit(payload) {
       var mpScript = 
         "#!/bin/sh\n" +
         "export PS1=''\n" +
+        "unset PROMPT_COMMAND\n" +
         "stty -echo\n" +
+        "echo '<<<STAGE:BOOT_OK>>>' > /dev/ttyS0\n" +
         "echo '<<<STAGE:MOUNT_START>>>' > /dev/ttyS0\n" +
         "mkdir -p /mnt/9p /root/.provision >/dev/null 2>&1\n" +
         "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +

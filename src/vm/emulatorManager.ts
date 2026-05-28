@@ -941,7 +941,18 @@ export class VMController {
       this.provisioning.getState() === "waiting_completion";
 
     if (provisioningActive && hasRootPrompt) {
-      Logger.warn("VM", `[PROVISIONING WATCHDOG] Prompt leakage detected: root prompt found in serial stream while provisioning is active. Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
+      Logger.error("VM", `[PROVISIONING WATCHDOG] Prompt leakage detected: root prompt found in serial stream while provisioning is active. Aborting, resetting TTY, and restarting execution.`);
+      Logger.warn("VM", `[PROVISIONING WATCHDOG] Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
+      
+      void this.sendProgrammaticInput(0, "\x03\n");
+      void this.sendProgrammaticInput(0, "stty sane\nreset\n");
+      
+      const execId = this.provisioning.getExecutionId();
+      Logger.info("VM", `[PROVISIONING WATCHDOG] Clean restart: sending execute command for helper prov_execute_${execId}.sh`);
+      void this.sendProgrammaticInput(0, `sh /root/.provision/prov_execute_${execId}.sh\n`);
+      
+      this.provisioningSearchBuffer = "";
+      return;
     }
 
     if (provisioningActive && (char === "\n" || hasRootPrompt)) {

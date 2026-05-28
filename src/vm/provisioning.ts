@@ -97,6 +97,24 @@ export class ProvisioningCompletionParser {
         });
       }
 
+      // Parse standalone STAGE:BOOT_OK: <<<STAGE:BOOT_OK>>>
+      if (line.includes("<<<STAGE:BOOT_OK>>>")) {
+        Logger.info("VM", "[Provisioning FSM] Stage marker parsed: STAGE:BOOT_OK");
+        line = line.replace("<<<STAGE:BOOT_OK>>>", "");
+      }
+
+      // Parse standalone STAGE:MOUNT_START: <<<STAGE:MOUNT_START>>>
+      if (line.includes("<<<STAGE:MOUNT_START>>>")) {
+        Logger.info("VM", "[Provisioning FSM] Stage marker parsed: STAGE:MOUNT_START");
+        line = line.replace("<<<STAGE:MOUNT_START>>>", "");
+      }
+
+      // Parse standalone STAGE:MOUNT_OK: <<<STAGE:MOUNT_OK>>>
+      if (line.includes("<<<STAGE:MOUNT_OK>>>")) {
+        Logger.info("VM", "[Provisioning FSM] Stage marker parsed: STAGE:MOUNT_OK");
+        line = line.replace("<<<STAGE:MOUNT_OK>>>", "");
+      }
+
       // Parse standalone STAGE:EXEC_START: <<<STAGE:EXEC_START>>>
       if (line.includes("<<<STAGE:EXEC_START>>>")) {
         const oldState = this.state;
@@ -108,6 +126,12 @@ export class ProvisioningCompletionParser {
         line = line.replace("<<<STAGE:EXEC_START>>>", "");
       }
 
+      // Parse standalone STAGE:EXEC_OK: <<<STAGE:EXEC_OK>>>
+      if (line.includes("<<<STAGE:EXEC_OK>>>")) {
+        Logger.info("VM", "[Provisioning FSM] Stage marker parsed: STAGE:EXEC_OK");
+        line = line.replace("<<<STAGE:EXEC_OK>>>", "");
+      }
+
       // Parse standalone STAGE:PROVISION_READY: <<<STAGE:PROVISION_READY>>>
       if (line.includes("<<<STAGE:PROVISION_READY>>>")) {
         const oldState = this.state;
@@ -116,6 +140,16 @@ export class ProvisioningCompletionParser {
         results.push({ type: "complete", id: this.currentExecId });
         Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (STAGE:PROVISION_READY): ${oldState} -> SUCCESS for execId=${this.currentExecId}`);
         line = line.replace("<<<STAGE:PROVISION_READY>>>", "");
+      }
+
+      // Parse standalone STAGE:PROVISION_DONE: <<<STAGE:PROVISION_DONE>>>
+      if (line.includes("<<<STAGE:PROVISION_DONE>>>")) {
+        const oldState = this.state;
+        this.state = "SUCCESS";
+        this.lastMarker = "STAGE:PROVISION_DONE";
+        results.push({ type: "complete", id: this.currentExecId });
+        Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (STAGE:PROVISION_DONE): ${oldState} -> SUCCESS for execId=${this.currentExecId}`);
+        line = line.replace("<<<STAGE:PROVISION_DONE>>>", "");
       }
 
       // Parse standalone EXEC_START: <<<EXEC_START:id>>>

@@ -100,7 +100,9 @@ export function canSaveState(): boolean {
 export function canSendInput(): boolean {
   return (
     lifecycleState === "terminal_ready" ||
-    lifecycleState === "ready"
+    lifecycleState === "ready" ||
+    lifecycleState === "provision_preparing" ||
+    lifecycleState === "provisioning"
   );
 }
 
