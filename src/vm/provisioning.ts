@@ -678,6 +678,20 @@ trap '
 
 echo "<<<PROTO:${executionId}:4:EXEC_START>>>" > /dev/ttyS0
 echo "[PROVISIONING] Started execution ID: ${executionId}"
+
+echo "[STAGE] self_test"
+echo "self_test_ok" > /root/.provision/self_test_file.tmp
+sync
+if [ -f /root/.provision/self_test_file.tmp ] && [ "$(cat /root/.provision/self_test_file.tmp)" = "self_test_ok" ]; then
+  echo "[SELF_TEST] Read/write verification passed"
+else
+  echo "[SELF_TEST] Read/write verification failed" > /dev/ttyS0
+  echo "<<<PROTO:${executionId}:7:FAIL:self_test_failed>>>" > /dev/ttyS0
+  exit 1
+fi
+rm -f /root/.provision/self_test_file.tmp
+sync
+
 echo "<<<PROTO:${executionId}:5:HEARTBEAT>>>" > /dev/ttyS0
 
 hostname linlearn
