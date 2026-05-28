@@ -175,22 +175,23 @@ export class VMController {
   private lifecycleMutex = new AsyncMutex();
   private actionToken = 0;
 
-  // ─── Shell Readiness Gate ─────────────────────────────────────────────────
-  // Tracks conditions required before serial input may be sent programmatically.
-  // The gate opens when ALL of the following are satisfied:
-  //   1. SERIAL_READY stage notification received from worker
-  //   2. At least one shell prompt (# / % / $) observed in serial stream
-  //   3. No active INIT_STAGE transitions pending
-  //   4. Runtime state is not 'loading' or 'booting'
+  // ─── Shell Readiness Preconditions ──────────────────────────────────────
+  // These booleans track low-level preconditions for the "interactive" FSM
+  // transition. They are NEVER used directly to gate serial input — the
+  // lifecycle FSM state "interactive" is the SINGLE SOURCE OF TRUTH.
+  //
+  // Gate opens (FSM → "interactive") when ALL are true:
+  //   1. receivedSerialReady  — SERIAL_READY received from worker
+  //   2. hasSeenPrompt        — root shell prompt observed in serial stream
+  //   3. !pendingInitStage    — no active INIT_STAGE transition in flight
+  //   4. FSM state === "booting" (transition guard)
   private receivedSerialReady = false;
   private hasSeenPrompt = false;
   private pendingInitStage = false;
-  private shellReadinessResolved = false;
-  private shellReadinessResolvers: Array<() => void> = [];
 
   // ─── Deferred Input Queue ─────────────────────────────────────────────────
-  // Programmatic serial inputs sent before the interactive gate is open are
-  // enqueued here and flushed upon transition to 'interactive'.
+  // Programmatic serial inputs arriving before FSM reaches "interactive" are
+  // enqueued here and flushed atomically when the FSM transitions to "interactive".
   private deferredInputQueue: Array<{ port: number; data: string }> = [];
 
   constructor(config: Partial<VMSessionConfig> = {}) {
@@ -564,12 +565,10 @@ export class VMController {
     this.provisioning.reset();
     this.provisioningSearchBuffer = "";
 
-    // Reset shell readiness gate for new session
+    // Reset shell readiness preconditions for new session
     this.receivedSerialReady = false;
     this.hasSeenPrompt = false;
     this.pendingInitStage = false;
-    this.shellReadinessResolved = false;
-    this.shellReadinessResolvers = [];
     this.deferredInputQueue = [];
 
     this.transitionState("loading", "VMController.start");
@@ -589,25 +588,12 @@ export class VMController {
           return;
         }
 
-        // Only probe shell if we are past the early boot phase (shell readiness gate open)
-        if (!this.shellReadinessResolved) {
-          Logger.warn("VM", `[BOOT WATCHDOG] Shell not yet interactive — skipping probe. Stalled in state: ${state}`);
-          this.useMinimalFallback = true;
-          this.orchestrator.triggerRecovery("boot timeout exceeded (shell not ready)");
-          return;
-        }
-
-        // Probe shell responsiveness only after shell is confirmed interactive
-        const shellResponsive = await this.probeShellResponsiveness();
-        if (shellResponsive) {
-          Logger.info("VM", "[BOOT WATCHDOG] Shell responded to probe. Extending boot timeout.");
-          this.timeouts.extend("boot_watchdog", 15000);
-          return;
-        }
-
-        Logger.warn("VM", `Boot watchdog triggered. Stalled in state: ${state}`);
+        // Inside this block, FSM is still in "loading" or "booting", which means
+        // it has NOT yet reached "interactive" (the single source of truth for readiness).
+        // Skip shell probe entirely — the shell is not yet ready for programmatic input.
+        Logger.warn("VM", `[BOOT WATCHDOG] FSM has not reached 'interactive' — skipping probe. Stalled in state: ${state}`);
         this.useMinimalFallback = true;
-        this.orchestrator.triggerRecovery("boot timeout exceeded");
+        this.orchestrator.triggerRecovery("boot timeout exceeded (shell not interactive)");
       }
     });
 
@@ -643,15 +629,16 @@ export class VMController {
             const stage = stagePayload.stage;
             this.timeouts.cancel("init_watchdog");
 
-            // Mark that an INIT_STAGE is in progress — shell readiness gate depends on this
+            // Track INIT_STAGE — clears when SERIAL_READY arrives (last stage)
             this.pendingInitStage = true;
 
-            // SERIAL_READY is the last stage; after it we know serial is attached
+            // SERIAL_READY is the terminal stage: serial port is now attached
             if (stage === "SERIAL_READY") {
               this.receivedSerialReady = true;
               this.pendingInitStage = false;
-              Logger.info("VM", "[SHELL GATE] SERIAL_READY received. Serial port is now attached.");
-              this.checkInteractiveShellReadiness();
+              Logger.info("VM", "[SHELL GATE] SERIAL_READY received. Attempting FSM transition to 'interactive'.");
+              // Attempt FSM transition — will succeed only if prompt was already seen
+              this._tryTransitionToInteractive("SERIAL_READY");
             }
             
             // Phase-specific watchdog timeout durations
@@ -1168,21 +1155,23 @@ export class VMController {
       this.provisioningSearchBuffer = "";
     }
 
-    // ── Boot ready: root prompt detected → update shell readiness gate ──
+    // ── Boot ready: root prompt detected → update FSM precondition, try interactive transition ──
     const isBootingState = this.lifecycle.getState().state === "booting";
     if (hasRootPrompt) {
-      // Signal that we've seen a shell prompt — gate condition 2
+      // Record prompt seen — precondition 2 for FSM transition to "interactive"
       if (!this.hasSeenPrompt) {
         this.hasSeenPrompt = true;
         Logger.info("VM", "[SHELL GATE] First root prompt observed in serial stream.");
-        this.checkInteractiveShellReadiness();
+        // Attempt FSM transition to "interactive" (may already be satisfied if SERIAL_READY arrived first)
+        this._tryTransitionToInteractive("prompt-detected");
       }
     }
 
     if (hasRootPrompt && isBootingState && this.provisioning.getState() === "idle") {
       // Wait for prompt to be stable using event-driven awaitPromptStable()
       void this.awaitPromptStable(1000).then(() => {
-        if (this.lifecycle.getState().state !== "booting" || this.provisioning.getState() !== "idle") return;
+        if (this.lifecycle.getState().state !== "booting" && this.lifecycle.getState().state !== "interactive") return;
+        if (this.provisioning.getState() !== "idle") return;
 
         this.timeouts.cancel("prompt_stabilization");
         this.timeouts.cancel("boot_watchdog");
@@ -1194,17 +1183,20 @@ export class VMController {
         this.bootCompleted = true;
         this.lifecycle.setBootComplete(true);
 
-        // Wait for interactive shell gate to fully open before sending any serial commands
-        void this.waitForInteractiveShell().then(() => {
+        // Try FSM transition to "interactive" now that serial has stabilized.
+        // This is the authoritative transition: if preconditions are already met
+        // (SERIAL_READY + prompt + no pending stage), the FSM moves to "interactive"
+        // immediately. If not yet met, the transition will fire when they are.
+        this._tryTransitionToInteractive("boot-complete-stable");
+
+        // Wait for FSM to reach "interactive" before starting file visibility verification.
+        // awaitFsmState() returns immediately if FSM is already "interactive" or beyond.
+        void this.awaitFsmState("interactive").then(() => {
           this.startFileVisibilityVerification(
             "/root/.provision/mount_prepare.sh",
             () => {
-              Logger.info("VM", "[PROVISIONING] mount_prepare.sh guest visibility verified. Transitioning to interactive.");
-              this.transitionState("interactive", "handleSerialLifecycle");
-
-              // Flush any deferred inputs that were queued before shell was ready
-              this._flushDeferredInputQueue();
-
+              Logger.info("VM", "[PROVISIONING] mount_prepare.sh guest visibility verified. Starting mount stabilization.");
+              // FSM is already "interactive" here — sendProgrammaticInput will be allowed.
               Logger.info("VM", "[PROVISIONING] Executing guest mount stabilization helper script...");
               void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
 
@@ -1225,59 +1217,111 @@ export class VMController {
     }
   }
 
-  // ─── Shell Readiness Gate ─────────────────────────────────────────────────
+  // ─── FSM-Unified Shell Readiness ─────────────────────────────────────────
+  // The lifecycle FSM state "interactive" is the SINGLE SOURCE OF TRUTH for
+  // shell readiness. All readiness checks must derive from:
+  //   lifecycleState === "interactive"
+  // The private booleans below are only precondition trackers that feed into
+  // the FSM transition. They are never used to gate I/O directly.
 
   /**
-   * Returns a Promise that resolves only when the interactive shell is confirmed
-   * ready. All conditions must be met:
-   *   1. SERIAL_READY received from worker
-   *   2. A root shell prompt was observed in serial output
-   *   3. No INIT_STAGE transition is pending
-   *   4. Runtime state is not 'loading' or 'booting'
-   * If the gate is already open, resolves immediately.
+   * Attempt to transition the FSM from "booting" to "interactive".
+   * Called whenever any precondition changes. Does nothing if:
+   *   - FSM is not in "booting" state (already transitioned or wrong state)
+   *   - Not all preconditions are satisfied
+   *
+   * When successful:
+   *   - FSM transitions to "interactive"
+   *   - Deferred input queue is flushed atomically
+   *   - [INTERACTIVE_ENTER] is logged
+   *
+   * If preconditions are met but FSM is still in "booting", this is a
+   * split-brain condition and is logged as [FSM_SPLIT_BRAIN].
    */
-  public waitForInteractiveShell(): Promise<void> {
-    if (this.shellReadinessResolved) {
+  private _tryTransitionToInteractive(trigger: string): void {
+    const state = this.lifecycle.getState().state;
+
+    // Only transition from "booting"
+    if (state !== "booting") {
+      // Detect split-brain: conditions met but FSM isn't in "booting"
+      if (this.hasSeenPrompt && this.receivedSerialReady && state !== "interactive" &&
+          state !== "provisioning" && state !== "shell_ready" && state !== "terminal_ready" && state !== "ready") {
+        Logger.warn("VM",
+          `[FSM_SPLIT_BRAIN] Shell conditions met (prompt=${this.hasSeenPrompt}, serialReady=${this.receivedSerialReady}) ` +
+          `but FSM is in state '${state}' (trigger: ${trigger}). Expected 'booting' or 'interactive+'.`
+        );
+      }
+      return;
+    }
+
+    // Check all preconditions
+    const conditionsLog = `serialReady=${this.receivedSerialReady}, prompt=${this.hasSeenPrompt}, pendingStage=${this.pendingInitStage}`;
+
+    if (!this.receivedSerialReady || !this.hasSeenPrompt || this.pendingInitStage) {
+      Logger.debug("VM", `[SHELL GATE] Preconditions not yet satisfied (trigger: ${trigger}). ${conditionsLog}`);
+      return;
+    }
+
+    // All conditions met — transition FSM to "interactive"
+    Logger.info("VM", `[INTERACTIVE_ENTER] All shell preconditions satisfied (trigger: ${trigger}). ${conditionsLog}. Transitioning FSM: booting → interactive.`);
+
+    const succeeded = this.transitionState("interactive", `shell-gate:${trigger}`);
+    if (succeeded) {
+      Logger.info("VM", `[FSM_SYNC_OK] FSM successfully transitioned to 'interactive' (trigger: ${trigger}).`);
+      // Flush the deferred queue atomically AFTER the FSM state change
+      this._flushDeferredInputQueue();
+    } else {
+      Logger.error("VM",
+        `[FSM_SPLIT_BRAIN] FSM transition booting → interactive FAILED despite all preconditions being met ` +
+        `(trigger: ${trigger}). ${conditionsLog}. Current state: ${this.lifecycle.getState().state}`
+      );
+    }
+  }
+
+  /**
+   * Returns a Promise that resolves when the lifecycle FSM reaches the target
+   * state or any state that comes after it in the boot sequence.
+   * Resolves immediately if already at or past the target state.
+   *
+   * This replaces waitForInteractiveShell() and is the event-driven bridge
+   * between FSM transitions and async continuation chains.
+   */
+  public awaitFsmState(targetState: VMStateName): Promise<void> {
+    const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
+    const targetIdx = stateOrder.indexOf(targetState);
+
+    const checkReached = (): boolean => {
+      const current = this.lifecycle.getState().state;
+      const currentIdx = stateOrder.indexOf(current);
+      return currentIdx >= targetIdx && currentIdx !== -1 && targetIdx !== -1;
+    };
+
+    if (checkReached()) {
       return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-      this.shellReadinessResolvers.push(resolve);
+
+    // Poll using the timeout manager — re-check every 50ms until reached or VM stops
+    return new Promise<void>((resolve, reject) => {
+      const poll = () => {
+        if (checkReached()) {
+          resolve();
+          return;
+        }
+        const current = this.lifecycle.getState().state;
+        if (current === "stopped" || current === "error" || current === "idle") {
+          reject(new Error(`[awaitFsmState] VM reached terminal state '${current}' before reaching '${targetState}'.`));
+          return;
+        }
+        this.timeouts.register(`await_fsm_${targetState}`, 50, poll);
+      };
+      poll();
     });
   }
 
   /**
-   * Called whenever any shell readiness condition changes.
-   * Opens the gate if all conditions are now satisfied.
-   */
-  private checkInteractiveShellReadiness(): void {
-    if (this.shellReadinessResolved) return;
-
-    const state = this.lifecycle.getState().state;
-    const isEarlyBoot = state === "loading" || state === "booting";
-    const allConditionsMet =
-      this.receivedSerialReady &&
-      this.hasSeenPrompt &&
-      !this.pendingInitStage &&
-      !isEarlyBoot;
-
-    // In practice the prompt may arrive before SERIAL_READY or after — handle both orderings.
-    // Allow the gate to open if prompt AND state are valid even before SERIAL_READY if the prompt
-    // unambiguously arrived during the booting state (we relax receivedSerialReady in that case).
-    const promptReceivedInBootingState = this.hasSeenPrompt && state === "booting";
-
-    if (allConditionsMet || promptReceivedInBootingState) {
-      this.shellReadinessResolved = true;
-      Logger.info("VM", "[SHELL GATE] Interactive shell readiness confirmed. Flushing deferred input queue.");
-      // Resolve all waiting callers
-      const resolvers = this.shellReadinessResolvers.splice(0);
-      for (const resolve of resolvers) resolve();
-    }
-  }
-
-  /**
    * Waits for the serial stream to be quiet for at least `quietMs` milliseconds
-   * (no new characters arriving), then resolves. This is the event-driven
-   * replacement for setTimeout-based prompt stabilization.
+   * (no new characters arriving), then resolves. Event-driven replacement for
+   * setTimeout-based prompt stabilization.
    */
   private awaitPromptStable(quietMs: number): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -1286,7 +1330,6 @@ export class VMController {
         if (age >= quietMs) {
           resolve();
         } else {
-          // Re-check after the remaining quiet period has elapsed
           this.timeouts.register("prompt_stabilization", quietMs - age, check);
         }
       };
@@ -1296,12 +1339,12 @@ export class VMController {
   }
 
   /**
-   * Flush all deferred programmatic inputs that were queued while the shell
-   * was not yet interactive. Called after the gate opens.
+   * Flush all deferred programmatic inputs queued while FSM was in
+   * loading/booting. Called atomically after FSM transitions to "interactive".
    */
   private _flushDeferredInputQueue(): void {
     if (this.deferredInputQueue.length === 0) return;
-    Logger.info("VM", `[SHELL GATE] Flushing ${this.deferredInputQueue.length} deferred input(s) now that shell is interactive.`);
+    Logger.info("VM", `[SHELL GATE] Flushing ${this.deferredInputQueue.length} deferred input(s) after FSM reached 'interactive'.`);
     const queue = this.deferredInputQueue.splice(0);
     for (const item of queue) {
       void this.transport.send(item.port, item.data);
@@ -1686,42 +1729,70 @@ export class VMController {
 
   /**
    * Queue a programmatic serial input for deferred delivery.
-   * The input will be sent once the interactive shell gate is open.
-   * Use this instead of sendProgrammaticInput when the gate may not yet be open.
+   * Derives readiness from the lifecycle FSM state — the single source of truth.
+   * If FSM is at "interactive" or beyond, sends immediately.
+   * Otherwise enqueues for flush when FSM reaches "interactive".
    */
   public queueProgrammaticInput(port: number, data: string): void {
-    if (this.shellReadinessResolved) {
-      // Gate already open — send immediately
+    const stateName = this.lifecycle.getState().state;
+    const isInteractiveOrBeyond =
+      stateName === "interactive" || stateName === "provisioning" ||
+      stateName === "shell_ready" || stateName === "terminal_ready" || stateName === "ready";
+    if (isInteractiveOrBeyond) {
       void this.transport.send(port, data);
     } else {
-      Logger.info("VM", `[SHELL GATE] Deferring serial input (port=${port}): ${JSON.stringify(data.slice(0, 64))}`);
+      Logger.info("VM", `[SHELL GATE] Deferring queued input (port=${port}, fsmState=${stateName}): ${JSON.stringify(data.slice(0, 64))}`);
       this.deferredInputQueue.push({ port, data });
     }
   }
 
+  /**
+   * Send programmatic serial input.
+   * Validated against the lifecycle FSM — the single source of truth.
+   *
+   * Allowed when FSM is: interactive | provisioning | shell_ready | terminal_ready | ready
+   * Deferred when FSM is: loading | booting
+   * Rejected when FSM is: idle | stopping | stopped | error
+   */
   public sendProgrammaticInput(port: number, data: string): Promise<void> {
     const stateName = this.lifecycle.getState().state;
 
-    // Hard block: never send programmatic input during early boot phases.
-    // Commands sent during loading/booting would be injected before the shell
-    // is interactive, causing "Ignored serial input in non-interactive state" errors
-    // and TTY desynchronization.
+    // Allowed states — FSM-derived, single source of truth
+    if (
+      stateName === "interactive" ||
+      stateName === "provisioning" ||
+      stateName === "shell_ready" ||
+      stateName === "terminal_ready" ||
+      stateName === "ready"
+    ) {
+      Logger.debug("VM", `[PROVISIONING_ALLOWED] sendProgrammaticInput: port=${port}, fsmState=${stateName}`);
+      return this.transport.send(port, data);
+    }
+
+    // Defer during early boot — FSM has not yet transitioned to "interactive"
     if (stateName === "loading" || stateName === "booting") {
-      Logger.warn("VM", `[SHELL GATE] Deferring programmatic input during '${stateName}' phase (port=${port}): ${JSON.stringify(data.slice(0, 64))}`);
+      Logger.warn("VM",
+        `[SHELL GATE] Deferring programmatic input: FSM in '${stateName}' (port=${port}). ` +
+        `Input queued until FSM reaches 'interactive'. Data: ${JSON.stringify(data.slice(0, 64))}`
+      );
+      // Invariant check: if shell conditions are met, FSM MUST NOT be in booting
+      if (this.hasSeenPrompt && this.receivedSerialReady && !this.pendingInitStage) {
+        Logger.error("VM",
+          `[FSM_SPLIT_BRAIN] INVARIANT VIOLATION: Shell conditions fully met ` +
+          `(prompt=${this.hasSeenPrompt}, serialReady=${this.receivedSerialReady}, pendingStage=${this.pendingInitStage}) ` +
+          `but FSM is still in '${stateName}'. Forcing _tryTransitionToInteractive().`
+        );
+        this._tryTransitionToInteractive("invariant-repair");
+        // After repair attempt, retry immediately
+        return this.sendProgrammaticInput(port, data);
+      }
       this.deferredInputQueue.push({ port, data });
       return Promise.resolve();
     }
 
-    if (
-      stateName === "error" ||
-      stateName === "stopped" ||
-      stateName === "stopping" ||
-      stateName === "idle"
-    ) {
-      Logger.warn("VM", `Refusing programmatic input in non-interactive state: ${stateName}`);
-      return Promise.resolve();
-    }
-    return this.transport.send(port, data);
+    // Reject for terminal/error states
+    Logger.warn("VM", `[SHELL GATE] Refusing programmatic input: FSM in non-interactive state '${stateName}'.`);
+    return Promise.resolve();
   }
 
   public transitionState(
