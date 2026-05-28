@@ -1876,12 +1876,52 @@ async function handleInit(payload) {
   var version = payload.version || Date.now().toString();
   var t0 = Date.now();
 
+  var initTelemetry = {
+    wasmFetchDuration: 0,
+    wasmCompileDuration: 0,
+    biosLoadDuration: 0,
+    filesystemImageLoadDuration: 0,
+    initrdLoadDuration: 0,
+    emulatorConstructorDuration: 0,
+    cpuBootstrapDuration: 0,
+    firstSerialOutputLatency: 0
+  };
+
+  var currentInitStage = "WASM_FETCH";
+  function transitionInitStage(stage) {
+    currentInitStage = stage;
+    postToHost("INIT_STAGE", { stage: stage, ts: Date.now() });
+  }
+
+  // Set up progressive heartbeat telemetry
+  var heartbeatInterval = setInterval(function() {
+    var stats = {
+      ts: Date.now(),
+      stage: currentInitStage,
+      jsHeapLimit: 0,
+      totalJSHeap: 0,
+      usedJSHeap: 0,
+      deviceMemory: typeof navigator !== "undefined" ? navigator.deviceMemory : undefined,
+      emulatorRam: payload.minimal ? 32 * 1024 * 1024 : payload.memory_size,
+      emulatorVgaRam: payload.minimal ? 0 : payload.vga_memory_size
+    };
+    if (typeof performance !== "undefined" && performance.memory) {
+      stats.jsHeapLimit = performance.memory.jsHeapSizeLimit;
+      stats.totalJSHeap = performance.memory.totalJSHeapSize;
+      stats.usedJSHeap = performance.memory.usedJSHeapSize;
+    }
+    postToHost("INIT_PROGRESS", stats);
+  }, 1000);
+
   setLifecycleState("loading");
+  transitionInitStage("WASM_FETCH");
+
   log("info", "Step 1/4: Loading libv86.js from " + origin + "/v86/libv86.js?v=" + version);
 
   try {
     importScripts(origin + "/v86/libv86.js?v=" + version);
   } catch (err) {
+    clearInterval(heartbeatInterval);
     var msg = "Failed to load libv86.js: " + (err.message || String(err));
     log("error", msg);
     setLifecycleState("failed");
@@ -1890,6 +1930,7 @@ async function handleInit(payload) {
   }
 
   if (typeof V86 === "undefined") {
+    clearInterval(heartbeatInterval);
     var errMsg = "V86 constructor not found after importScripts";
     log("error", errMsg);
     setLifecycleState("failed");
@@ -1906,20 +1947,41 @@ async function handleInit(payload) {
   try {
     // Step 2: Preload Wasm Runtime
     log("info", "Step 2/4: Preloading and validating WebAssembly runtime...");
+    var tWasmFetchStart = Date.now();
     var wasmBuffer = await loadAsset(origin + "/v86/v86.wasm?v=" + version, "v86.wasm");
+    initTelemetry.wasmFetchDuration = Date.now() - tWasmFetchStart;
+
+    transitionInitStage("WASM_COMPILE");
+    var tWasmCompileStart = Date.now();
+    try {
+      await WebAssembly.compile(wasmBuffer);
+    } catch (compileErr) {
+      log("warn", "WebAssembly compilation check failed/warned: " + compileErr.message);
+    }
+    initTelemetry.wasmCompileDuration = Date.now() - tWasmCompileStart;
+
     var wasmBlob = new Blob([wasmBuffer], { type: "application/wasm" });
     var wasmBlobUrl = URL.createObjectURL(wasmBlob);
     log("info", "Step 2/4 completed: WebAssembly runtime loaded.");
 
     // Step 3: Load Boot Binaries
-    log("info", "Step 3/4: Loading BIOS & Kernel binaries...");
+    transitionInitStage("BIOS_LOAD");
+    var tBiosLoadStart = Date.now();
 
     log("info", "Loading System BIOS (seabios.bin)");
     var biosBuffer = await loadAsset(origin + "/v86/bios/seabios.bin?v=" + version, "seabios.bin");
 
-    log("info", "Loading VGA BIOS (vgabios.bin)");
-    var vgaBiosBuffer = await loadAsset(origin + "/v86/bios/vgabios.bin?v=" + version, "vgabios.bin");
+    var vgaBiosBuffer = null;
+    if (!payload.minimal) {
+      log("info", "Loading VGA BIOS (vgabios.bin)");
+      vgaBiosBuffer = await loadAsset(origin + "/v86/bios/vgabios.bin?v=" + version, "vgabios.bin");
+    } else {
+      log("info", "Minimal fallback boot active: skipping VGA BIOS fetch.");
+    }
+    initTelemetry.biosLoadDuration = Date.now() - tBiosLoadStart;
 
+    transitionInitStage("FS_LOAD");
+    var tFsLoadStart = Date.now();
     var bzImageBuffer = null;
     if (!payload.initial_state) {
       log("info", "Loading Linux kernel (bzImage)");
@@ -1927,11 +1989,20 @@ async function handleInit(payload) {
     } else {
       log("info", "Skipping kernel download: Restoring directly from snapshot.");
     }
+    initTelemetry.filesystemImageLoadDuration = Date.now() - tFsLoadStart;
+    initTelemetry.initrdLoadDuration = 0;
+
+    var memoryLimit = payload.memory_size || 64 * 1024 * 1024;
+    var vgaMemoryLimit = payload.vga_memory_size || 8 * 1024 * 1024;
+    if (payload.minimal) {
+      memoryLimit = 32 * 1024 * 1024; // 32MB
+      vgaMemoryLimit = 0; // 0MB VGA
+    }
 
     var config = {
       wasm_path: wasmBlobUrl,
       bios: { buffer: biosBuffer },
-      vga_bios: { buffer: vgaBiosBuffer },
+      vga_bios: vgaBiosBuffer ? { buffer: vgaBiosBuffer } : undefined,
       bzimage: bzImageBuffer ? { buffer: bzImageBuffer } : undefined,
       initial_state: payload.initial_state ? { buffer: payload.initial_state } : undefined,
       // filesystem:{} enables the 9p virtual filesystem, which is required for
@@ -1939,14 +2010,42 @@ async function handleInit(payload) {
       filesystem: { baseurl: "", basefs: "" },
       autostart: true,
       cmdline: payload.cmdline || "tsc=reliable mitigations=off random.trust_cpu=on console=ttyS0",
-      memory_size: payload.memory_size || 64 * 1024 * 1024,
-      vga_memory_size: payload.vga_memory_size || 8 * 1024 * 1024
+      memory_size: memoryLimit,
+      vga_memory_size: vgaMemoryLimit
     };
 
     // Step 4: Create emulator
-    log("info", "Step 4/4: Creating v86 emulator instance...");
+    transitionInitStage("EMULATOR_CREATE");
+    var tEmuCreateStart = Date.now();
     await createEmulator(config, self);
+    initTelemetry.emulatorConstructorDuration = Date.now() - tEmuCreateStart;
 
+    transitionInitStage("CPU_BOOT");
+    var tCpuBootStart = Date.now();
+
+    // Set up serial output listener to capture first serial byte received
+    var firstByteReceived = false;
+    var firstByteListener = function(byte) {
+      if (firstByteReceived) return;
+      firstByteReceived = true;
+      initTelemetry.firstSerialOutputLatency = Date.now() - t0;
+      initTelemetry.cpuBootstrapDuration = Date.now() - tCpuBootStart;
+      log("info", "[TELEMETRY] First serial byte latency: " + initTelemetry.firstSerialOutputLatency + "ms, CPU bootstrap: " + initTelemetry.cpuBootstrapDuration + "ms");
+      transitionInitStage("SERIAL_READY");
+      postToHost("INIT_TELEMETRY", initTelemetry);
+      if (emulator) {
+        try {
+          emulator.remove_listener("serial0-output-byte", firstByteListener);
+        } catch (e) {
+          // ignore
+        }
+      }
+    };
+    if (emulator) {
+      emulator.add_listener("serial0-output-byte", firstByteListener);
+    }
+
+    clearInterval(heartbeatInterval);
     postToHost("INIT_SUCCESS", {
       hasSerial1: !!(SerialChannelManager.ports['1'] && SerialChannelManager.ports['1'].ready)
     });
@@ -1958,6 +2057,7 @@ async function handleInit(payload) {
       setLifecycleState("booting");
     }
   } catch (err) {
+    clearInterval(heartbeatInterval);
     setLifecycleState("failed");
     await destroyEmulator();
     var initErr = "Emulator initialization failed: " + (err.message || String(err));

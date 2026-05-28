@@ -156,6 +156,9 @@ export class VMController {
   // Provisioning matching buffer
   private provisioningSearchBuffer = "";
 
+  private lastOrigin: string = "";
+  private useMinimalFallback: boolean = false;
+
   // Initialization mutex (legacy — kept for _doStart abort signal)
   private initPromise: Promise<void> | null = null;
   private initAbortController: AbortController | null = null;
@@ -361,11 +364,31 @@ export class VMController {
     if (this.onSerialOutput) {
       this.onSerialOutput("\r\n\x1b[1;31m[Recovery] All recovery exhausted. Cold booting guest VM...\x1b[0m\r\n");
     }
+
+    // Force stop regardless of state
+    if (this.lifecycle.isAlive() || this.lifecycle.getState().state !== "idle") {
+      await this._internalStop();
+      if (this.isStaleAction(token)) return;
+    }
+
     this.savedState = null;
     this.wasRestoredFromSnapshot = false;
+    this.serialHistory = "";
 
-    // Full shell recovery (stop → delay → start)
-    await this._dispatchRecoverShell(token);
+    const origin = this.lastOrigin || "";
+    const onSerial = this.onSerialOutput || (() => {});
+    const onState = this.onStateChange || (() => {});
+
+    // Cold start
+    this.initAbortController = new AbortController();
+    const abortSignal = this.initAbortController.signal;
+    this.initPromise = this._doStart(origin, onSerial, onState, undefined, abortSignal);
+    try {
+      await this.initPromise;
+    } finally {
+      this.initPromise = null;
+      this.initAbortController = null;
+    }
   }
 
   private _dispatchReattach(
@@ -489,6 +512,7 @@ export class VMController {
     initialState: ArrayBuffer | undefined,
     abortSignal: AbortSignal
   ): Promise<void> {
+    this.lastOrigin = origin;
     this.onSerialOutput = onSerial;
     this.onStateChange = onState;
 
@@ -529,6 +553,7 @@ export class VMController {
         }
 
         Logger.warn("VM", `Boot watchdog triggered. Stalled in state: ${state}`);
+        this.useMinimalFallback = true;
         this.orchestrator.triggerRecovery("boot timeout exceeded");
       }
     });
@@ -547,21 +572,85 @@ export class VMController {
         switch (type) {
           case "INIT_ACK":
             this.timeouts.cancel("init_watchdog");
-            this.timeouts.register("init_watchdog", 10000, async () => {
+            this.timeouts.register("init_watchdog", 12000, async () => {
               const currentState = this.lifecycle.getState().state;
               if (currentState === "loading") {
-                Logger.error("VM", "[INIT TIMEOUT] Worker received INIT but failed to complete asset loading / instantiation within 10s!");
+                Logger.error("VM", "[INIT TIMEOUT] Worker received INIT but failed to complete asset loading / instantiation!");
                 const activeGen = this.transport.getGenerationManager().getActiveGeneration();
                 this.dumpInitDiagnostics(activeGen ? activeGen.id : 0);
+                this.useMinimalFallback = true;
+                this.orchestrator.triggerRecovery("init watchdog timeout");
               }
             });
             Logger.info("VM", `[INIT_ACK] Worker acknowledged INIT receipt for generation ${payload && typeof payload === "object" && "generation" in payload ? (payload as { generation: number }).generation : "unknown"}`);
             break;
 
+          case "INIT_STAGE": {
+            const stagePayload = payload as { stage: string; ts: number };
+            const stage = stagePayload.stage;
+            this.timeouts.cancel("init_watchdog");
+            
+            // Phase-specific watchdog timeout durations
+            let timeoutMs = 12000; // default 12s
+            if (stage === "WASM_FETCH") timeoutMs = 25000;
+            else if (stage === "WASM_COMPILE") timeoutMs = 15000;
+            else if (stage === "BIOS_LOAD") timeoutMs = 15000;
+            else if (stage === "FS_LOAD") timeoutMs = 30000;
+            else if (stage === "EMULATOR_CREATE") timeoutMs = 10000;
+            else if (stage === "CPU_BOOT") timeoutMs = 15000;
+            else if (stage === "SERIAL_READY") timeoutMs = 10000;
+            
+            this.timeouts.register("init_watchdog", timeoutMs, async () => {
+              const currentState = this.lifecycle.getState().state;
+              if (currentState === "loading") {
+                Logger.error("VM", `[INIT TIMEOUT] Worker stalled during stage '${stage}'!`);
+                const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+                this.dumpInitDiagnostics(activeGen ? activeGen.id : 0);
+                this.useMinimalFallback = true;
+                this.orchestrator.triggerRecovery(`init watchdog timeout at stage ${stage}`);
+              }
+            });
+            Logger.info("VM", `[INIT_STAGE] Stage transitioned to ${stage}. Timeout registered for ${timeoutMs}ms.`);
+            break;
+          }
+
+          case "INIT_PROGRESS": {
+            const stats = payload as {
+              ts: number;
+              stage: string;
+              jsHeapLimit: number;
+              totalJSHeap: number;
+              usedJSHeap: number;
+              deviceMemory?: number;
+              emulatorRam?: number;
+              emulatorVgaRam?: number;
+            };
+            // Extend/reset active init watchdog timeout to keep alive
+            this.timeouts.extend("init_watchdog", 12000);
+            Logger.debug("VM", `[INIT_PROGRESS] Worker heartbeat: stage=${stats.stage}, heap=${Math.round(stats.usedJSHeap / (1024 * 1024))}MB/${Math.round(stats.totalJSHeap / (1024 * 1024))}MB, limit=${Math.round(stats.jsHeapLimit / (1024 * 1024))}MB`);
+            break;
+          }
+
+          case "INIT_TELEMETRY": {
+            const telemetry = payload as {
+              wasmFetchDuration: number;
+              wasmCompileDuration: number;
+              biosLoadDuration: number;
+              filesystemImageLoadDuration: number;
+              initrdLoadDuration: number;
+              emulatorConstructorDuration: number;
+              cpuBootstrapDuration: number;
+              firstSerialOutputLatency: number;
+            };
+            Logger.info("VM", "[INIT TELEMETRY RECEIVED]", telemetry);
+            break;
+          }
+
           case "INIT_SUCCESS":
             this.timeouts.cancel("init_watchdog");
             this.initCompleteTimestamp = Date.now();
             Logger.info("VM", `[INIT_SUCCESS] Worker successfully initialized emulator. Latency: ${this.initCompleteTimestamp - this.initDispatchTimestamp}ms`);
+            this.useMinimalFallback = false; // Reset minimal boot fallback flag upon success
             if (!resolved) {
               resolved = true;
               resolve();
@@ -743,6 +832,8 @@ export class VMController {
           if (currentState === "loading") {
             Logger.error("VM", "[INIT TIMEOUT] VM initialization stalled (no INIT_ACK or INIT_SUCCESS) for more than 5s!");
             this.dumpInitDiagnostics(activeGenId);
+            this.useMinimalFallback = true;
+            this.orchestrator.triggerRecovery("INIT_ACK handshake timeout");
           }
         });
 
@@ -752,6 +843,7 @@ export class VMController {
           vga_memory_size: this.config.vgaMemoryLimitBytes,
           version: Date.now().toString(),
           initial_state: this.savedState || undefined,
+          minimal: this.useMinimalFallback,
         });
       }).catch((err) => {
         if (!resolved) {
