@@ -24,15 +24,131 @@ export class ProvisioningCompletionParser {
   private lastProcessedSequence = 0;
   private isExecutionMode = false;
   private currentPhaseTimestamp = Date.now();
+  private lastFeedTimestamp = Date.now();
+  private lastMarker = "none";
+
+  public getState() {
+    return this.state;
+  }
+
+  public getLastFeedTimestamp(): number {
+    return this.lastFeedTimestamp;
+  }
+
+  public getLastMarker(): string {
+    return this.lastMarker;
+  }
 
   public feed(data: string): { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] {
+    this.lastFeedTimestamp = Date.now();
     // Sanitize immediately to prevent replacement mismatches caused by ANSI codes or carriage returns
     this.buffer = this.sanitize(this.buffer + data);
     if (this.buffer.length > 8192) {
       this.buffer = this.buffer.slice(-8192);
     }
 
+    // 2. Parser Hard Barrier: ignore all FSM and VERIFYING/REVAL markers during EXECUTION_MODE
+    if (this.isExecutionMode) {
+      this.buffer = this.buffer.replace(/<<<(FSM|EXEC_REVAL|VERIFYING|MOUNTING):[^>]*>>>/g, (match) => {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Ignored stale FSM/verification marker during execution phase: ${match}`);
+        return "";
+      });
+    }
+
     const results: { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] = [];
+
+    // Parse standalone EXEC_START: <<<EXEC_START:id>>>
+    const execStartRegex = /<<<EXEC_START:(\d+)>>>/g;
+    let startMatch;
+    while ((startMatch = execStartRegex.exec(this.buffer)) !== null) {
+      const raw = startMatch[0];
+      const execId = parseInt(startMatch[1], 10);
+      this.lastMarker = "EXEC_START:" + execId;
+      
+      if (execId < this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale EXEC_START marker for past execId=${execId} (current=${this.currentExecId})`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+      
+      if (execId > this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] Monotonic execId progression (EXEC_START): ${this.currentExecId} -> ${execId}. Resetting parser state.`);
+        this.currentExecId = execId;
+        this.lastProcessedSequence = 0;
+        this.processedPackets.clear();
+        this.state = "IDLE";
+        this.isExecutionMode = true;
+        this.currentPhaseTimestamp = Date.now();
+      }
+
+      if (this.state === "IDLE" || this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_END" || this.state === "EXEC_START") {
+        const oldState = this.state;
+        this.state = "EXEC_START";
+        this.isExecutionMode = true;
+        results.push({ type: "exec_start", id: execId });
+        Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (EXEC_START): ${oldState} -> EXEC_START for execId=${execId}`);
+      }
+      this.buffer = this.buffer.replace(raw, "");
+    }
+
+    // Parse standalone EXEC_COMPLETE: <<<EXEC_COMPLETE:id:code>>>
+    const execCompleteRegex = /<<<EXEC_COMPLETE:(\d+):([^>]+)>>>/g;
+    let completeMatch;
+    while ((completeMatch = execCompleteRegex.exec(this.buffer)) !== null) {
+      const raw = completeMatch[0];
+      const execId = parseInt(completeMatch[1], 10);
+      const code = completeMatch[2];
+      this.lastMarker = "EXEC_COMPLETE:" + execId + ":" + code;
+
+      if (execId < this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale EXEC_COMPLETE marker for past execId=${execId} (current=${this.currentExecId})`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+
+      if (execId > this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] Monotonic execId progression (EXEC_COMPLETE): ${this.currentExecId} -> ${execId}. Resetting parser state.`);
+        this.currentExecId = execId;
+        this.lastProcessedSequence = 0;
+        this.processedPackets.clear();
+        this.state = "IDLE";
+        this.isExecutionMode = true;
+        this.currentPhaseTimestamp = Date.now();
+      }
+
+      const oldState = this.state;
+      if (code === "0") {
+        this.state = "SUCCESS";
+        results.push({ type: "complete", id: execId });
+        Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (EXEC_COMPLETE): ${oldState} -> SUCCESS for execId=${execId} (exit code 0)`);
+      } else {
+        this.state = "FAIL";
+        results.push({ type: "failed", id: execId });
+        Logger.error("VM", `[Provisioning FSM] State transition SUCCESS (EXEC_COMPLETE FAILURE): ${oldState} -> FAIL for execId=${execId}. Code: ${code}`);
+      }
+      this.buffer = this.buffer.replace(raw, "");
+    }
+
+    // Parse standalone LLVM_PROVISION_COMPLETE: <<<LLVM_PROVISION_COMPLETE>>> or <<<LLVM_PROVISION_COMPLETE:execId>>>
+    const llvmCompleteRegex = /<<<LLVM_PROVISION_COMPLETE(?::(\d+))?>>>/g;
+    let llvmMatch;
+    while ((llvmMatch = llvmCompleteRegex.exec(this.buffer)) !== null) {
+      const raw = llvmMatch[0];
+      const execId = llvmMatch[1] ? parseInt(llvmMatch[1], 10) : this.currentExecId;
+      this.lastMarker = "LLVM_PROVISION_COMPLETE:" + execId;
+
+      if (execId < this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale LLVM_PROVISION_COMPLETE marker for past execId=${execId} (current=${this.currentExecId})`);
+        this.buffer = this.buffer.replace(raw, "");
+        continue;
+      }
+
+      const oldState = this.state;
+      this.state = "SUCCESS";
+      results.push({ type: "complete", id: execId });
+      Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (LLVM_PROVISION_COMPLETE): ${oldState} -> SUCCESS for execId=${execId}`);
+      this.buffer = this.buffer.replace(raw, "");
+    }
 
     // Regex to match <<<PROTO:execId:sequence:ACTION(:reason)>>>
     const protoRegex = /<<<PROTO:(\d+):(\d+):([A-Z_]+)(?::([^>]*))?>>>/g;
@@ -53,10 +169,11 @@ export class ProvisioningCompletionParser {
 
     for (const item of matchesToReplace) {
       const { raw, action, execId, sequence, reason } = item;
+      this.lastMarker = "PROTO:" + execId + ":" + action;
 
       // 1. Monotonic Execution ID constraint
       if (execId < this.currentExecId) {
-        Logger.warn("VM", `[Provisioning FSM] Ignored stale execution packet '${action}' for past execId=${execId} (current=${this.currentExecId})`);
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Replay fragment ignored (stale/out-of-order): ${action} (seq=${sequence}, execId=${execId}, currentExecId=${this.currentExecId})`);
         this.buffer = this.buffer.replace(raw, "");
         continue;
       }
@@ -71,12 +188,14 @@ export class ProvisioningCompletionParser {
         this.currentPhaseTimestamp = Date.now();
       }
 
-      // 2. Execution-Phase Parser Mode Isolation
+      // 2. Execution-Phase Parser Mode Isolation & Filtering
       const isVerificationAction = action === "BEGIN" || action === "FILE_VISIBLE" || action === "VERIFY_END";
-      if (this.isExecutionMode && isVerificationAction) {
-        Logger.warn("VM", `[Provisioning FSM] Ignored stale verification marker '${action}' (seq=${sequence}) during execution phase for execId=${execId}`);
-        this.buffer = this.buffer.replace(raw, "");
-        continue;
+      if (this.isExecutionMode) {
+        if (action !== "EXEC_START" && action !== "EXEC_COMPLETE" && action !== "LLVM_PROVISION_COMPLETE" && action !== "HEARTBEAT" && action !== "SHELL_READY" && action !== "FAIL") {
+          Logger.info("VM", `[Provisioning FSM] [Telemetry] Execution-only filter dropped: ${action} for execId=${execId}`);
+          this.buffer = this.buffer.replace(raw, "");
+          continue;
+        }
       }
 
       // 3. Packet Deduplication
@@ -147,7 +266,7 @@ export class ProvisioningCompletionParser {
         } else {
           rejectionReason = `FSM state not EXEC_START (current state: ${this.state})`;
         }
-      } else if (action === "EXEC_COMPLETE") {
+      } else if (action === "EXEC_COMPLETE" || action === "LLVM_PROVISION_COMPLETE") {
         if (this.state === "EXEC_START" || this.state === "VERIFY_END" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_BEGIN") {
           this.state = "SUCCESS";
           results.push({ type: "complete", id: execId });
@@ -204,7 +323,7 @@ export class ProvisioningCompletionParser {
   }
 
   public enterExecutionMode(): void {
-    Logger.info("VM", `[Provisioning FSM] Explicitly entering EXECUTION_MODE. Ignoring all future verification markers.`);
+    Logger.info("VM", `[Provisioning FSM] Explicitly entering EXECUTION_MODE. Ignoring all future FSM and verification markers.`);
     this.isExecutionMode = true;
   }
 
@@ -221,6 +340,8 @@ export class ProvisioningCompletionParser {
     this.lastProcessedSequence = 0;
     this.isExecutionMode = false;
     this.currentPhaseTimestamp = Date.now();
+    this.lastFeedTimestamp = Date.now();
+    this.lastMarker = "none";
   }
 }
 
@@ -332,6 +453,21 @@ export class ProvisioningController {
     // Absolute max execution time: 90 seconds
     this.execCompleteTimer = setTimeout(() => {
       Logger.error("VM", `[PROVISIONING TIMEOUT] Script execution timed out (exceeded 90s) for execId=${execId}`);
+      
+      // Capture diagnostics (Requirement 7)
+      const parserBuffer = (this.completionParser as unknown as { buffer: string }).buffer;
+      const parserState = this.completionParser.getState();
+      const diag = this.getDiagnostics();
+      
+      Logger.error("VM", `[PROVISIONING WATCHDOG EXECUTION TIMEOUT DIAGNOSTICS]`, {
+        activeExecId: execId,
+        parserState,
+        lastMarker: this.completionParser.getLastMarker(),
+        parserBufferLength: parserBuffer.length,
+        parserBufferSnippet: parserBuffer.slice(-1024),
+        diagnostics: diag
+      });
+
       this.handleProvisioningFailed(execId, this.activeBridgeGeneration);
     }, 90000);
   }
@@ -717,25 +853,53 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     Logger.info(
       "VM",
       `[PROVISIONING] PROVISION_READY received and guest visibility confirmed. File ${ready.filePath} written to VM FS. ` +
-      `Sending PROVISION_EXECUTE...`
+      `Entering serial stabilization and drain barrier...`
     );
     this.transitionTransportTo("awaiting_execute");
 
-    // Flush serial parser buffer and enter execution mode (Requirement 5, 10, 14)
-    this.completionParser.flush();
-    this.completionParser.enterExecutionMode();
+    const readyReceivedTime = Date.now();
+    const checkStabilizationAndExecute = () => {
+      if (ready.execId !== this.currentExecutionId || bridgeGeneration !== this.activeBridgeGeneration) {
+        Logger.warn("VM", `[PROVISIONING] Stabilization wait aborted: execId or generation changed.`);
+        return;
+      }
 
-    // Start timer waiting for execution to start
-    this._startExecStartTimer(ready.execId);
+      const now = Date.now();
+      const lastFeed = this.completionParser.getLastFeedTimestamp();
+      const silenceDuration = now - lastFeed;
+      const totalWait = now - readyReceivedTime;
 
-    // Send execution trigger — worker will write single serial command
-    this.onPostMessage("PROVISION_EXECUTE", {
-      execId: this.currentExecutionId,
-      generation: this.activeBridgeGeneration,
-      filePath: ready.filePath,
-      verifiedInode: ready.telemetry?.verifiedInode || "unknown",
-      fallbackRequired: false
-    });
+      // If we have had at least 400ms of silence, OR we've waited a maximum of 2500ms
+      if (silenceDuration >= 400 || totalWait >= 2500) {
+        Logger.info(
+          "VM",
+          `[PROVISIONING] Serial buffer stabilized. Silence duration: ${silenceDuration}ms, Total wait: ${totalWait}ms. ` +
+          `Draining serial parser buffer and entering EXECUTION_MODE.`
+        );
+
+        // Flush serial parser buffer and enter execution mode (serial replay drain barrier)
+        this.completionParser.flush();
+        this.completionParser.enterExecutionMode();
+
+        // Start timer waiting for execution to start
+        this._startExecStartTimer(ready.execId);
+
+        // Send execution trigger — worker will write single serial command
+        this.onPostMessage("PROVISION_EXECUTE", {
+          execId: this.currentExecutionId,
+          generation: this.activeBridgeGeneration,
+          filePath: ready.filePath,
+          verifiedInode: ready.telemetry?.verifiedInode || "unknown",
+          fallbackRequired: false
+        });
+      } else {
+        // Check again in 100ms
+        setTimeout(checkStabilizationAndExecute, 100);
+      }
+    };
+
+    // Kick off stabilization check
+    setTimeout(checkStabilizationAndExecute, 100);
   }
 
   // ─── Completion / failure handlers ────────────────────────────────────────

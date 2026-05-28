@@ -1523,10 +1523,20 @@ self.onmessage = async function (e) {
       WorkerProvisioner.transitionTo("executing");
       log("info", "[WorkerProvisioner] Executing via direct file path: " + execFilePath);
 
-      // 3. Atomic execution path
+      // 3. Atomic execution path with EXEC_START and failure capture (Requirement 5 & 6)
       var triggerCmd =
         "stty -echo 2>/dev/null\n" +
-        "sh -c \"test -f '" + execFilePath + "' && exec sh '" + execFilePath + "'\"\n";
+        "sh -c '_exec_completed=0; " +
+        "trap '\''_code=$?; if [ \"$_exec_completed\" -eq 0 ]; then echo \"<<<EXEC_COMPLETE:" + execExecId + ":err_$_code>>>\" > /dev/ttyS0; fi'\'' EXIT INT TERM HUP; " +
+        "echo \"<<<EXEC_START:" + execExecId + ">>>\" > /dev/ttyS0; " +
+        "if [ ! -f '\''" + execFilePath + "'\'' ]; then " +
+        "echo \"<<<EXEC_COMPLETE:" + execExecId + ":nofile>>>\" > /dev/ttyS0; " +
+        "_exec_completed=1; exit 1; " +
+        "fi; " +
+        "sh '\''" + execFilePath + "'\''; " +
+        "_code=$?; " +
+        "echo \"<<<EXEC_COMPLETE:" + execExecId + ":$_code>>>\" > /dev/ttyS0; " +
+        "_exec_completed=1;' \n";
 
       var sent = SerialChannelManager.send(0, triggerCmd);
       if (sent) {
