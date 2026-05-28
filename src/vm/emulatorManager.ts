@@ -1,4 +1,4 @@
-// src/vm/emulatorManager.ts
+﻿// src/vm/emulatorManager.ts
 import { VMLifecycleManager } from "./vmLifecycle";
 import { ResourceLimitsValidator } from "./resourceLimits";
 import { VMSessionConfig, VMStateName, VMSnapshotMetadata } from "../lib/types";
@@ -163,6 +163,13 @@ export class VMController {
   private pendingOnVerified: (() => void) | null = null;
   private pendingOnVisibilityError: (() => void) | null = null;
   private verifyingFilePath = "";
+
+  // FILE_MATERIALIZATION_VERIFIED handler
+  // When the worker confirms host-side 9p write success, we bypass the serial
+  // visibility poll and fire this callback directly.
+  private pendingMaterializationVerified: (() => void) | null = null;
+  private pendingMaterializationFailed: (() => void) | null = null;
+  private mountPrepareVerified = false;
 
   private lastOrigin: string = "";
   private useMinimalFallback: boolean = false;
@@ -875,6 +882,22 @@ export class VMController {
               this.lifecycle.transitionRecoveryTo("recovering", "Worker PROVISION_RECOVERING");
             }
             break;
+
+          case "FILE_MATERIALIZATION_VERIFIED": {
+            // Worker confirmed host-side 9p filesystem write success.
+            // The file exists in the inode table with correct size.
+            // We can proceed directly to executing mount_prepare.sh.
+            const matPayload = payload as { path: string; inodeId: number; size: number; isReinject?: boolean };
+            Logger.info("VM", `[GUEST_FS_VISIBLE] FILE_MATERIALIZATION_VERIFIED: path=${matPayload.path}, inode=${matPayload.inodeId}, size=${matPayload.size}, isReinject=${matPayload.isReinject || false}`);
+            this.mountPrepareVerified = true;
+            if (this.pendingMaterializationVerified) {
+              const cb = this.pendingMaterializationVerified;
+              this.pendingMaterializationVerified = null;
+              this.pendingMaterializationFailed = null;
+              cb();
+            }
+            break;
+          }
         }
       }).then(() => {
         if (abortSignal.aborted) return;
@@ -1189,27 +1212,15 @@ export class VMController {
         // immediately. If not yet met, the transition will fire when they are.
         this._tryTransitionToInteractive("boot-complete-stable");
 
-        // Wait for FSM to reach "interactive" before starting file visibility verification.
+        // Wait for FSM to reach "interactive" before starting mount_prepare execution.
         // awaitFsmState() returns immediately if FSM is already "interactive" or beyond.
         void this.awaitFsmState("interactive").then(() => {
-          this.startFileVisibilityVerification(
-            "/root/.provision/mount_prepare.sh",
-            () => {
-              Logger.info("VM", "[PROVISIONING] mount_prepare.sh guest visibility verified. Starting mount stabilization.");
-              // FSM is already "interactive" here — sendProgrammaticInput will be allowed.
-              Logger.info("VM", "[PROVISIONING] Executing guest mount stabilization helper script...");
-              void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
-
-              this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
-                Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
-                this.handleVisibilityFailure();
-              });
-            },
-            () => {
-              Logger.error("VM", "[PROVISIONING] mount_prepare.sh guest visibility check timed out.");
-              this.handleVisibilityFailure();
-            }
-          );
+          // ARCHITECTURAL FIX: Do not poll the guest serial output for file visibility.
+          // The worker emits FILE_MATERIALIZATION_VERIFIED after confirming the host-side
+          // 9p inode write. We wait for that event (or a timeout), then directly execute
+          // mount_prepare.sh. The guest need not confirm the file before running it because
+          // mount_prepare.sh itself establishes the 9p mount that makes the file visible.
+          this._waitForMaterializationThenMount();
         });
 
         this.provisioningSearchBuffer = "";
@@ -1871,7 +1882,103 @@ export class VMController {
     );
     this.healthMonitor.start();
   }
- 
+
+  /**
+   * Wait for FILE_MATERIALIZATION_VERIFIED from the worker, then execute mount_prepare.sh.
+   *
+   * Replaces the old serial-echo visibility poll (startFileVisibilityVerification).
+   *
+   * Flow:
+   *   1. If FILE_MATERIALIZATION_VERIFIED already arrived (mountPrepareVerified), proceed immediately.
+   *   2. Otherwise register a pending callback fired by the message handler.
+   *   3. A 10-second timeout guard triggers PROVISIONING_REINJECTION on failure.
+   */
+  private _waitForMaterializationThenMount(): void {
+    const executeMountScript = () => {
+      Logger.info("VM", "[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Executing mount_prepare.sh in guest.");
+      void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+      this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
+        Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
+        this.handleVisibilityFailure();
+      });
+    };
+
+    if (this.mountPrepareVerified) {
+      Logger.info("VM", "[PROVISIONING] mount_prepare.sh already materialized (fast path). Executing immediately.");
+      executeMountScript();
+      return;
+    }
+
+    Logger.info("VM", "[PROVISIONING] Waiting for FILE_MATERIALIZATION_VERIFIED from worker...");
+
+    this.pendingMaterializationVerified = executeMountScript;
+    this.pendingMaterializationFailed = () => {
+      Logger.error("VM", "[PROVISIONING] Materialization verification failed. Triggering PROVISIONING_REINJECTION.");
+      this.handleVisibilityFailure();
+    };
+
+    this.timeouts.register("materialization_watchdog", 10000, () => {
+      if (this.pendingMaterializationVerified) {
+        Logger.error("VM", "[PROVISIONING] materialization_watchdog fired: FILE_MATERIALIZATION_VERIFIED not received within 10s.");
+        this.dumpMaterializationDiagnostics();
+        const cb = this.pendingMaterializationFailed;
+        this.pendingMaterializationVerified = null;
+        this.pendingMaterializationFailed = null;
+        if (cb) cb();
+      }
+    });
+  }
+
+  private dumpMaterializationDiagnostics(): void {
+    Logger.error("VM", "=== MATERIALIZATION DIAGNOSTICS ===");
+    Logger.error("VM", `  - mountPrepareVerified: ${this.mountPrepareVerified}`);
+    Logger.error("VM", `  - FSM state: ${this.lifecycle.getState().state}`);
+    Logger.error("VM", `  - Provisioning state: ${this.provisioning.getState()}`);
+    Logger.error("VM", `  - Last serial output age: ${Date.now() - this.lastSerialOutputTimestamp}ms`);
+    Logger.error("VM", `  - Worker generation valid: ${this.transport.getGenerationManager().getActiveGeneration()?.isValid}`);
+    Logger.error("VM", "  - [ACTION] Will trigger PROVISION_REINJECT to re-inject mount_prepare.sh via worker message channel.");
+    Logger.error("VM", "===================================");
+  }
+
+  /**
+   * Handle file visibility / materialization failure.
+   *
+   * Old behavior: trigger generic recovery (TTY -> shell -> serial -> soft reboot -> cold boot).
+   * New behavior: trigger targeted PROVISIONING_REINJECTION via PROVISION_REINJECT worker message,
+   * which reruns create_file() for mount_prepare.sh without touching TTY/shell/serial.
+   * Only escalates to full recovery chain if reinject itself fails.
+   */
+  private handleVisibilityFailure(): void {
+    Logger.error("VM", "[PROVISIONING] handleVisibilityFailure: Triggering PROVISIONING_REINJECTION (targeted file reinject).");
+    Logger.error("VM", "[PROVISIONING] This targets the host-side 9p file injection layer, NOT the TTY/shell/serial transport.");
+
+    this.timeouts.cancel("mount_stabilization_watchdog");
+    this.pendingMaterializationVerified = null;
+    this.pendingMaterializationFailed = null;
+    this.mountPrepareVerified = false;
+
+    this.transport.post("PROVISION_REINJECT", { path: "/root/.provision/mount_prepare.sh" });
+
+    this.pendingMaterializationVerified = () => {
+      Logger.info("VM", "[PROVISIONING] File reinjection confirmed. Re-executing mount_prepare.sh.");
+      void this.sendProgrammaticInput(0, "sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n");
+      void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+      this.timeouts.register("mount_stabilization_watchdog", 20000, () => {
+        Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired after reinject. Escalating to generic recovery.");
+        this.orchestrator.triggerRecovery("file reinject mount stabilization timeout");
+      });
+    };
+
+    this.timeouts.register("reinject_watchdog", 15000, () => {
+      if (this.pendingMaterializationVerified) {
+        Logger.error("VM", "[PROVISIONING] reinject_watchdog fired: PROVISION_REINJECT did not complete within 15s. Escalating.");
+        this.pendingMaterializationVerified = null;
+        this.pendingMaterializationFailed = null;
+        this.orchestrator.triggerRecovery("provisioning reinjection timeout");
+      }
+    });
+  }
+
   public startFileVisibilityVerification(filePath: string, onVerified: () => void, onError: () => void) {
     if (this.fileVisibilityTimer) {
       clearTimeout(this.fileVisibilityTimer);
@@ -1882,7 +1989,6 @@ export class VMController {
     this.verifyingFilePath = filePath;
     this.pendingOnVerified = onVerified;
     this.pendingOnVisibilityError = onError;
-    
     this.pollFileVisibility();
   }
 
@@ -1900,28 +2006,13 @@ export class VMController {
       }
       return;
     }
-
     Logger.info("VM", `[PROVISIONING WATCHDOG] Polling guest visibility for ${this.verifyingFilePath} (attempt ${this.fileVisibilityRetries})...`);
-    
     const checkCmd = `sync; echo 3 > /proc/sys/vm/drop_caches; [ -f "${this.verifyingFilePath}" ] && [ -s "${this.verifyingFilePath}" ] && [ -x "${this.verifyingFilePath}" ] && echo '<<<PROVISION_FILES_VISIBLE>>>'\n`;
     void this.sendProgrammaticInput(0, checkCmd);
-
     const delay = Math.min(1000 + (this.fileVisibilityRetries * 250), 3000);
     this.fileVisibilityTimer = setTimeout(() => {
       this.pollFileVisibility();
     }, delay);
-  }
-
-  private runVisibilityDiagnostics() {
-    Logger.error("VM", "[PROVISIONING WATCHDOG] Visibility timeout reached. Running diagnostics...");
-    void this.sendProgrammaticInput(0, "ls -la /root/.provision\n");
-    void this.sendProgrammaticInput(0, "ls -la /mnt/9p/root/.provision\n");
-    void this.sendProgrammaticInput(0, "cat /proc/mounts\n");
-  }
-
-  private handleVisibilityFailure() {
-    this.runVisibilityDiagnostics();
-    this.orchestrator.triggerRecovery("file visibility timeout");
   }
 
   private stopHealthMonitoring(): void {
