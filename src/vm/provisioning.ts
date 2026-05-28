@@ -699,13 +699,24 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
         `[PROVISIONING TELEMETRY] FS Ready: ${ready.telemetry.fsReadyTimestamp}, ` +
         `Write Latency: ${ready.telemetry.writeLatencyMs}ms, Path: ${ready.telemetry.filePath}, ` +
         `Size: ${ready.telemetry.fileSize} bytes, Verified: ${ready.telemetry.verified}, ` +
-        `GuestVisible: ${ready.telemetry.guestVisible ?? "n/a"}, FallbackRequired: ${ready.telemetry.fallbackRequired ?? "n/a"}`
+        `GuestVisible: ${ready.telemetry.guestVisible ?? "n/a"}, FallbackRequired: ${ready.telemetry.fallbackRequired ?? "n/a"}` +
+        (ready.telemetry.mountSuccess !== undefined ? `, MountSuccess: ${ready.telemetry.mountSuccess}, PropLatency: ${ready.telemetry.propagationLatencyMs}ms, Retries: ${ready.telemetry.retryCount}, VisTiming: ${ready.telemetry.guestVisibilityTimingMs}ms, Remounts: ${ready.telemetry.remountAttempts}` : "")
       );
     }
+
+    // Execution barrier: Do NOT execute provisioning until GuestVisible=true is confirmed
+    if (!ready.telemetry || !ready.telemetry.guestVisible) {
+      Logger.error(
+        "VM",
+        `[PROVISIONING BARRIER] Execution blocked. Guest visibility check failed (GuestVisible=false).`
+      );
+      this.handleProvisioningFailed(ready.execId, this.activeBridgeGeneration);
+      return;
+    }
+
     Logger.info(
       "VM",
-      `[PROVISIONING] PROVISION_READY received. File ${ready.filePath} written to VM FS. ` +
-      `Fallback mode: ${ready.telemetry?.fallbackRequired ? "ENABLED" : "DISABLED"}. ` +
+      `[PROVISIONING] PROVISION_READY received and guest visibility confirmed. File ${ready.filePath} written to VM FS. ` +
       `Sending PROVISION_EXECUTE...`
     );
     this.transitionTransportTo("awaiting_execute");
@@ -722,7 +733,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       execId: this.currentExecutionId,
       generation: this.activeBridgeGeneration,
       filePath: ready.filePath,
-      fallbackRequired: ready.telemetry?.fallbackRequired || false
+      fallbackRequired: false
     });
   }
 

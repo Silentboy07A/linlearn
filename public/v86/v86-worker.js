@@ -660,7 +660,7 @@ var WorkerProvisioner = {
 
     await emu.create_file(filePath, bytes);
     
-    // Integrity verification FSM step
+    // Worker-side filesystem integrity verification
     this.transitionTo("verifying");
     var fs = emu.fs9p;
     var search = fs.SearchPath(filePath);
@@ -682,6 +682,11 @@ var WorkerProvisioner = {
 
     log("info", "[WorkerProvisioner] WorkerFS write verified. Size: " + bytes.length + " bytes. Latency: " + (Date.now() - startTime) + "ms");
 
+    // FS propagation delay: give virtio-9p driver time to sync the inode
+    // to the guest namespace before the visibility probe runs.
+    log("info", "[WorkerProvisioner] Waiting 500ms for 9p FS propagation to guest namespace...");
+    await new Promise(function(r) { setTimeout(r, 500); });
+
     // Guest namespace synchronization & verification step
     var guestVerification = await this.verifyGuestVisibility(emu, filePath, this.execId);
     
@@ -697,7 +702,12 @@ var WorkerProvisioner = {
       fileSize: bytes.length,
       verified: true,
       guestVisible: guestVerification.visible,
-      fallbackRequired: !guestVerification.visible
+      fallbackRequired: !guestVerification.visible,
+      mountSuccess: guestVerification.telemetry ? guestVerification.telemetry.mountSuccess : false,
+      propagationLatencyMs: guestVerification.telemetry ? guestVerification.telemetry.propagationLatencyMs : -1,
+      retryCount: guestVerification.telemetry ? guestVerification.telemetry.retryCount : 0,
+      guestVisibilityTimingMs: guestVerification.telemetry ? guestVerification.telemetry.guestVisibilityTimingMs : -1,
+      remountAttempts: guestVerification.telemetry ? guestVerification.telemetry.remountAttempts : 0
     };
   },
 
@@ -712,116 +722,277 @@ var WorkerProvisioner = {
   },
 
   /**
-   * Verify if a file is visible inside the guest Linux namespace.
+   * MountVisibilityFSM — deterministic 9p mount, verify, and retry state machine.
+   *
+   * States: MOUNTING -> VERIFYING -> RETRY_VERIFY -> REMOUNT -> VERIFIED | FALLBACK
+   *
+   * Rules:
+   *  - Check /proc/mounts first; skip mount if already mounted.
+   *  - Retry verification up to MAX_VERIFY_RETRIES times before trying remount.
+   *  - Remount once (unmount + mount) before declaring FALLBACK.
+   *  - Log mount latency, verify retry count, propagation timing.
+   *  - On verify failure: dump /proc/mounts, ls /mnt/9p, stat <file> for diagnostics.
+   *
+   * Always resolves — never rejects. Returns { visible: bool, elapsedMs: number }.
    */
   verifyGuestVisibility: function(emu, filePath, execId) {
-    return new Promise(function(resolve) {
-      log("info", "[WorkerProvisioner] Initiating guest-visible verification for: " + filePath);
-      
-      var rawBuffer = "";
-      var parserState = "awaiting_verify_begin";
-      var visible = false;
-      var finished = false;
-      var startVerifyTime = Date.now();
-      var checkTimer = null;
-      var listener;
+    var MAX_VERIFY_RETRIES = 6;
+    var CMD_TIMEOUT_MS = 8000;
+    var fsmState = "MOUNTING";
+    var startTime = Date.now();
+    var verifyAttempt = 0;
+    var mountStartTime = 0;
+    var finished = false;
+    var rawBuffer = "";
+    var parserState = "idle";
+    var cmdTimeout = null;
+    var listener = null;
 
-      function finalizeVerification(result) {
+    // Telemetry fields
+    var mountSuccess = false;
+    var propagationLatencyMs = -1;
+    var retryCount = 0;
+    var guestVisibilityTimingMs = -1;
+    var remountAttemptsCount = 0;
+
+    log("info", "[MountVisibilityFSM] Starting for path: " + filePath + " execId=" + execId);
+
+    return new Promise(function(resolve) {
+      function done(visible) {
         if (finished) return;
         finished = true;
-        if (checkTimer) {
-          clearInterval(checkTimer);
+        if (cmdTimeout) clearTimeout(cmdTimeout);
+        if (listener) emu.remove_listener("serial0-output-byte", listener);
+        var elapsed = Date.now() - startTime;
+        if (visible) {
+          propagationLatencyMs = elapsed;
         }
-        if (listener) {
-          emu.remove_listener("serial0-output-byte", listener);
-        }
-        log("info", "[WorkerProvisioner] Guest visibility verification finished. Result visible: " + result + " after " + (Date.now() - startVerifyTime) + "ms.");
-        resolve({ visible: result, elapsedMs: Date.now() - startVerifyTime });
+        guestVisibilityTimingMs = elapsed;
+
+        log("info", "[MountVisibilityFSM TELEMETRY] Resolved visible=" + visible + 
+                   " | mountSuccess=" + mountSuccess +
+                   " | propagationLatency=" + (propagationLatencyMs !== -1 ? propagationLatencyMs + "ms" : "N/A") +
+                   " | retryCount=" + retryCount +
+                   " | guestVisibilityTiming=" + guestVisibilityTimingMs + "ms" +
+                   " | remountAttempts=" + remountAttemptsCount);
+
+        resolve({
+          visible: visible,
+          elapsedMs: elapsed,
+          telemetry: {
+            mountSuccess: mountSuccess,
+            propagationLatencyMs: propagationLatencyMs,
+            retryCount: retryCount,
+            guestVisibilityTimingMs: guestVisibilityTimingMs,
+            remountAttempts: remountAttemptsCount
+          }
+        });
       }
 
+      function armTimeout(ms) {
+        if (cmdTimeout) clearTimeout(cmdTimeout);
+        cmdTimeout = setTimeout(function() {
+          log("warn", "[MountVisibilityFSM] Command timeout after " + ms + "ms in state " + fsmState +
+                     ". Buffer: " + JSON.stringify(rawBuffer.slice(-512)));
+          advance("TIMEOUT");
+        }, ms);
+      }
+
+      // Parse serial output byte-by-byte, accumulate rawBuffer, scan for FSM markers
       listener = function(byte) {
-        var char = String.fromCharCode(byte);
-        rawBuffer += char;
-        // Keep rawBuffer size under control to avoid memory leakage/slowdown
-        if (rawBuffer.length > 4096) {
-          rawBuffer = rawBuffer.slice(-4096);
-        }
-        
-        // Strip ANSI escapes and carriage returns for protocol checks
-        var sanitized = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
-        
-        // Process FSM states
-        var beginMarker = "<<<PROTO:" + execId + ":1:BEGIN>>>";
-        var visibleMarker = "<<<PROTO:" + execId + ":2:FILE_VISIBLE>>>";
-        var endMarker = "<<<PROTO:" + execId + ":3:VERIFY_END>>>";
-        
-        if (parserState === "awaiting_verify_begin") {
-          var beginIdx = sanitized.indexOf(beginMarker);
-          if (beginIdx !== -1) {
-            parserState = "awaiting_visibility";
-            log("info", "[WorkerProvisioner] FSM state: awaiting_verify_begin -> awaiting_visibility");
-          }
-        }
-        
-        if (parserState === "awaiting_visibility") {
-          var beginIdx = sanitized.indexOf(beginMarker);
-          var searchArea = beginIdx !== -1 ? sanitized.substring(beginIdx + beginMarker.length) : sanitized;
-          
-          if (searchArea.indexOf(visibleMarker) !== -1) {
-            visible = true;
-            parserState = "awaiting_verify_end";
-            log("info", "[WorkerProvisioner] FSM state: awaiting_visibility -> awaiting_verify_end. Guest file verified.");
-          } else if (searchArea.indexOf(endMarker) !== -1) {
-            visible = false;
-            parserState = "complete";
-            log("info", "[WorkerProvisioner] FSM state: awaiting_visibility -> complete. Guest file not found.");
-            finalizeVerification(visible);
-          }
-        }
-        
-        if (parserState === "awaiting_verify_end") {
-          var beginIdx = sanitized.indexOf(beginMarker);
-          var searchArea = beginIdx !== -1 ? sanitized.substring(beginIdx + beginMarker.length) : sanitized;
-          
-          if (searchArea.indexOf(endMarker) !== -1) {
-            parserState = "complete";
-            log("info", "[WorkerProvisioner] FSM state: awaiting_verify_end -> complete. Verification complete.");
-            finalizeVerification(visible);
+        if (finished) return;
+        rawBuffer += String.fromCharCode(byte);
+        if (rawBuffer.length > 8192) rawBuffer = rawBuffer.slice(-8192);
+        var buf = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
+
+        var tag = "FSM:" + execId + ":" + fsmState;
+        var okMarker  = "<<<" + tag + ":OK>>>";
+        var errMarker = "<<<" + tag + ":ERR>>>";
+        var visMarker = "<<<" + tag + ":VIS>>>";
+        var noVisMarker = "<<<" + tag + ":NOVIS>>>";
+        var diagDoneMarker = "<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>";
+
+        if (parserState === "waiting") {
+          if (fsmState === "DIAGNOSTICS" && buf.indexOf(diagDoneMarker) !== -1) {
+            var capturedBuf = buf;
+            parserState = "idle";
+            rawBuffer = "";
+            advance("DIAG_DONE", capturedBuf);
+          } else if (buf.indexOf(okMarker) !== -1) {
+            parserState = "idle";
+            rawBuffer = "";
+            advance("OK");
+          } else if (buf.indexOf(errMarker) !== -1) {
+            parserState = "idle";
+            rawBuffer = "";
+            advance("ERR");
+          } else if (buf.indexOf(visMarker) !== -1) {
+            parserState = "idle";
+            rawBuffer = "";
+            advance("VIS");
+          } else if (buf.indexOf(noVisMarker) !== -1) {
+            parserState = "idle";
+            rawBuffer = "";
+            advance("NOVIS");
           }
         }
       };
-      
       emu.add_listener("serial0-output-byte", listener);
-      
-      // Build mount, copy, and test command wrapped in a single non-interactive sh -c block
-      // Prepended with stty -echo to prevent echoing the command characters to the serial port
-      var testCmd = 
-        "stty -echo\n" +
-        "sh -c 'PS1=\"\"; echo \"<<<PROTO:" + execId + ":1:BEGIN>>>\"; " +
-        "mkdir -p /mnt/9p /tmp 2>/dev/null; " +
-        "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-        "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-        "mount -t 9p host9p /mnt/9p 2>/dev/null; " +
-        "cp /mnt/9p" + filePath + " " + filePath + " 2>/dev/null; " +
-        "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null; " +
-        "chmod +x " + filePath + " 2>/dev/null; " +
-        "if [ -f " + filePath + " ]; then echo \"<<<PROTO:" + execId + ":2:FILE_VISIBLE>>>\"; fi; " +
-        "echo \"<<<PROTO:" + execId + ":3:VERIFY_END>>>\"'\n";
+
+      function sendCmd(script) {
+        rawBuffer = "";
+        parserState = "waiting";
+        SerialChannelManager.send(0, script);
+      }
+
+      // Build a tagged shell command. Uses PS1='' and stty -echo to suppress noise.
+      // Each command emits a unique marker: <<<FSM:<execId>:<STATE>:OK/ERR/VIS/NOVIS>>>
+      function makeTag(state, result) {
+        return "<<<FSM:" + execId + ":" + state + ":" + result + ">>>";
+      }
+
+      function doMount() {
+        fsmState = "MOUNTING";
+        mountStartTime = Date.now();
+        log("info", "[MountVisibilityFSM] MOUNTING: checking /proc/mounts then mounting host9p and polling readiness");
+        armTimeout(CMD_TIMEOUT_MS);
         
-      SerialChannelManager.send(0, testCmd);
-      
-      var timeout = 6000; // 6 seconds timeout
-      checkTimer = setInterval(function() {
-        var elapsed = Date.now() - startVerifyTime;
-        if (elapsed >= timeout) {
-          var sanitizedOutput = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
-          log("warn", "[WorkerProvisioner] Guest visibility verification timed out. " +
-                      "Raw buffer: " + JSON.stringify(rawBuffer) + " | " +
-                      "Sanitized: " + JSON.stringify(sanitizedOutput) + " | " +
-                      "FSM State: " + parserState);
-          finalizeVerification(false);
+        var cmd =
+          "stty -echo 2>/dev/null; PS1=''; " +
+          "check_mnt() { [ -d /mnt/9p ] && stat /mnt/9p >/dev/null 2>&1 && ls /mnt/9p >/dev/null 2>&1; }; " +
+          "if ! grep -q host9p /proc/mounts 2>/dev/null; then " +
+          "mkdir -p /mnt/9p 2>/dev/null; " +
+          "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p host9p /mnt/9p 2>/dev/null; fi; " +
+          "i=0; ok=0; " +
+          "while [ $i -lt 15 ]; do " +
+          "if check_mnt; then ok=1; break; fi; " +
+          "sleep 0.2; i=$((i+1)); done; " +
+          "if [ $ok -eq 1 ]; then " +
+          "echo '" + makeTag("MOUNTING", "OK") + "'; " +
+          "else echo '" + makeTag("MOUNTING", "ERR") + "'; fi\n";
+          
+        sendCmd(cmd);
+      }
+
+      function doVerify() {
+        fsmState = "VERIFYING";
+        verifyAttempt++;
+        retryCount = verifyAttempt;
+        
+        // Calculate exponential backoff delay: base 300ms, backoff factor 2, capped at 4000ms
+        var delay = Math.min(4000, 300 * Math.pow(2, verifyAttempt - 1));
+        log("info", "[MountVisibilityFSM] VERIFYING attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES + " for " + filePath + " after delay of " + delay + "ms");
+        
+        setTimeout(function() {
+          if (finished) return;
+          armTimeout(CMD_TIMEOUT_MS);
+          var cmd =
+            "stty -echo 2>/dev/null; PS1=''; " +
+            "if [ -f '" + filePath + "' ] && stat '" + filePath + "' >/dev/null 2>&1 && ls '" + filePath + "' >/dev/null 2>&1 && cat '" + filePath + "' >/dev/null 2>&1; then " +
+            "echo '" + makeTag("VERIFYING", "VIS") + "'; " +
+            "else echo '" + makeTag("VERIFYING", "NOVIS") + "'; fi\n";
+          sendCmd(cmd);
+        }, delay);
+      }
+
+      function doRemount() {
+        fsmState = "REMOUNT";
+        remountAttemptsCount++;
+        log("info", "[MountVisibilityFSM] REMOUNT: unmounting and remounting host9p and polling readiness");
+        armTimeout(CMD_TIMEOUT_MS);
+        
+        var cmd =
+          "stty -echo 2>/dev/null; PS1=''; " +
+          "check_mnt() { [ -d /mnt/9p ] && stat /mnt/9p >/dev/null 2>&1 && ls /mnt/9p >/dev/null 2>&1; }; " +
+          "umount /mnt/9p 2>/dev/null; " +
+          "mkdir -p /mnt/9p 2>/dev/null; " +
+          "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p host9p /mnt/9p 2>/dev/null; then " +
+          "i=0; ok=0; " +
+          "while [ $i -lt 15 ]; do " +
+          "if check_mnt; then ok=1; break; fi; " +
+          "sleep 0.2; i=$((i+1)); done; " +
+          "if [ $ok -eq 1 ]; then echo '" + makeTag("REMOUNT", "OK") + "'; " +
+          "else echo '" + makeTag("REMOUNT", "ERR") + "'; fi; " +
+          "else echo '" + makeTag("REMOUNT", "ERR") + "'; fi\n";
+          
+        sendCmd(cmd);
+      }
+
+      function doDiagnostics() {
+        fsmState = "DIAGNOSTICS";
+        log("warn", "[MountVisibilityFSM] Verification exhausted. Dumping namespace diagnostics.");
+        armTimeout(5000);
+        
+        var cmd =
+          "stty -echo 2>/dev/null; PS1=''; " +
+          "echo '[DIAG:MOUNT]'; mount 2>/dev/null || echo 'mount-failed'; " +
+          "echo '[DIAG:DF]'; df 2>/dev/null || echo 'df-failed'; " +
+          "echo '[DIAG:LS]'; ls -la /mnt/9p 2>/dev/null || echo 'ls-failed'; " +
+          "echo '[DIAG:STAT]'; stat '" + filePath + "' 2>/dev/null || echo 'stat-failed'; " +
+          "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>'\n";
+          
+        sendCmd(cmd);
+      }
+
+      function advance(event, extra) {
+        if (finished) return;
+        log("info", "[MountVisibilityFSM] State=" + fsmState + " Event=" + event);
+
+        if (fsmState === "MOUNTING") {
+          if (event === "OK") {
+            mountSuccess = true;
+            var mountLatency = Date.now() - mountStartTime;
+            log("info", "[MountVisibilityFSM] Mount OK. Latency: " + mountLatency + "ms. -> VERIFYING");
+            doVerify();
+          } else {
+            // Mount failed — try remount once, then fallback
+            if (remountAttemptsCount === 0) {
+              log("warn", "[MountVisibilityFSM] Initial mount failed. Attempting remount recovery.");
+              doRemount();
+            } else {
+              log("error", "[MountVisibilityFSM] Mount failed twice. -> FALLBACK");
+              done(false);
+            }
+          }
+        } else if (fsmState === "VERIFYING") {
+          if (event === "VIS") {
+            log("info", "[MountVisibilityFSM] File VISIBLE on attempt " + verifyAttempt + ". -> VERIFIED");
+            done(true);
+          } else if (event === "NOVIS" || event === "TIMEOUT") {
+            if (verifyAttempt < MAX_VERIFY_RETRIES) {
+              log("warn", "[MountVisibilityFSM] Not visible yet (attempt " + verifyAttempt + "). Retrying verify loop.");
+              doVerify();
+            } else if (remountAttemptsCount === 0) {
+              log("warn", "[MountVisibilityFSM] " + MAX_VERIFY_RETRIES + " verify attempts exhausted. Attempting remount.");
+              doRemount();
+            } else {
+              log("error", "[MountVisibilityFSM] All retries + remount exhausted. Triggering diagnostics.");
+              doDiagnostics();
+            }
+          } else {
+            done(false);
+          }
+        } else if (fsmState === "REMOUNT") {
+          if (event === "OK") {
+            log("info", "[MountVisibilityFSM] Remount OK. Resetting verify counter -> VERIFYING");
+            verifyAttempt = 0;
+            doVerify();
+          } else {
+            log("error", "[MountVisibilityFSM] Remount failed. Triggering diagnostics.");
+            doDiagnostics();
+          }
+        } else if (fsmState === "DIAGNOSTICS") {
+          log("warn", "[MountVisibilityFSM DIAGNOSTICS] Guest dump:\n" + (extra || ""));
+          done(false);
         }
-      }, 100);
+      }
+
+      // Kick off the FSM
+      doMount();
     });
   },
 
@@ -1217,30 +1388,18 @@ self.onmessage = async function (e) {
       var fallbackRequired = payload.fallbackRequired;
       WorkerProvisioner.transitionTo("executing");
       
-      var triggerCmd;
+      // Serial fallback streaming mode PERMANENTLY REMOVED.
+      // The MountVisibilityFSM guarantees the file is guest-visible via the full
+      // MOUNTING->VERIFYING->RETRY_VERIFY->REMOUNT->VERIFIED FSM before we reach
+      // PROVISION_EXECUTE. The 9p mount is already live at this point.
+      // Always use direct file execution — no heredoc injection, no echo flooding.
       if (fallbackRequired) {
-        log("warn", "[WorkerProvisioner] Guest visibility failed. Using serial streaming fallback mode.");
-        var scriptContent = WorkerProvisioner.assembleScript();
-        // Disable echo first, then stream script directly using a heredoc block.
-        // We write the script line-by-line using standard shell redirection.
-        triggerCmd = 
-          "stty -echo\n" +
-          "sh << 'EOF_PROVISION'\n" +
-          scriptContent + "\n" +
-          "EOF_PROVISION\n";
-      } else {
-        log("info", "[WorkerProvisioner] Guest visibility verified. Using local file execution mode: " + execFilePath);
-        triggerCmd = 
-          "stty -echo\n" +
-          "sh -c 'mkdir -p /mnt/9p /tmp 2>/dev/null; " +
-          "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p host9p /mnt/9p 2>/dev/null; " +
-          "cp /mnt/9p" + execFilePath + " " + execFilePath + " 2>/dev/null; " +
-          "cp /mnt/9p/tmp/fs.tar.gz /tmp/fs.tar.gz 2>/dev/null; " +
-          "chmod +x " + execFilePath + " 2>/dev/null; " +
-          "exec sh " + execFilePath + "'\n";
+        log("warn", "[WorkerProvisioner] fallbackRequired=true received but fallback streaming is disabled. Proceeding with direct execution.");
       }
+      log("info", "[WorkerProvisioner] Executing via direct file path: " + execFilePath);
+      var triggerCmd =
+        "stty -echo 2>/dev/null\n" +
+        "exec sh '" + execFilePath + "'\n";
 
       var sent = SerialChannelManager.send(0, triggerCmd);
       if (sent) {
@@ -1312,7 +1471,11 @@ function wrapV86Constructor() {
       this._v86_val = val;
       if (val) {
         log("info", "Intercepted internal ticker F instance creation. Applying safe tick ownership and guards.");
-        val.emuInstance = this; // Bind the V86 instance to the ticker!
+        // Capture _ownerGeneration ON THE TICKER at construction time.
+        // We cannot use emuInstance.generation because autostart fires ticks BEFORE
+        // createEmulator() stamps emulator.generation after the constructor returns.
+        val._ownerGeneration = workerGeneration;
+        val.emuInstance = this;
         patchTickerInstance(val);
       }
     }
@@ -1389,55 +1552,42 @@ function patchTickerInstance(ticker) {
 
   FProto.do_tick = function() {
     var emuInstance = this.emuInstance;
-    var tickGen = emuInstance ? emuInstance.generation : -1;
-    var activeGen = workerGeneration;
     var emu = emulator;
 
-    // 6. Add do_tick instrumentation
-    if (typeof doTickLogCount === "undefined") {
+    // Periodic instrumentation
+    if (typeof globalThis.doTickLogCount === "undefined") {
       globalThis.doTickLogCount = 0;
     }
     globalThis.doTickLogCount++;
     if (globalThis.doTickLogCount % 50000 === 0) {
-      log("debug", "[do_tick Instrumentation] Gen: " + tickGen + 
-                 " | ActiveGen: " + activeGen +
-                 " | Worker State: " + lifecycleState + 
-                 " | Worker Terminating? " + workerTerminating +
-                 " | Emu Destroyed? " + !!(emuInstance && emuInstance.destroyed));
+      log("debug", "[do_tick] State: " + lifecycleState +
+                 " | Terminating: " + workerTerminating +
+                 " | EmuDestroyed: " + !!(emuInstance && emuInstance.destroyed));
     }
 
-    // 2. Add generation ownership guards
-    if (tickGen !== activeGen) {
-      if (!this._warnedStaleGen) {
-        this._warnedStaleGen = true;
-        log("warn", "[do_tick GUARD] Rejected tick: Stale generation. Ticker gen: " + tickGen + ", Active gen: " + activeGen);
-      }
-      return;
-    }
-
-    // 5. Add worker termination barrier
+    // Termination barrier — checked first, cheapest exit
     if (workerTerminating) {
       if (!this._warnedTerminating) {
         this._warnedTerminating = true;
-        log("warn", "[do_tick GUARD] Rejected tick: Worker is terminating/destroyed.");
+        log("warn", "[do_tick GUARD] Rejected: worker is terminating.");
       }
       return;
     }
 
-    // 7. Add destroyed-instance guards
+    // Destroyed-instance guard
     if (!emuInstance || emuInstance.destroyed || !emu || emu.destroyed) {
       if (!this._warnedDestroyed) {
         this._warnedDestroyed = true;
-        log("warn", "[do_tick GUARD] Rejected tick: Emulator instance is destroyed/null.");
+        log("warn", "[do_tick GUARD] Rejected: emulator instance is destroyed/null.");
       }
       return;
     }
 
-    // 3. Prevent double tick scheduling
+    // Double-tick prevention
     if (this.isTickingNow) {
       if (!this._warnedDoubleTick) {
         this._warnedDoubleTick = true;
-        log("warn", "[do_tick GUARD] Rejected tick: Double tick loop detected.");
+        log("warn", "[do_tick GUARD] Rejected: double tick loop detected.");
       }
       return;
     }
@@ -1452,29 +1602,18 @@ function patchTickerInstance(ticker) {
 
   FProto.yield_callback = function(tickCount) {
     var emuInstance = this.emuInstance;
-    var tickGen = emuInstance ? emuInstance.generation : -1;
-    var activeGen = workerGeneration;
     var emu = emulator;
 
-    // 2. Add generation ownership guards
-    if (tickGen !== activeGen) {
-      if (!this._warnedStaleYieldGen) {
-        this._warnedStaleYieldGen = true;
-        log("warn", "[yield_callback GUARD] Rejected yield: Stale generation. Ticker gen: " + tickGen + ", Active gen: " + activeGen);
-      }
-      return;
-    }
-
-    // 5. Add worker termination barrier
+    // Termination barrier
     if (workerTerminating) {
       return;
     }
 
-    // 7. Add destroyed-instance guards
+    // Destroyed-instance guard
     if (!emuInstance || emuInstance.destroyed || !emu || emu.destroyed) {
       if (!this._warnedYieldDestroyed) {
         this._warnedYieldDestroyed = true;
-        log("warn", "[yield_callback GUARD] Rejected yield: Emulator instance is destroyed/null.");
+        log("warn", "[yield_callback GUARD] Rejected: emulator instance is destroyed/null.");
       }
       return;
     }

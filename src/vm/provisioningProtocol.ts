@@ -107,6 +107,11 @@ export interface ProvisionReadyPayload {
     verified: boolean;
     guestVisible?: boolean;
     fallbackRequired?: boolean;
+    mountSuccess?: boolean;
+    propagationLatencyMs?: number;
+    retryCount?: number;
+    guestVisibilityTimingMs?: number;
+    remountAttempts?: number;
   };
 }
 
