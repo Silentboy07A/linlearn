@@ -461,6 +461,27 @@ var WorkerProvisioner = {
   },
 
   /**
+   * Compute SHA-256 hash of a Uint8Array.
+   */
+  computeSHA256: async function(bytes) {
+    if (typeof crypto !== "undefined" && crypto.subtle) {
+      try {
+        var hashBuffer = await crypto.subtle.digest("SHA-256", bytes);
+        var hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+      } catch (e) {
+        log("warn", "[WorkerProvisioner] Subtle Crypto digest failed: " + e.message);
+      }
+    }
+    // Fallback: simple checksum converted to hex
+    var cs = 0;
+    for (var i = 0; i < bytes.length; i++) {
+      cs ^= bytes[i];
+    }
+    return cs.toString(16);
+  },
+
+  /**
    * Begin a new provisioning session.
    */
   begin: function(payload) {
@@ -634,18 +655,31 @@ var WorkerProvisioner = {
    */
   writeFile: async function(emu, filePath) {
     var startTime = Date.now();
-    await this.waitAndValidateFS(
-      emu, 
-      filePath, 
-      FilesystemAccessPolicy.SOURCES.PROVISIONING_SYSTEM, 
-      FilesystemAccessPolicy.OPERATIONS.WRITE_FILE
-    );
 
     this.transitionTo("writing");
     this.ensureParentDirectories(emu, filePath);
 
+    var fs = emu.fs9p;
+    if (!fs) {
+      throw new Error("fs9p is not initialized on emulator");
+    }
+
+    // Verify parent directory exists on host/worker side
+    var parentDir = filePath.substring(0, filePath.lastIndexOf("/"));
+    var parentSearch = fs.SearchPath(parentDir);
+    if (parentSearch.id === -1) {
+      throw new Error("Verification failed: Parent directory " + parentDir + " not created in 9p filesystem");
+    }
+
+    await this.waitAndValidateFS(
+      emu, 
+      filePath + ".tmp", 
+      FilesystemAccessPolicy.SOURCES.PROVISIONING_SYSTEM, 
+      FilesystemAccessPolicy.OPERATIONS.WRITE_FILE
+    );
+
     var script = this.assembleScript();
-    log("info", "[WorkerProvisioner] Writing " + script.length + " bytes to " + filePath + " via create_file()");
+    log("info", "[WorkerProvisioner] Writing " + script.length + " bytes to " + filePath + ".tmp via create_file()");
 
     var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
     var bytes;
@@ -658,26 +692,29 @@ var WorkerProvisioner = {
       }
     }
 
-    await emu.create_file(filePath, bytes);
+    await emu.create_file(filePath + ".tmp", bytes);
     
+    // Compute SHA-256 hash for guest-side integrity check
+    var sha256 = await this.computeSHA256(bytes);
+    log("info", "[WorkerProvisioner] Computed SHA-256 for assembly: " + sha256);
+
     // Worker-side filesystem integrity verification
     this.transitionTo("verifying");
-    var fs = emu.fs9p;
-    var search = fs.SearchPath(filePath);
+    var search = fs.SearchPath(filePath + ".tmp");
     
     if (search.id === -1) {
-      throw new Error("Verification failed: File not found in 9p filesystem after write");
+      throw new Error("Verification failed: Temp file not found in 9p filesystem after write");
     }
     
     var inode = fs.GetInode(search.id);
     if (inode.size !== bytes.length) {
-      throw new Error("Verification failed: File size mismatch. Wrote " + bytes.length + ", got " + inode.size);
+      throw new Error("Verification failed: Temp file size mismatch. Wrote " + bytes.length + ", got " + inode.size);
     }
 
     // Try reading it back to verify readability
-    var readData = await emu.read_file(filePath);
+    var readData = await emu.read_file(filePath + ".tmp");
     if (!readData || readData.length !== bytes.length) {
-      throw new Error("Verification failed: File could not be read back or length mismatch");
+      throw new Error("Verification failed: Temp file could not be read back or length mismatch");
     }
 
     log("info", "[WorkerProvisioner] WorkerFS write verified. Size: " + bytes.length + " bytes. Latency: " + (Date.now() - startTime) + "ms");
@@ -692,7 +729,7 @@ var WorkerProvisioner = {
     // dispatch via short single-line tty commands ("sh /root/.provision/prov_XXX_N.sh")
     // instead of inline compound shell programs that trigger PS2 continuation deadlocks.
     log("info", "[WorkerProvisioner] Pre-writing FSM helper scripts via create_file()...");
-    await this.prepareHelperScripts(emu, this.execId, filePath);
+    await this.prepareHelperScripts(emu, this.execId, filePath + ".tmp", sha256);
 
     // Guest namespace synchronization & verification step
     var guestVerification = await this.verifyGuestVisibility(emu, filePath, this.execId);
@@ -750,7 +787,7 @@ var WorkerProvisioner = {
    * Each script is short, self-contained, and emits a single FSM marker to /dev/ttyS0.
    * The tty then only receives: "sh /root/.provision/prov_XXX_N.sh\n" (one short line).
    */
-  prepareHelperScripts: async function(emu, execId, filePath) {
+  prepareHelperScripts: async function(emu, execId, filePath, sha256) {
     var base = "/root/.provision";
     var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
 
@@ -788,18 +825,10 @@ var WorkerProvisioner = {
       "  mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null ||\n" +
       "  mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
       "fi\n" +
-      "# Poll until /mnt/9p is accessible with debounce\n" +
-      "i=0; ok=0\n" +
-      "while [ $i -lt 15 ]; do\n" +
-      "  if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
-      "    sleep 1\n" +
-      "    if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
-      "      ok=1; break\n" +
-      "    fi\n" +
-      "  fi\n" +
-      "  sleep 1; i=$((i+1))\n" +
-      "done\n" +
-      "if [ $ok -eq 1 ]; then\n" +
+      "# Symlink setup\n" +
+      "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "sync\n" +
+      "if [ -d /root/.provision ]; then\n" +
       "  echo '" + makeTag("MOUNTING", "OK") + "' > /dev/ttyS0\n" +
       "else\n" +
       "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0\n" +
@@ -812,9 +841,22 @@ var WorkerProvisioner = {
       "#!/bin/sh\n" +
       "stty -echo > /dev/null 2>&1\n" +
       "sync\n" +
-      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1 && cat '" + fp + "' > /dev/null 2>&1; then\n" +
-      "  inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
-      "  echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
+      "echo '[VERIFY:STAT]' > /dev/ttyS0; stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
+      "echo '[VERIFY:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
+      "echo '[VERIFY:MODE]' > /dev/ttyS0; stat -c %a '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
+      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
+      "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
+      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
+      "  elif [ -z \"$actual_sha\" ]; then\n" +
+      "    # Fallback if sha256sum not available on guest\n" +
+      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
+      "  else\n" +
+      "    echo '[VERIFY:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
+      "    echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
+      "  fi\n" +
       "else\n" +
       "  echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
       "fi\n";
@@ -829,18 +871,9 @@ var WorkerProvisioner = {
       "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null ||\n" +
       "   mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null ||\n" +
       "   mount -t 9p host9p /mnt/9p 2>/dev/null; then\n" +
-      "  mkdir -p /root/.provision > /dev/null 2>&1\n" +
-      "  i=0; ok=0\n" +
-      "  while [ $i -lt 15 ]; do\n" +
-      "    if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
-      "      sleep 1\n" +
-      "      if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
-      "        ok=1; break\n" +
-      "      fi\n" +
-      "    fi\n" +
-      "    sleep 1; i=$((i+1))\n" +
-      "  done\n" +
-      "  if [ $ok -eq 1 ]; then\n" +
+      "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "  sync\n" +
+      "  if [ -d /root/.provision ]; then\n" +
       "    echo '" + makeTag("REMOUNT", "OK") + "' > /dev/ttyS0\n" +
       "  else\n" +
       "    echo '" + makeTag("REMOUNT", "ERR") + "' > /dev/ttyS0\n" +
@@ -863,6 +896,8 @@ var WorkerProvisioner = {
       "ls -la /root/.provision 2>/dev/null > /dev/ttyS0 || echo 'ls-failed' > /dev/ttyS0\n" +
       "echo '[DIAG:STAT]' > /dev/ttyS0\n" +
       "stat '" + fp + "' 2>/dev/null > /dev/ttyS0 || echo 'stat-failed' > /dev/ttyS0\n" +
+      "echo '[DIAG:MODE]' > /dev/ttyS0\n" +
+      "stat -c %a '" + fp + "' 2>/dev/null > /dev/ttyS0 || echo 'mode-failed' > /dev/ttyS0\n" +
       "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>' > /dev/ttyS0\n";
 
     // ── Revalidation script ────────────────────────────────────────────────────
@@ -879,32 +914,53 @@ var WorkerProvisioner = {
       "ls -la /root/.provision > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
       "echo '[EXEC_DIAG:STAT]' > /dev/ttyS0\n" +
       "stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
-      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1 && cat '" + fp + "' > /dev/null 2>&1; then\n" +
-      "  inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
-      "  echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
-      "else\n" +
-      "  sleep 1\n" +
-      "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1 && cat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "echo '[EXEC_DIAG:MODE]' > /dev/ttyS0\n" +
+      "stat -c %a '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
+      "echo '[EXEC_DIAG:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
+      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
+      "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
       "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
       "    echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "  elif [ -z \"$actual_sha\" ]; then\n" +
+      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "    echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "  else\n" +
+      "    echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
+      "    echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "  fi\n" +
+      "else\n" +
+      "  sleep 1\n" +
+      "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "    actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
+      "    if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
+      "      inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "      echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "    elif [ -z \"$actual_sha\" ]; then\n" +
+      "      inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "      echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "    else\n" +
+      "      echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
+      "      echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "    fi\n" +
       "  else\n" +
       "    echo '" + failMarker + "' > /dev/ttyS0\n" +
       "  fi\n" +
       "fi\n";
 
-    // Write all helper scripts via create_file()
+    // Write all helper scripts via create_file() as .tmp files
     try {
-      await emu.create_file(base + "/prov_mount_" + execId + ".sh", encode(mountScript));
-      log("info", "[WorkerProvisioner] Helper: prov_mount_" + execId + ".sh written (" + mountScript.length + " bytes)");
-      await emu.create_file(base + "/prov_verify_" + execId + ".sh", encode(verifyScript));
-      log("info", "[WorkerProvisioner] Helper: prov_verify_" + execId + ".sh written (" + verifyScript.length + " bytes)");
-      await emu.create_file(base + "/prov_remount_" + execId + ".sh", encode(remountScript));
-      log("info", "[WorkerProvisioner] Helper: prov_remount_" + execId + ".sh written (" + remountScript.length + " bytes)");
-      await emu.create_file(base + "/prov_diag_" + execId + ".sh", encode(diagScript));
-      log("info", "[WorkerProvisioner] Helper: prov_diag_" + execId + ".sh written (" + diagScript.length + " bytes)");
-      await emu.create_file(base + "/prov_reval_" + execId + ".sh", encode(revalScript));
-      log("info", "[WorkerProvisioner] Helper: prov_reval_" + execId + ".sh written (" + revalScript.length + " bytes)");
-      log("info", "[WorkerProvisioner] All FSM helper scripts written. TTY will only receive short dispatch commands.");
+      await emu.create_file(base + "/prov_mount_" + execId + ".sh.tmp", encode(mountScript));
+      log("info", "[WorkerProvisioner] Helper: prov_mount_" + execId + ".sh.tmp written (" + mountScript.length + " bytes)");
+      await emu.create_file(base + "/prov_verify_" + execId + ".sh.tmp", encode(verifyScript));
+      log("info", "[WorkerProvisioner] Helper: prov_verify_" + execId + ".sh.tmp written (" + verifyScript.length + " bytes)");
+      await emu.create_file(base + "/prov_remount_" + execId + ".sh.tmp", encode(remountScript));
+      log("info", "[WorkerProvisioner] Helper: prov_remount_" + execId + ".sh.tmp written (" + remountScript.length + " bytes)");
+      await emu.create_file(base + "/prov_diag_" + execId + ".sh.tmp", encode(diagScript));
+      log("info", "[WorkerProvisioner] Helper: prov_diag_" + execId + ".sh.tmp written (" + diagScript.length + " bytes)");
+      await emu.create_file(base + "/prov_reval_" + execId + ".sh.tmp", encode(revalScript));
+      log("info", "[WorkerProvisioner] Helper: prov_reval_" + execId + ".sh.tmp written (" + revalScript.length + " bytes)");
+      log("info", "[WorkerProvisioner] All FSM helper scripts written as .tmp. TTY will only receive short dispatch commands.");
     } catch (e) {
       log("error", "[WorkerProvisioner] Failed to write helper scripts: " + String(e));
       throw e;
@@ -1022,6 +1078,14 @@ var WorkerProvisioner = {
         if (rawBuffer.length > 8192) rawBuffer = rawBuffer.slice(-8192);
         var buf = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
 
+        if (buf.indexOf("<<<PROVISION_FILE_MISSING>>>") !== -1) {
+          log("error", "[MountVisibilityFSM] Preflight check failed: helper script " + fsmState + " is missing!");
+          parserState = "idle";
+          rawBuffer = "";
+          advance("NOVIS");
+          return;
+        }
+
         var tag = "FSM:" + execId + ":" + fsmState;
         var okMarker  = "<<<" + tag + ":OK>>>";
         var errMarker = "<<<" + tag + ":ERR>>>";
@@ -1075,15 +1139,50 @@ var WorkerProvisioner = {
         rawBuffer = "";
         parserState = "waiting";
         log("info", "[MountVisibilityFSM] Dispatching: sh " + scriptPath);
-        SerialChannelManager.send(0, "sh " + scriptPath + "\n");
+        
+        var cmd =
+          "if [ -f '" + scriptPath + "' ]; then " +
+          "sh " + scriptPath + "; " +
+          "else " +
+          "echo '<<<PROVISION_FILE_MISSING>>>' > /dev/ttyS0; " +
+          "fi\n";
+          
+        SerialChannelManager.send(0, cmd);
       }
 
       function doMount() {
         fsmState = "MOUNTING";
         mountStartTime = Date.now();
-        log("info", "[MountVisibilityFSM] MOUNTING: dispatching helper script");
+        log("info", "[MountVisibilityFSM] MOUNTING: dispatching inline mount command");
         armTimeout(CMD_TIMEOUT_MS + 30000); // Mount can take up to ~30s extra for sleep loops
-        sendCmd(base + "/prov_mount_" + execId + ".sh");
+        
+        var inlineCmd = 
+          "mkdir -p /mnt/9p && " +
+          "(grep -q host9p /proc/mounts || " +
+          "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "rm -rf /root/.provision && " +
+          "mkdir -p /mnt/9p/root/.provision && " +
+          "ln -s /mnt/9p/root/.provision /root/.provision && " +
+          "sync && " +
+          "for f in /root/.provision/prov_*.sh.tmp; do " +
+          "  if [ -f \"$f\" ]; then " +
+          "    mv -f \"$f\" \"${f%.tmp}\" && " +
+          "    chmod +x \"${f%.tmp}\" && " +
+          "    ls -l \"${f%.tmp}\" && " +
+          "    stat -c %a \"${f%.tmp}\"; " +
+          "  fi; " +
+          "done && " +
+          "sync && " +
+          "[ -d /root/.provision ] && " +
+          "echo '<<<FSM:" + execId + ":MOUNTING:OK>>>' > /dev/ttyS0 || " +
+          "echo '<<<FSM:" + execId + ":MOUNTING:ERR>>>' > /dev/ttyS0\n";
+          
+        rawBuffer = "";
+        parserState = "waiting";
+        log("info", "[MountVisibilityFSM] Dispatching inline mount command: " + inlineCmd.trim());
+        SerialChannelManager.send(0, inlineCmd);
       }
 
       function doVerify(isStabilityCheck) {
@@ -1105,9 +1204,36 @@ var WorkerProvisioner = {
 
       function doRemount() {
         fsmState = "REMOUNT";
-        log("info", "[MountVisibilityFSM] REMOUNT: dispatching helper script (attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + ")");
+        log("info", "[MountVisibilityFSM] REMOUNT: dispatching inline remount command (attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + ")");
         armTimeout(CMD_TIMEOUT_MS + 20000);
-        sendCmd(base + "/prov_remount_" + execId + ".sh");
+        
+        var inlineRemountCmd =
+          "umount -f /mnt/9p >/dev/null 2>&1; umount /mnt/9p >/dev/null 2>&1; " +
+          "mkdir -p /mnt/9p >/dev/null 2>&1; " +
+          "(mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "rm -rf /root/.provision && " +
+          "mkdir -p /mnt/9p/root/.provision && " +
+          "ln -s /mnt/9p/root/.provision /root/.provision && " +
+          "sync && " +
+          "for f in /root/.provision/prov_*.sh.tmp; do " +
+          "  if [ -f \"$f\" ]; then " +
+          "    mv -f \"$f\" \"${f%.tmp}\" && " +
+          "    chmod +x \"${f%.tmp}\" && " +
+          "    ls -l \"${f%.tmp}\" && " +
+          "    stat -c %a \"${f%.tmp}\"; " +
+          "  fi; " +
+          "done && " +
+          "sync && " +
+          "[ -d /root/.provision ] && " +
+          "echo '<<<FSM:" + execId + ":REMOUNT:OK>>>' > /dev/ttyS0 || " +
+          "echo '<<<FSM:" + execId + ":REMOUNT:ERR>>>' > /dev/ttyS0\n";
+          
+        rawBuffer = "";
+        parserState = "waiting";
+        log("info", "[MountVisibilityFSM] Dispatching inline remount command: " + inlineRemountCmd.trim());
+        SerialChannelManager.send(0, inlineRemountCmd);
       }
 
       function scheduleRemount() {
@@ -1249,6 +1375,12 @@ var WorkerProvisioner = {
         if (rawBuffer.length > 8192) rawBuffer = rawBuffer.slice(-8192);
         var buf = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
 
+        if (buf.indexOf("<<<PROVISION_FILE_MISSING>>>") !== -1) {
+          log("error", "[WorkerProvisioner] Preflight check failed: reval script is missing!");
+          done(false, "reval_script_missing");
+          return;
+        }
+
         if (buf.indexOf(okMarkerPrefix) !== -1) {
           // Extract inode
           var idx = buf.indexOf(okMarkerPrefix);
@@ -1261,6 +1393,7 @@ var WorkerProvisioner = {
             inode = rest.replace(/[^0-9a-zA-Z]/g, "");
           }
           log("info", "[WorkerProvisioner] Pre-execution revalidation OK. Inode: " + inode);
+          log("info", "[WorkerProvisioner REVAL DIAGNOSTICS]\n" + buf);
           
           // Inode consistency check
           if (expectedInode && expectedInode !== "unknown" && inode !== "unknown" && inode !== expectedInode) {
@@ -1283,7 +1416,14 @@ var WorkerProvisioner = {
       armTimeout(CMD_TIMEOUT_MS + 10000);
       var helperPath = "/root/.provision/prov_reval_" + execId + ".sh";
       log("info", "[WorkerProvisioner] Dispatching revalidation helper: sh " + helperPath);
-      SerialChannelManager.send(0, "sh " + helperPath + "\n");
+      
+      var cmd =
+        "if [ -f '" + helperPath + "' ]; then " +
+        "sh " + helperPath + "; " +
+        "else " +
+        "echo '<<<PROVISION_FILE_MISSING>>>' > /dev/ttyS0; " +
+        "fi\n";
+      SerialChannelManager.send(0, cmd);
     });
   },
 
@@ -1695,18 +1835,23 @@ self.onmessage = async function (e) {
       WorkerProvisioner.transitionTo("executing");
       log("info", "[WorkerProvisioner] Executing via direct file path: " + execFilePath);
 
-      // 3. Minimal atomic execution trigger.
-      // The provisioning script (provision_N.sh) already emits all required PROTO lifecycle markers:
-      //   <<<PROTO:id:4:EXEC_START>>>     - at script start
-      //   <<<PROTO:id:5:HEARTBEAT>>>      - during execution
-      //   <<<PROTO:id:6:EXEC_COMPLETE>>>  - on success
-      //   <<<PROTO:id:7:FAIL:...>>>       - on abnormal exit (via trap EXIT)
-      // The previous outer sh -c wrapper with nested ''...'' quoting was broken on BusyBox ash:
-      // $? expanded as literal "err_$_code" inside the trap instead of the actual exit code.
-      // Fix: invoke the script directly - no redundant outer wrapper needed.
+      // 3. Minimal atomic execution trigger with atomic rename preflight and chmod validation.
+      var tmpFilePath = execFilePath + ".tmp";
       var triggerCmd =
         "stty -echo 2>/dev/null\n" +
-        "sh " + execFilePath + "\n";
+        "sync\n" +
+        "if [ -f '" + tmpFilePath + "' ]; then\n" +
+        "  mv -f '" + tmpFilePath + "' '" + execFilePath + "'\n" +
+        "  chmod +x '" + execFilePath + "'\n" +
+        "  sync\n" +
+        "fi\n" +
+        "if [ -f '" + execFilePath + "' ]; then\n" +
+        "  ls -l '" + execFilePath + "'\n" +
+        "  stat -c %a '" + execFilePath + "'\n" +
+        "  sh " + execFilePath + "\n" +
+        "else\n" +
+        "  echo '<<<PROTO:" + execExecId + ":7:FAIL:provision_file_missing>>>' > /dev/ttyS0\n" +
+        "fi\n";
 
       var sent = SerialChannelManager.send(0, triggerCmd);
       if (sent) {
