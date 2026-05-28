@@ -707,7 +707,8 @@ var WorkerProvisioner = {
       propagationLatencyMs: guestVerification.telemetry ? guestVerification.telemetry.propagationLatencyMs : -1,
       retryCount: guestVerification.telemetry ? guestVerification.telemetry.retryCount : 0,
       guestVisibilityTimingMs: guestVerification.telemetry ? guestVerification.telemetry.guestVisibilityTimingMs : -1,
-      remountAttempts: guestVerification.telemetry ? guestVerification.telemetry.remountAttempts : 0
+      remountAttempts: guestVerification.telemetry ? guestVerification.telemetry.remountAttempts : 0,
+      verifiedInode: guestVerification.inode
     };
   },
 
@@ -758,7 +759,7 @@ var WorkerProvisioner = {
     log("info", "[MountVisibilityFSM] Starting for path: " + filePath + " execId=" + execId);
 
     return new Promise(function(resolve) {
-      function done(visible) {
+      function done(visible, inode) {
         if (finished) return;
         finished = true;
         if (cmdTimeout) clearTimeout(cmdTimeout);
@@ -769,7 +770,10 @@ var WorkerProvisioner = {
         }
         guestVisibilityTimingMs = elapsed;
 
+        var resolvedInode = inode || "unknown";
+
         log("info", "[MountVisibilityFSM TELEMETRY] Resolved visible=" + visible + 
+                   " | inode=" + resolvedInode +
                    " | mountSuccess=" + mountSuccess +
                    " | propagationLatency=" + (propagationLatencyMs !== -1 ? propagationLatencyMs + "ms" : "N/A") +
                    " | retryCount=" + retryCount +
@@ -779,6 +783,7 @@ var WorkerProvisioner = {
         resolve({
           visible: visible,
           elapsedMs: elapsed,
+          inode: resolvedInode,
           telemetry: {
             mountSuccess: mountSuccess,
             propagationLatencyMs: propagationLatencyMs,
@@ -808,7 +813,7 @@ var WorkerProvisioner = {
         var tag = "FSM:" + execId + ":" + fsmState;
         var okMarker  = "<<<" + tag + ":OK>>>";
         var errMarker = "<<<" + tag + ":ERR>>>";
-        var visMarker = "<<<" + tag + ":VIS>>>";
+        var visMarkerPrefix = "<<<" + tag + ":VIS>>>";
         var noVisMarker = "<<<" + tag + ":NOVIS>>>";
         var diagDoneMarker = "<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>";
 
@@ -826,10 +831,23 @@ var WorkerProvisioner = {
             parserState = "idle";
             rawBuffer = "";
             advance("ERR");
-          } else if (buf.indexOf(visMarker) !== -1) {
+          } else if (buf.indexOf(visMarkerPrefix) !== -1) {
+            // Extract the inode suffix after the marker
+            var idx = buf.indexOf(visMarkerPrefix);
+            var restOfBuf = buf.slice(idx + visMarkerPrefix.length);
+            var inode = "unknown";
+            var endOfMarkerIdx = restOfBuf.indexOf("\n");
+            if (endOfMarkerIdx !== -1) {
+              inode = restOfBuf.slice(0, endOfMarkerIdx).replace(/[^0-9a-zA-Z]/g, "");
+            } else {
+              inode = restOfBuf.replace(/[^0-9a-zA-Z]/g, "");
+            }
+            if (inode.indexOf(":") === 0) {
+              inode = inode.slice(1);
+            }
             parserState = "idle";
             rawBuffer = "";
-            advance("VIS");
+            advance("VIS", inode);
           } else if (buf.indexOf(noVisMarker) !== -1) {
             parserState = "idle";
             rawBuffer = "";
@@ -891,7 +909,8 @@ var WorkerProvisioner = {
           var cmd =
             "stty -echo 2>/dev/null; PS1=''; " +
             "if [ -f '" + filePath + "' ] && stat '" + filePath + "' >/dev/null 2>&1 && ls '" + filePath + "' >/dev/null 2>&1 && cat '" + filePath + "' >/dev/null 2>&1; then " +
-            "echo '" + makeTag("VERIFYING", "VIS") + "'; " +
+            "inode=$(stat -c %i '" + filePath + "' 2>/dev/null || echo 'unknown'); " +
+            "echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\"; " +
             "else echo '" + makeTag("VERIFYING", "NOVIS") + "'; fi\n";
           sendCmd(cmd);
         }, delay);
@@ -961,7 +980,7 @@ var WorkerProvisioner = {
         } else if (fsmState === "VERIFYING") {
           if (event === "VIS") {
             log("info", "[MountVisibilityFSM] File VISIBLE on attempt " + verifyAttempt + ". -> VERIFIED");
-            done(true);
+            done(true, extra);
           } else if (event === "NOVIS" || event === "TIMEOUT") {
             if (verifyAttempt < MAX_VERIFY_RETRIES) {
               log("warn", "[MountVisibilityFSM] Not visible yet (attempt " + verifyAttempt + "). Retrying verify loop.");
@@ -993,6 +1012,105 @@ var WorkerProvisioner = {
 
       // Kick off the FSM
       doMount();
+  },
+
+  /**
+   * Pre-execution revalidation.
+   * Compares inodes, checks file visibility/readability, gathers diagnostics.
+   */
+  revalidateBeforeExecution: function(emu, filePath, execId, expectedInode) {
+    var CMD_TIMEOUT_MS = 6000;
+    var finished = false;
+    var rawBuffer = "";
+    var listener = null;
+    var cmdTimeout = null;
+
+    log("info", "[WorkerProvisioner] Starting pre-execution revalidation for: " + filePath + 
+               " | Expected Inode: " + expectedInode + " | Exec ID: " + execId);
+
+    // Path telemetry
+    log("info", "[WorkerProvisioner PATH TELEMETRY] Worker Path: " + filePath + 
+               " | Guest Path: " + filePath + 
+               " | Exec Path: " + filePath + 
+               " | Current Mount Namespace: host9p -> /mnt/9p");
+
+    return new Promise(function(resolve) {
+      function done(success, details) {
+        if (finished) return;
+        finished = true;
+        if (cmdTimeout) clearTimeout(cmdTimeout);
+        if (listener) emu.remove_listener("serial0-output-byte", listener);
+        resolve({ success: success, details: details });
+      }
+
+      function armTimeout(ms) {
+        if (cmdTimeout) clearTimeout(cmdTimeout);
+        cmdTimeout = setTimeout(function() {
+          log("warn", "[WorkerProvisioner] Pre-execution revalidation timed out. Raw buffer: " + JSON.stringify(rawBuffer.slice(-512)));
+          done(false, "timeout");
+        }, ms);
+      }
+
+      var tag = "EXEC_REVAL:" + execId;
+      var okMarkerPrefix = "<<<" + tag + ":OK>>>";
+      var failMarker = "<<<" + tag + ":FAIL>>>";
+
+      listener = function(byte) {
+        if (finished) return;
+        rawBuffer += String.fromCharCode(byte);
+        if (rawBuffer.length > 8192) rawBuffer = rawBuffer.slice(-8192);
+        var buf = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
+
+        if (buf.indexOf(okMarkerPrefix) !== -1) {
+          // Extract inode
+          var idx = buf.indexOf(okMarkerPrefix);
+          var rest = buf.slice(idx + okMarkerPrefix.length);
+          var inode = "unknown";
+          var endIdx = rest.indexOf("\n");
+          if (endIdx !== -1) {
+            inode = rest.slice(0, endIdx).replace(/[^0-9a-zA-Z]/g, "");
+          } else {
+            inode = rest.replace(/[^0-9a-zA-Z]/g, "");
+          }
+          log("info", "[WorkerProvisioner] Pre-execution revalidation OK. Inode: " + inode);
+          
+          // Inode consistency check
+          if (expectedInode && expectedInode !== "unknown" && inode !== "unknown" && inode !== expectedInode) {
+            log("warn", "[WorkerProvisioner] Inode mismatch detected! Expected: " + expectedInode + ", got: " + inode + ". Possible filesystem reset.");
+          } else {
+            log("info", "[WorkerProvisioner] Inode consistency verified: " + inode);
+          }
+          
+          done(true, inode);
+        } else if (buf.indexOf(failMarker) !== -1) {
+          log("error", "[WorkerProvisioner] Pre-execution revalidation reported FAIL.");
+          log("warn", "[WorkerProvisioner REVAL DIAGNOSTICS]\n" + buf);
+          done(false, "guest_verification_failed");
+        }
+      };
+      emu.add_listener("serial0-output-byte", listener);
+
+      // Start revalidation command after a minor delay
+      armTimeout(CMD_TIMEOUT_MS);
+      var cmd =
+        "stty -echo 2>/dev/null; PS1=''; " +
+        "sync 2>/dev/null; " +
+        "echo '[EXEC_DIAG:PWD]'; pwd; " +
+        "echo '[EXEC_DIAG:MOUNTS]'; cat /proc/mounts 2>/dev/null | grep -E '9p|host' || echo 'none'; " +
+        "echo '[EXEC_DIAG:LSTMP]'; ls -la /tmp 2>/dev/null || echo 'ls-failed'; " +
+        "echo '[EXEC_DIAG:STAT]'; stat '" + filePath + "' 2>/dev/null || echo 'stat-failed'; " +
+        "check_file() { [ -f '" + filePath + "' ] && stat '" + filePath + "' >/dev/null 2>&1 && ls '" + filePath + "' >/dev/null 2>&1 && cat '" + filePath + "' >/dev/null 2>&1; }; " +
+        "if check_file; then " +
+        "inode=$(stat -c %i '" + filePath + "' 2>/dev/null || echo 'unknown'); " +
+        "echo '" + okMarkerPrefix + "':\"$inode\"; " +
+        "else " +
+        "sleep 1; " +
+        "if check_file; then " +
+        "inode=$(stat -c %i '" + filePath + "' 2>/dev/null || echo 'unknown'); " +
+        "echo '" + okMarkerPrefix + "':\"$inode\"; " +
+        "else echo '" + failMarker + "'; fi; fi\n";
+
+      SerialChannelManager.send(0, cmd);
     });
   },
 
@@ -1385,21 +1503,29 @@ self.onmessage = async function (e) {
     case "PROVISION_EXECUTE": {
       var execFilePath = payload.filePath;
       var execExecId = payload.execId;
-      var fallbackRequired = payload.fallbackRequired;
-      WorkerProvisioner.transitionTo("executing");
-      
-      // Serial fallback streaming mode PERMANENTLY REMOVED.
-      // The MountVisibilityFSM guarantees the file is guest-visible via the full
-      // MOUNTING->VERIFYING->RETRY_VERIFY->REMOUNT->VERIFIED FSM before we reach
-      // PROVISION_EXECUTE. The 9p mount is already live at this point.
-      // Always use direct file execution — no heredoc injection, no echo flooding.
-      if (fallbackRequired) {
-        log("warn", "[WorkerProvisioner] fallbackRequired=true received but fallback streaming is disabled. Proceeding with direct execution.");
+      var expectedInode = payload.verifiedInode || "unknown";
+
+      // 4. Filesystem stabilization delay
+      log("info", "[WorkerProvisioner] Applying filesystem stabilization delay (800ms)...");
+      await new Promise(function(r) { setTimeout(r, 800); });
+
+      // 2. Pre-execution revalidation
+      var reval = await WorkerProvisioner.revalidateBeforeExecution(emulator, execFilePath, execExecId, expectedInode);
+
+      if (!reval.success) {
+        log("error", "[WorkerProvisioner] Pre-execution revalidation failed. Aborting execution trigger.");
+        postToHost("PROVISION_NACK", { execId: execExecId, reason: "pre_execution_revalidation_failed: " + reval.details });
+        WorkerProvisioner.transitionTo("failed");
+        break;
       }
+
+      WorkerProvisioner.transitionTo("executing");
       log("info", "[WorkerProvisioner] Executing via direct file path: " + execFilePath);
+
+      // 3. Atomic execution path
       var triggerCmd =
         "stty -echo 2>/dev/null\n" +
-        "exec sh '" + execFilePath + "'\n";
+        "sh -c \"test -f '" + execFilePath + "' && exec sh '" + execFilePath + "'\"\n";
 
       var sent = SerialChannelManager.send(0, triggerCmd);
       if (sent) {

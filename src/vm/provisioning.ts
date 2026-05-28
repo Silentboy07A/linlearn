@@ -733,6 +733,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
       execId: this.currentExecutionId,
       generation: this.activeBridgeGeneration,
       filePath: ready.filePath,
+      verifiedInode: ready.telemetry?.verifiedInode || "unknown",
       fallbackRequired: false
     });
   }

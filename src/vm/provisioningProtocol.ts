@@ -75,6 +75,7 @@ export interface ProvisionExecutePayload {
   execId: number;
   generation: number;
   filePath: string;
+  verifiedInode?: string;
   fallbackRequired?: boolean;
 }
 
@@ -112,6 +113,7 @@ export interface ProvisionReadyPayload {
     retryCount?: number;
     guestVisibilityTimingMs?: number;
     remountAttempts?: number;
+    verifiedInode?: string;
   };
 }
 
