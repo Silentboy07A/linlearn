@@ -316,6 +316,7 @@ export function TerminalSimulator({
 
   const [isV86Running, setIsV86Running] = useState<boolean>(false);
   const [vmStateName, setVmStateName] = useState<string>("idle");
+  const [bootComplete, setBootComplete] = useState<boolean>(false);
   const [provisioningState, setProvisioningState] = useState<string>("idle");
   const [terminalState, setTerminalState] = useState<string>("detached");
   const [recoveryState, setRecoveryState] = useState<string>("healthy");
@@ -901,20 +902,33 @@ export function TerminalSimulator({
           if (!isMounted) return;
           setVmStateName(newState);
 
+          let isBooted = false;
           if (v86EmulatorRef.current) {
             const fullState = v86EmulatorRef.current.getFullLifecycleState();
             setProvisioningState(fullState.provisioning);
             setTerminalState(fullState.terminal);
             setRecoveryState(fullState.recovery);
+            setBootComplete(fullState.bootComplete);
+            isBooted = fullState.bootComplete;
+
+            if (fullState.recovery === "recovering" && fullState.bootComplete) {
+              if (activeTermRef.current) {
+                activeTermRef.current.write(`\r\n\x1b[1;33m[VM] Filesystem synchronization recovering...\x1b[0m\r\n`);
+              }
+            }
           }
 
           if (newState === "error") {
             if (activeTermRef.current) {
-              activeTermRef.current.write(`\r\n\x1b[1;31mError: Failed to boot guest virtual machine.\x1b[0m\r\n`);
+              if (isBooted) {
+                activeTermRef.current.write(`\r\n\x1b[1;33mWarning: Provisioning recovery in progress...\x1b[0m\r\n`);
+              } else {
+                activeTermRef.current.write(`\r\n\x1b[1;31mError: Failed to boot guest virtual machine.\x1b[0m\r\n`);
+                setV86Booting(false);
+                setIsV86Running(false);
+              }
             }
-            setV86Booting(false);
-            setIsV86Running(false);
-          } else if (newState === "running") {
+          } else if (newState === "running" || (isBooted && (newState === "provisioning" || newState === "shell_ready" || newState === "terminal_ready"))) {
             setV86Booting(false);
             setIsV86Running(true);
             setTimeout(() => {
@@ -947,8 +961,10 @@ export function TerminalSimulator({
           setProvisioningState(fullState.provisioning);
           setTerminalState(fullState.terminal);
           setRecoveryState(fullState.recovery);
+          setBootComplete(fullState.bootComplete);
 
-          if (currentVmState === "running") {
+          const isBooted = fullState.bootComplete;
+          if (currentVmState === "running" || (isBooted && (currentVmState === "provisioning" || currentVmState === "shell_ready" || currentVmState === "terminal_ready"))) {
             setV86Booting(false);
             setIsV86Running(true);
             setTimeout(() => {
@@ -1033,8 +1049,17 @@ export function TerminalSimulator({
             return;
           }
           if (!v86EmulatorRef.current) return;
-          const vmState = v86EmulatorRef.current.getLifecycleState().state;
-          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready") {
+          const fullState = v86EmulatorRef.current.getFullLifecycleState();
+          const vmState = fullState.runtime;
+          const provState = fullState.provisioning;
+          const isProvisioningActive = provState === "preparing" || provState === "transferring" || provState === "executing" || provState === "waiting_completion";
+          
+          if (isProvisioningActive) {
+            console.warn("[xterm DEBUG] onData ignored: provisioning in progress");
+            return;
+          }
+
+          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready" && vmState !== "ready") {
             console.warn("[xterm DEBUG] onData ignored: VM not in interactive state:", vmState);
             return;
           }
@@ -1497,12 +1522,12 @@ export function TerminalSimulator({
             {isV86Mode && (
               vmStateName === "loading" || 
               vmStateName === "booting" || 
-              vmStateName === "provisioning" || 
-              vmStateName === "shell_ready" || 
-              vmStateName === "terminal_ready" || 
+              (vmStateName === "provisioning" && !bootComplete) || 
+              (vmStateName === "shell_ready" && !bootComplete) || 
+              (vmStateName === "terminal_ready" && !bootComplete) || 
               vmStateName === "idle" || 
               vmStateName === "stopping" ||
-              recoveryState === "recovering" ||
+              (recoveryState === "recovering" && !bootComplete) ||
               recoveryState === "crashloop"
             ) && (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#06070a]/90 gap-3">
@@ -1551,6 +1576,11 @@ export function TerminalSimulator({
                       recoveryState === "recovering" ? "recovering" :
                       vmStateName
                     }</span></span>
+                    {recoveryState === "recovering" && bootComplete && (
+                      <span className="text-amber-500 animate-pulse ml-2 text-[10px] font-bold tracking-wider">
+                        Filesystem synchronization recovering...
+                      </span>
+                    )}
                   </div>
                   {bootTimeRef.current !== null && (
                     <div>Boot: {(bootTimeRef.current / 1000).toFixed(1)}s</div>

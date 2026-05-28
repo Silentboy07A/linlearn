@@ -844,17 +844,27 @@ var WorkerProvisioner = {
       "stty -echo > /dev/null 2>&1\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
+      "i=0; ok=0; inode=; size=;\n" +
+      "while [ $i -lt 10 ]; do\n" +
+      "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null)\n" +
+      "    size=$(stat -c %s '" + fp + "' 2>/dev/null)\n" +
+      "    if [ -n \"$inode\" ] && [ -n \"$size\" ] && [ \"$size\" -gt 0 ]; then\n" +
+      "      ok=1; break;\n" +
+      "    fi\n" +
+      "  fi\n" +
+      "  sleep 0.5\n" +
+      "  i=$((i+1))\n" +
+      "done\n" +
       "echo '[VERIFY:STAT]' > /dev/ttyS0; stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
       "echo '[VERIFY:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
       "echo '[VERIFY:MODE]' > /dev/ttyS0; stat -c %a '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
-      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "if [ $ok -eq 1 ]; then\n" +
       "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
       "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
-      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
       "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
       "  elif [ -z \"$actual_sha\" ]; then\n" +
       "    # Fallback if sha256sum not available on guest\n" +
-      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
       "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
       "  else\n" +
       "    echo '[VERIFY:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
@@ -1362,6 +1372,7 @@ var WorkerProvisioner = {
           var jitter = Math.floor(Math.random() * 500);
           var finalDelay = delay + jitter;
           log("warn", "[MountVisibilityFSM] Scheduling remount attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + " in " + finalDelay + "ms (backoff=" + delay + "ms, jitter=" + jitter + "ms)");
+          postToHost("PROVISION_RECOVERING", { msg: "Filesystem synchronization recovering..." });
           setTimeout(function() {
             if (finished) return;
             doRemount();
@@ -1411,6 +1422,7 @@ var WorkerProvisioner = {
             stabilityCount = 0; // Reset stability counter since it failed!
             if (verifyAttempt < MAX_VERIFY_RETRIES) {
               log("warn", "[MountVisibilityFSM] Not visible yet (attempt " + verifyAttempt + "). Retrying verify loop.");
+              postToHost("PROVISION_RECOVERING", { msg: "Filesystem synchronization recovering..." });
               doVerify(false);
             } else {
               log("warn", "[MountVisibilityFSM] " + MAX_VERIFY_RETRIES + " verify attempts exhausted. Scheduling remount.");

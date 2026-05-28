@@ -5,13 +5,14 @@ import { Logger } from "../lib/logger";
 export type VMRuntimeState = VMStateName;
 export type ProvisioningState = "idle" | "preparing" | "transferring" | "executing" | "waiting_completion" | "completed" | "failed" | "recovering";
 export type TerminalState = "detached" | "attached" | "interactive" | "recovering";
-export type RecoveryState = "healthy" | "recovering" | "degraded" | "crashloop";
+export type RecoveryState = "healthy" | "recovering" | "degraded" | "crashloop" | "info" | "fatal";
 
 export interface VMFullState {
   runtime: VMRuntimeState;
   provisioning: ProvisioningState;
   terminal: TerminalState;
   recovery: RecoveryState;
+  bootComplete: boolean;
 }
 
 export class VMLifecycleManager {
@@ -19,6 +20,7 @@ export class VMLifecycleManager {
     state: "idle",
     lastActiveTimestamp: Date.now(),
     ramUsageBytes: 0,
+    bootComplete: false,
   };
 
   private provisioningState: ProvisioningState = "idle";
@@ -35,7 +37,7 @@ export class VMLifecycleManager {
   private static readonly VALID_TRANSITIONS: Record<VMStateName, Set<VMStateName>> = {
     idle:         new Set<VMStateName>(["loading", "stopped"]),
     loading:      new Set<VMStateName>(["booting", "running", "error", "stopped"]),
-    booting:      new Set<VMStateName>(["provisioning", "running", "error", "stopped"]),
+    booting:      new Set<VMStateName>(["provisioning", "running", "error", "stopped", "ready"]),
     provisioning: new Set<VMStateName>(["shell_ready", "running", "error", "stopped"]),
     shell_ready:  new Set<VMStateName>(["terminal_ready", "error", "stopped"]),
     terminal_ready: new Set<VMStateName>(["running", "error", "stopped"]),
@@ -43,6 +45,7 @@ export class VMLifecycleManager {
     stopping:     new Set<VMStateName>(["stopped", "error"]),
     stopped:      new Set<VMStateName>(["idle", "loading", "booting"]),
     error:        new Set<VMStateName>(["idle", "loading", "booting", "stopped"]),
+    ready:        new Set<VMStateName>(["provisioning", "running", "error", "stopped"]),
   };
 
   private static readonly VALID_PROVISIONING_TRANSITIONS: Record<ProvisioningState, Set<ProvisioningState>> = {
@@ -64,10 +67,12 @@ export class VMLifecycleManager {
   };
 
   private static readonly VALID_RECOVERY_TRANSITIONS: Record<RecoveryState, Set<RecoveryState>> = {
-    healthy:    new Set<RecoveryState>(["recovering", "degraded"]),
-    recovering: new Set<RecoveryState>(["healthy", "degraded", "crashloop"]),
-    degraded:   new Set<RecoveryState>(["healthy", "recovering", "crashloop"]),
-    crashloop:  new Set<RecoveryState>(["healthy"])
+    healthy:    new Set<RecoveryState>(["recovering", "degraded", "info", "fatal"]),
+    recovering: new Set<RecoveryState>(["healthy", "degraded", "crashloop", "info", "fatal"]),
+    degraded:   new Set<RecoveryState>(["healthy", "recovering", "crashloop", "info", "fatal"]),
+    crashloop:  new Set<RecoveryState>(["healthy"]),
+    info:       new Set<RecoveryState>(["healthy", "recovering", "degraded", "fatal"]),
+    fatal:      new Set<RecoveryState>(["healthy", "recovering", "degraded", "crashloop"]),
   };
 
   public transitionTo(
@@ -184,12 +189,17 @@ export class VMLifecycleManager {
     return true;
   }
 
+  public setBootComplete(val: boolean): void {
+    this.currentState.bootComplete = val;
+  }
+
   public getFullState(): VMFullState {
     return {
       runtime: this.currentState.state,
       provisioning: this.provisioningState,
       terminal: this.terminalState,
-      recovery: this.recoveryState
+      recovery: this.recoveryState,
+      bootComplete: !!this.currentState.bootComplete
     };
   }
 

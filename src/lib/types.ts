@@ -30,13 +30,14 @@ export interface VMSessionConfig {
   timeoutMs: number;
 }
 
-export type VMStateName = "idle" | "loading" | "booting" | "provisioning" | "shell_ready" | "terminal_ready" | "running" | "stopping" | "stopped" | "error";
+export type VMStateName = "idle" | "loading" | "booting" | "provisioning" | "shell_ready" | "terminal_ready" | "running" | "stopping" | "stopped" | "error" | "ready";
 
 export interface VMState {
   state: VMStateName;
   bootTimeMs?: number;
   lastActiveTimestamp: number;
   ramUsageBytes: number;
+  bootComplete?: boolean;
 }
 
 export interface VMSnapshotMetadata {

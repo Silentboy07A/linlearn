@@ -96,7 +96,7 @@ export type EmulatorAction =
 // Maps each action type to the set of lifecycle states from which it is valid.
 const ACTION_VALID_FROM: Record<EmulatorAction["type"], Set<VMStateName> | "always" | "alive"> = {
   START:         new Set<VMStateName>(["idle", "stopped", "error"]),
-  STOP:          new Set<VMStateName>(["loading", "booting", "provisioning", "shell_ready", "terminal_ready", "running", "stopping"]),
+  STOP:          new Set<VMStateName>(["loading", "booting", "provisioning", "shell_ready", "terminal_ready", "running", "stopping", "ready"]),
   RECOVER_SHELL: "alive",
   SOFT_REBOOT:   "alive",
   COLD_BOOT:     "alive",
@@ -147,6 +147,7 @@ export class VMController {
   private initCompleteTimestamp = 0;
   private firstStateChangedTimestamp = 0;
   private firstSerialOutputTimestamp = 0;
+  private bootCompleted = false;
 
   // New modules
   private timeouts: UnifiedTimeoutManager;
@@ -356,6 +357,8 @@ export class VMController {
     if (this.onSerialOutput) {
       this.onSerialOutput("\r\n\x1b[1;31m[Recovery] Guest CPU stalled. Rebooting VM...\x1b[0m\r\n");
     }
+    this.bootCompleted = false;
+    this.lifecycle.setBootComplete(false);
     this.transport.post("RESTART");
   }
 
@@ -364,6 +367,9 @@ export class VMController {
     if (this.onSerialOutput) {
       this.onSerialOutput("\r\n\x1b[1;31m[Recovery] All recovery exhausted. Cold booting guest VM...\x1b[0m\r\n");
     }
+
+    this.bootCompleted = false;
+    this.lifecycle.setBootComplete(false);
 
     // Force stop regardless of state
     if (this.lifecycle.isAlive() || this.lifecycle.getState().state !== "idle") {
@@ -421,6 +427,9 @@ export class VMController {
   ): Promise<void> {
     Logger.info("VM", "[DISPATCH] Executing RESET: force stop + clear snapshot + cold boot.");
     
+    this.bootCompleted = false;
+    this.lifecycle.setBootComplete(false);
+
     // Force stop regardless of state
     if (this.lifecycle.isAlive() || this.lifecycle.getState().state !== "idle") {
       await this._internalStop();
@@ -804,6 +813,14 @@ export class VMController {
               this.transitionState(mappedState, "worker STATE_CHANGED", true, "STATE_CHANGED");
             }
             break;
+
+          case "PROVISION_RECOVERING":
+            {
+              const data = payload as { msg: string };
+              Logger.info("VM", `[PROVISIONING RECOVERY] Worker reported: ${data.msg}`);
+              this.lifecycle.transitionRecoveryTo("recovering", "Worker PROVISION_RECOVERING");
+            }
+            break;
         }
       }).then(() => {
         if (abortSignal.aborted) return;
@@ -995,6 +1012,14 @@ export class VMController {
       }
       this.timeouts.cancel("prompt_stabilization");
       this.timeouts.cancel("boot_watchdog");
+
+      Logger.info("VM", "<<<VM_BOOT_COMPLETE>>>");
+      if (this.onSerialOutput) {
+        this.onSerialOutput("\r\n\x1b[1;32m<<<VM_BOOT_COMPLETE>>>\x1b[0m\r\n");
+      }
+      this.bootCompleted = true;
+      this.lifecycle.setBootComplete(true);
+      this.transitionState("ready", "handleSerialLifecycle");
       
       // Disable echo only — keep canonical mode (icanon) so ash can read full newline-terminated lines.
       // Removing -icanon (raw mode) because it causes ash to receive characters without line buffering,
@@ -1427,6 +1452,11 @@ export class VMController {
   ): boolean {
     const currentState = this.lifecycle.getState().state;
     if (currentState === newState) return true;
+
+    if (newState === "error" && this.bootCompleted) {
+      Logger.warn("VM", `[LIFECYCLE PREVENT] Prevented transition to error after boot completion. Current state: ${currentState}. Source: ${source}`);
+      return false;
+    }
 
     const succeeded = this.lifecycle.transitionTo(newState, undefined, source, workerEvent, snapshot);
     if (!succeeded) {
