@@ -30,6 +30,11 @@ export class ProvisioningCompletionParser {
   private lastFeedTimestamp = Date.now();
   private lastMarker = "none";
 
+  public setActiveExecutionId(execId: number): void {
+    this.currentExecId = execId;
+    Logger.info("VM", `[Provisioning FSM] Active execution ID token established: ${execId}`);
+  }
+
   public getState() {
     return this.state;
   }
@@ -106,22 +111,6 @@ export class ProvisioningCompletionParser {
           line = line.replace(raw, "");
           continue;
         }
-        
-        if (execId < this.currentExecId) {
-          Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale EXEC_START marker for past execId=${execId} (current=${this.currentExecId})`);
-          line = line.replace(raw, "");
-          continue;
-        }
-        
-        if (execId > this.currentExecId) {
-          Logger.info("VM", `[Provisioning FSM] Monotonic execId progression (EXEC_START): ${this.currentExecId} -> ${execId}. Resetting parser state.`);
-          this.currentExecId = execId;
-          this.lastProcessedSequence = 0;
-          this.processedPackets.clear();
-          this.state = "IDLE";
-          this.isExecutionMode = true;
-          this.currentPhaseTimestamp = Date.now();
-        }
 
         if (this.state === "IDLE" || this.state === "VERIFY_BEGIN" || this.state === "FILE_VISIBLE" || this.state === "VERIFY_END" || this.state === "EXEC_START") {
           const oldState = this.state;
@@ -149,22 +138,6 @@ export class ProvisioningCompletionParser {
           continue;
         }
 
-        if (execId < this.currentExecId) {
-          Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale EXEC_COMPLETE marker for past execId=${execId} (current=${this.currentExecId})`);
-          line = line.replace(raw, "");
-          continue;
-        }
-
-        if (execId > this.currentExecId) {
-          Logger.info("VM", `[Provisioning FSM] Monotonic execId progression (EXEC_COMPLETE): ${this.currentExecId} -> ${execId}. Resetting parser state.`);
-          this.currentExecId = execId;
-          this.lastProcessedSequence = 0;
-          this.processedPackets.clear();
-          this.state = "IDLE";
-          this.isExecutionMode = true;
-          this.currentPhaseTimestamp = Date.now();
-        }
-
         const oldState = this.state;
         if (code === "0") {
           this.state = "SUCCESS";
@@ -189,12 +162,6 @@ export class ProvisioningCompletionParser {
         // Strict execId validation (Requirement 8)
         if (this.currentExecId !== -1 && execId !== this.currentExecId) {
           Logger.info("VM", `[Provisioning FSM] [Telemetry] Rejected LLVM_PROVISION_COMPLETE due to execId mismatch: incoming ${execId} !== current ${this.currentExecId}`);
-          line = line.replace(raw, "");
-          continue;
-        }
-
-        if (execId < this.currentExecId) {
-          Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale LLVM_PROVISION_COMPLETE marker for past execId=${execId} (current=${this.currentExecId})`);
           line = line.replace(raw, "");
           continue;
         }
@@ -230,23 +197,6 @@ export class ProvisioningCompletionParser {
           Logger.info("VM", `[Provisioning FSM] [Telemetry] Rejected PROTO marker due to execId mismatch: incoming ${execId} !== current ${this.currentExecId} (${action})`);
           line = line.replace(raw, "");
           continue;
-        }
-
-        // 1. Monotonic Execution ID constraint
-        if (execId < this.currentExecId) {
-          Logger.info("VM", `[Provisioning FSM] [Telemetry] Replay fragment ignored (stale/out-of-order): ${action} (seq=${sequence}, execId=${execId}, currentExecId=${this.currentExecId})`);
-          line = line.replace(raw, "");
-          continue;
-        }
-
-        if (execId > this.currentExecId) {
-          Logger.info("VM", `[Provisioning FSM] Monotonic execId progression: ${this.currentExecId} -> ${execId}. Resetting parser state.`);
-          this.currentExecId = execId;
-          this.lastProcessedSequence = 0;
-          this.processedPackets.clear();
-          this.state = "IDLE";
-          this.isExecutionMode = false;
-          this.currentPhaseTimestamp = Date.now();
         }
 
         // 2. Execution-Phase Parser Mode Isolation & Filtering
@@ -630,6 +580,7 @@ export class ProvisioningController {
     this.lastHeartbeatTimestamp = 0;
     this.activeBridgeGeneration = bridgeGeneration;
     this.completionParser.reset();
+    this.completionParser.setActiveExecutionId(executionId);
 
     this.transitionTo("preparing");
     this.transitionTransportTo("preparing");

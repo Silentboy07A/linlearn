@@ -810,6 +810,18 @@ export class VMController {
               } else {
                 mappedState = rawState as VMStateName;
               }
+
+              // Prevent host backward FSM transitions for the bootstrap-to-ready sequence
+              const stateOrder: VMStateName[] = ["idle", "loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready"];
+              const currentState = this.lifecycle.getState().state;
+              const currentIndex = stateOrder.indexOf(currentState);
+              const targetIndex = stateOrder.indexOf(mappedState);
+
+              if (currentIndex !== -1 && targetIndex !== -1 && targetIndex < currentIndex) {
+                Logger.info("VM", `[FSM] Dropped backward worker STATE_CHANGED transition notification: ${currentState} -> ${mappedState}`);
+                break;
+              }
+
               this.transitionState(mappedState, "worker STATE_CHANGED", true, "STATE_CHANGED");
             }
             break;
@@ -924,6 +936,52 @@ export class VMController {
 
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
     const activeGenId = activeGen ? activeGen.id : 0;
+
+    // Check for mount stabilization markers during provision_preparing state
+    if (this.lifecycle.getState().state === "provision_preparing") {
+      if (this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
+        this.timeouts.cancel("mount_stabilization_watchdog");
+        Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized. Transitioning to provisioning state.");
+        this.transitionState("provisioning", "handleSerialLifecycle");
+        this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
+
+        Logger.info("VM", "[PROVISIONING] Starting atomic provisioning via PROVISION_* protocol...");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
+        }
+
+        // Dynamic provisioning timeout
+        let timeoutMs = 45000;
+        if (this.wasRestoredFromSnapshot) {
+          timeoutMs = 60000;
+        } else {
+          timeoutMs = 75000;
+        }
+        if (this.orchestrator.getStage() > RecoveryStage.NONE) {
+          timeoutMs += 15000;
+        }
+
+        this.timeouts.register("provisioning_watchdog", timeoutMs, () => {
+          this._onProvisioningWatchdogFired();
+        });
+
+        void this.provisioning.startProvisioning(
+          this.savedState,
+          GUEST_INSPECT_SCRIPT,
+          this.transport.hasSerial1Support(),
+          activeGenId
+        );
+        this.provisioningSearchBuffer = "";
+        return;
+      } else if (this.provisioningSearchBuffer.includes("<<<MOUNT_FAILED>>>")) {
+        this.timeouts.cancel("mount_stabilization_watchdog");
+        Logger.error("VM", "[PROVISIONING] Guest filesystem mount failed.");
+        this.orchestrator.triggerRecovery("guest mount barrier report failure");
+        this.provisioningSearchBuffer = "";
+        return;
+      }
+    }
+
     const parserEvents = this.provisioning.getCompletionParser().feed(char, activeGenId);
 
     for (const event of parserEvents) {
@@ -999,7 +1057,8 @@ export class VMController {
     }
 
     // ── Boot ready: root prompt detected, start provisioning ──
-    if (hasRootPrompt && this.provisioning.getState() === "idle") {
+    const isBootingState = this.lifecycle.getState().state === "booting";
+    if (hasRootPrompt && isBootingState && this.provisioning.getState() === "idle") {
       // Ensure prompt is stable for a minimum duration (1000ms of quiet/silence)
       const now = Date.now();
       const quietDuration = now - this.lastSerialOutputTimestamp;
@@ -1027,39 +1086,26 @@ export class VMController {
       Logger.info("VM", "[PROVISIONING] Disabling serial echo (stty -echo) — canonical mode preserved...");
       void this.sendProgrammaticInput(0, "stty -echo\n");
 
-      this.transitionState("provisioning", "handleSerialLifecycle");
-      this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
+      Logger.info("VM", "[PROVISIONING] Sending guest filesystem mount stabilization barrier...");
+      const mountCommand = "mkdir -p /mnt/9p 2>/dev/null\n" +
+        "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
+        "  mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+        "fi\n" +
+        "mkdir -p /mnt/9p/root/.provision 2>/dev/null\n" +
+        "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+        "if [ -d /root/.provision ]; then\n" +
+        "  echo '<<<MOUNT_STABILIZED>>>'\n" +
+        "else\n" +
+        "  echo '<<<MOUNT_FAILED>>>'\n" +
+        "fi\n";
+      void this.sendProgrammaticInput(0, mountCommand);
 
-      Logger.info("VM", "[PROVISIONING] Root prompt detected. Starting atomic provisioning via PROVISION_* protocol...");
-
-      if (this.onSerialOutput) {
-        this.onSerialOutput("\r\n\x1b[1;33m[VM] Provisioning user environment silently...\x1b[0m\r\n");
-      }
-
-      // Dynamic provisioning timeout
-      let timeoutMs = 45000;
-      if (this.wasRestoredFromSnapshot) {
-        timeoutMs = 60000;
-      } else {
-        timeoutMs = 75000;
-      }
-      if (this.orchestrator.getStage() > RecoveryStage.NONE) {
-        timeoutMs += 15000;
-      }
-
-      this.timeouts.register("provisioning_watchdog", timeoutMs, () => {
-        this._onProvisioningWatchdogFired();
+      this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
+        Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
+        this.orchestrator.triggerRecovery("mount stabilization timeout");
       });
 
-      // Pass the raw savedState ArrayBuffer directly — no base64 encoding.
-      // The ProvisioningController will send it as a binary PROVISION_WRITE_BINARY
-      // message that the worker writes via create_file().
-      void this.provisioning.startProvisioning(
-        this.savedState,
-        GUEST_INSPECT_SCRIPT,
-        this.transport.hasSerial1Support(),
-        activeGenId
-      );
+      this.provisioningSearchBuffer = "";
     }
   }
 

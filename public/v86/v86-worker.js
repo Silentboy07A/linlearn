@@ -177,6 +177,14 @@ function flushSerialBuffer() {
  */
 function setLifecycleState(newState) {
   if (lifecycleState !== newState) {
+    var stateOrder = ["idle", "loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready"];
+    var currentIndex = stateOrder.indexOf(lifecycleState);
+    var targetIndex = stateOrder.indexOf(newState);
+    if (currentIndex !== -1 && targetIndex !== -1 && targetIndex < currentIndex) {
+      log("warn", "[TRANSITION BLOCKED] Dropped backward transition: " + lifecycleState + " -> " + newState);
+      return;
+    }
+
     console.log("[WORKER STATE_CHANGED EMISSION]", newState);
     var oldState = lifecycleState;
     lifecycleState = newState;
@@ -448,6 +456,24 @@ var WorkerProvisioner = {
   transitionTo: function(newState) {
     log("info", "[WorkerProvisioner] FSM State: " + this.state + " -> " + newState);
     this.state = newState;
+  },
+
+  verifyExecId: function(execId) {
+    if (execId < this.execId) {
+      log("warn", "[WorkerProvisioner] Rejected stale message: message execId (" + execId + ") < active execId (" + this.execId + ")");
+      return false;
+    }
+    if (execId > this.execId) {
+      log("info", "[WorkerProvisioner] Monotonic execId progression: active " + this.execId + " -> " + execId + ". Resetting transfer assembly state.");
+      this.execId = execId;
+      this.chunks = [];
+      this.receivedCount = 0;
+      this.totalExpected = 0;
+      this.active = false;
+      this.state = "idle";
+      this.registeredHelpers = {};
+    }
+    return true;
   },
 
   /**
@@ -1878,11 +1904,19 @@ self.onmessage = async function (e) {
     // They implement atomic file transfer to replace base64 serial injection.
 
     case "PROVISION_BEGIN":
+      if (!WorkerProvisioner.verifyExecId(payload.execId)) {
+        postToHost("PROVISION_NACK", { execId: payload.execId, reason: "stale_execution_id" });
+        break;
+      }
       WorkerProvisioner.begin(payload);
       postToHost("PROVISION_ACK", { type: "begin", execId: payload.execId });
       break;
 
     case "PROVISION_CHUNK": {
+      if (!WorkerProvisioner.verifyExecId(payload.execId)) {
+        postToHost("PROVISION_NACK", { execId: payload.execId, chunkIndex: payload.chunkIndex, reason: "stale_execution_id" });
+        break;
+      }
       var chunkOk = WorkerProvisioner.addChunk(payload);
       if (chunkOk) {
         postToHost("PROVISION_ACK", { type: "chunk", execId: payload.execId, chunkIndex: payload.chunkIndex });
@@ -1894,6 +1928,10 @@ self.onmessage = async function (e) {
     }
 
     case "PROVISION_END": {
+      if (!WorkerProvisioner.verifyExecId(payload.execId)) {
+        postToHost("PROVISION_NACK", { execId: payload.execId, reason: "stale_execution_id" });
+        break;
+      }
       var endOk = WorkerProvisioner.finalize(payload);
       if (endOk) {
         postToHost("PROVISION_ACK", { type: "end", execId: payload.execId });
@@ -1905,6 +1943,10 @@ self.onmessage = async function (e) {
     }
 
     case "PROVISION_WRITE": {
+      if (!WorkerProvisioner.verifyExecId(payload.execId)) {
+        postToHost("PROVISION_NACK", { execId: payload.execId, reason: "stale_execution_id" });
+        break;
+      }
       // Write the assembled script to the VM filesystem via create_file().
       // This is the key step that replaces base64 serial injection.
       var writeExecId = payload.execId;
@@ -1929,6 +1971,10 @@ self.onmessage = async function (e) {
     }
 
     case "PROVISION_WRITE_BINARY": {
+      if (!WorkerProvisioner.verifyExecId(payload.execId)) {
+        postToHost("PROVISION_NACK", { execId: payload.execId, reason: "stale_execution_id" });
+        break;
+      }
       // Write the user home backup blob directly to the VM filesystem.
       // payload.data is a Uint8Array transferred via structured clone (no base64).
       var binaryExecId = payload.execId;
@@ -1952,6 +1998,10 @@ self.onmessage = async function (e) {
     }
 
     case "PROVISION_EXECUTE": {
+      if (!WorkerProvisioner.verifyExecId(payload.execId)) {
+        postToHost("PROVISION_NACK", { execId: payload.execId, reason: "stale_execution_id" });
+        break;
+      }
       var execFilePath = payload.filePath;
       var execExecId = payload.execId;
       var expectedInode = payload.verifiedInode || "unknown";

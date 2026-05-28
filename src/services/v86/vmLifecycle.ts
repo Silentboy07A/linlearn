@@ -46,6 +46,15 @@ export function setLifecycleState(
 ): boolean {
   if (lifecycleState === newState) return false;
 
+  // Prevent backward transitions for the bootstrap-to-ready sequence
+  const stateOrder: EmulatorState[] = ["idle", "loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready"];
+  const currentIndex = stateOrder.indexOf(lifecycleState);
+  const targetIndex = stateOrder.indexOf(newState);
+  if (currentIndex !== -1 && targetIndex !== -1 && targetIndex < currentIndex) {
+    log("warn", `[TRANSITION BLOCKED] Dropped backward transition: ${lifecycleState} -> ${newState} (source: ${source})`);
+    return false;
+  }
+
   // Validate transition
   const allowed = VALID_TRANSITIONS[lifecycleState]?.has(newState) ?? false;
   if (!allowed) {
