@@ -30,7 +30,7 @@ export interface VMSessionConfig {
   timeoutMs: number;
 }
 
-export type VMStateName = "idle" | "loading" | "booting" | "provision_preparing" | "provisioning" | "shell_ready" | "terminal_ready" | "ready" | "stopping" | "stopped" | "error";
+export type VMStateName = "idle" | "loading" | "booting" | "interactive" | "provisioning" | "shell_ready" | "terminal_ready" | "ready" | "stopping" | "stopped" | "error";
 
 export interface VMState {
   state: VMStateName;

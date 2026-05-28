@@ -1,7 +1,7 @@
 // src/services/v86/vmLifecycle.ts
 import { log } from "./logger";
 
-export type EmulatorState = "idle" | "loading" | "booting" | "provision_preparing" | "provisioning" | "shell_ready" | "terminal_ready" | "ready" | "stopping" | "stopped" | "error";
+export type EmulatorState = "idle" | "loading" | "booting" | "interactive" | "provisioning" | "shell_ready" | "terminal_ready" | "ready" | "stopping" | "stopped" | "error";
 
 interface DedicatedWorkerGlobal {
   postMessage(message: unknown, transfer?: Transferable[]): void;
@@ -15,8 +15,8 @@ let lastTransitionTimestamp = 0;
 const VALID_TRANSITIONS: Record<EmulatorState, Set<EmulatorState>> = {
   idle:                new Set<EmulatorState>(["loading", "stopped"]),
   loading:             new Set<EmulatorState>(["booting", "ready", "error", "stopped"]),
-  booting:             new Set<EmulatorState>(["provision_preparing", "ready", "error", "stopped"]),
-  provision_preparing: new Set<EmulatorState>(["provisioning", "ready", "error", "stopped"]),
+  booting:             new Set<EmulatorState>(["interactive", "ready", "error", "stopped"]),
+  interactive:         new Set<EmulatorState>(["provisioning", "ready", "error", "stopped"]),
   provisioning:        new Set<EmulatorState>(["shell_ready", "ready", "error", "stopped"]),
   shell_ready:         new Set<EmulatorState>(["terminal_ready", "ready", "error", "stopped"]),
   terminal_ready:      new Set<EmulatorState>(["ready", "error", "stopped"]),
@@ -47,7 +47,7 @@ export function setLifecycleState(
   if (lifecycleState === newState) return false;
 
   // Prevent backward transitions for the bootstrap-to-ready sequence
-  const stateOrder: EmulatorState[] = ["idle", "loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready"];
+  const stateOrder: EmulatorState[] = ["idle", "loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
   const currentIndex = stateOrder.indexOf(lifecycleState);
   const targetIndex = stateOrder.indexOf(newState);
   if (currentIndex !== -1 && targetIndex !== -1 && targetIndex < currentIndex) {
@@ -101,7 +101,7 @@ export function canSendInput(): boolean {
   return (
     lifecycleState === "terminal_ready" ||
     lifecycleState === "ready" ||
-    lifecycleState === "provision_preparing" ||
+    lifecycleState === "interactive" ||
     lifecycleState === "provisioning"
   );
 }

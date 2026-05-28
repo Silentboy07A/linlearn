@@ -96,7 +96,7 @@ export type EmulatorAction =
 // Maps each action type to the set of lifecycle states from which it is valid.
 const ACTION_VALID_FROM: Record<EmulatorAction["type"], Set<VMStateName> | "always" | "alive"> = {
   START:         new Set<VMStateName>(["idle", "stopped", "error"]),
-  STOP:          new Set<VMStateName>(["loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready", "stopping"]),
+  STOP:          new Set<VMStateName>(["loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready", "stopping"]),
   RECOVER_SHELL: "alive",
   SOFT_REBOOT:   "alive",
   COLD_BOOT:     "alive",
@@ -175,10 +175,28 @@ export class VMController {
   private lifecycleMutex = new AsyncMutex();
   private actionToken = 0;
 
+  // ─── Shell Readiness Gate ─────────────────────────────────────────────────
+  // Tracks conditions required before serial input may be sent programmatically.
+  // The gate opens when ALL of the following are satisfied:
+  //   1. SERIAL_READY stage notification received from worker
+  //   2. At least one shell prompt (# / % / $) observed in serial stream
+  //   3. No active INIT_STAGE transitions pending
+  //   4. Runtime state is not 'loading' or 'booting'
+  private receivedSerialReady = false;
+  private hasSeenPrompt = false;
+  private pendingInitStage = false;
+  private shellReadinessResolved = false;
+  private shellReadinessResolvers: Array<() => void> = [];
+
+  // ─── Deferred Input Queue ─────────────────────────────────────────────────
+  // Programmatic serial inputs sent before the interactive gate is open are
+  // enqueued here and flushed upon transition to 'interactive'.
+  private deferredInputQueue: Array<{ port: number; data: string }> = [];
+
   constructor(config: Partial<VMSessionConfig> = {}) {
     this.transport = new TransportCoordinator(() => {
       const state = this.lifecycle.getState().state;
-      return state !== "loading" && state !== "booting" && state !== "provisioning" && state !== "shell_ready" && state !== "terminal_ready";
+      return state !== "loading" && state !== "booting" && state !== "interactive" && state !== "provisioning" && state !== "shell_ready" && state !== "terminal_ready";
     });
     this.transport.setSerialAttachedChecker(() => {
       return this.lifecycle.getFullState().terminal !== "detached";
@@ -304,7 +322,7 @@ export class VMController {
     token: number
   ): Promise<void> {
     const state = this.lifecycle.getState().state;
-    if (this.initPromise || state === "loading" || state === "booting" || state === "provision_preparing" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "ready") {
+    if (this.initPromise || state === "loading" || state === "booting" || state === "interactive" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "ready") {
       Logger.warn("VM", `[START IGNORED] VM is already starting, booting, or active (state: ${state}). Ignoring duplicate START.`);
       this.orchestrator.recordDuplicateStartSuppression();
       return;
@@ -546,12 +564,22 @@ export class VMController {
     this.provisioning.reset();
     this.provisioningSearchBuffer = "";
 
+    // Reset shell readiness gate for new session
+    this.receivedSerialReady = false;
+    this.hasSeenPrompt = false;
+    this.pendingInitStage = false;
+    this.shellReadinessResolved = false;
+    this.shellReadinessResolvers = [];
+    this.deferredInputQueue = [];
+
     this.transitionState("loading", "VMController.start");
     this.lifecycle.transitionTerminalTo("attached", "VMController.start");
 
     const workerUrl = `${origin}/v86/v86-worker.js?v=${Date.now()}`;
 
     // Start boot watchdog timeout
+    // NOTE: During loading/booting we only extend based on serial activity.
+    // We never probe the shell during these phases — shell is not yet interactive.
     this.timeouts.register("boot_watchdog", this.config.timeoutMs, async () => {
       const state = this.lifecycle.getState().state;
       if (state === "loading" || state === "booting") {
@@ -560,8 +588,16 @@ export class VMController {
           this.timeouts.extend("boot_watchdog", 15000);
           return;
         }
-        
-        // Probe shell responsiveness
+
+        // Only probe shell if we are past the early boot phase (shell readiness gate open)
+        if (!this.shellReadinessResolved) {
+          Logger.warn("VM", `[BOOT WATCHDOG] Shell not yet interactive — skipping probe. Stalled in state: ${state}`);
+          this.useMinimalFallback = true;
+          this.orchestrator.triggerRecovery("boot timeout exceeded (shell not ready)");
+          return;
+        }
+
+        // Probe shell responsiveness only after shell is confirmed interactive
         const shellResponsive = await this.probeShellResponsiveness();
         if (shellResponsive) {
           Logger.info("VM", "[BOOT WATCHDOG] Shell responded to probe. Extending boot timeout.");
@@ -606,6 +642,17 @@ export class VMController {
             const stagePayload = payload as { stage: string; ts: number };
             const stage = stagePayload.stage;
             this.timeouts.cancel("init_watchdog");
+
+            // Mark that an INIT_STAGE is in progress — shell readiness gate depends on this
+            this.pendingInitStage = true;
+
+            // SERIAL_READY is the last stage; after it we know serial is attached
+            if (stage === "SERIAL_READY") {
+              this.receivedSerialReady = true;
+              this.pendingInitStage = false;
+              Logger.info("VM", "[SHELL GATE] SERIAL_READY received. Serial port is now attached.");
+              this.checkInteractiveShellReadiness();
+            }
             
             // Phase-specific watchdog timeout durations
             let timeoutMs = 12000; // default 12s
@@ -820,7 +867,7 @@ export class VMController {
               }
 
               // Prevent host backward FSM transitions for the bootstrap-to-ready sequence
-              const stateOrder: VMStateName[] = ["idle", "loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready"];
+              const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
               const currentState = this.lifecycle.getState().state;
               const currentIndex = stateOrder.indexOf(currentState);
               const targetIndex = stateOrder.indexOf(mappedState);
@@ -991,8 +1038,8 @@ export class VMController {
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
     const activeGenId = activeGen ? activeGen.id : 0;
 
-    // Check for mount stabilization markers during provision_preparing state
-    if (this.lifecycle.getState().state === "provision_preparing") {
+    // Check for mount stabilization markers during interactive state
+    if (this.lifecycle.getState().state === "interactive") {
       if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_OK>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
         this.timeouts.cancel("mount_stabilization_watchdog");
         Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
@@ -1121,49 +1168,143 @@ export class VMController {
       this.provisioningSearchBuffer = "";
     }
 
-    // ── Boot ready: root prompt detected, start provisioning ──
+    // ── Boot ready: root prompt detected → update shell readiness gate ──
     const isBootingState = this.lifecycle.getState().state === "booting";
+    if (hasRootPrompt) {
+      // Signal that we've seen a shell prompt — gate condition 2
+      if (!this.hasSeenPrompt) {
+        this.hasSeenPrompt = true;
+        Logger.info("VM", "[SHELL GATE] First root prompt observed in serial stream.");
+        this.checkInteractiveShellReadiness();
+      }
+    }
+
     if (hasRootPrompt && isBootingState && this.provisioning.getState() === "idle") {
-      // Ensure prompt is stable for a minimum duration (1000ms of quiet/silence)
-      const now = Date.now();
-      const quietDuration = now - this.lastSerialOutputTimestamp;
-      if (quietDuration < 1000) {
+      // Wait for prompt to be stable using event-driven awaitPromptStable()
+      void this.awaitPromptStable(1000).then(() => {
+        if (this.lifecycle.getState().state !== "booting" || this.provisioning.getState() !== "idle") return;
+
         this.timeouts.cancel("prompt_stabilization");
-        this.timeouts.register("prompt_stabilization", 1000 - quietDuration, () => {
-          this.handleSerialLifecycle("");
-        });
-        return;
-      }
-      this.timeouts.cancel("prompt_stabilization");
-      this.timeouts.cancel("boot_watchdog");
+        this.timeouts.cancel("boot_watchdog");
 
-      Logger.info("VM", "<<<VM_BOOT_COMPLETE>>>");
-      if (this.onSerialOutput) {
-        this.onSerialOutput("\r\n\x1b[1;32m<<<VM_BOOT_COMPLETE>>>\x1b[0m\r\n");
-      }
-      this.bootCompleted = true;
-      this.lifecycle.setBootComplete(true);
-      this.startFileVisibilityVerification(
-        "/root/.provision/mount_prepare.sh",
-        () => {
-          Logger.info("VM", "[PROVISIONING] mount_prepare.sh guest visibility verified. Transitioning to provision_preparing.");
-          this.transitionState("provision_preparing", "handleSerialLifecycle");
-          
-          Logger.info("VM", "[PROVISIONING] Executing guest mount stabilization helper script...");
-          void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
-
-          this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
-            Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
-            this.handleVisibilityFailure();
-          });
-        },
-        () => {
-          Logger.error("VM", "[PROVISIONING] mount_prepare.sh guest visibility check timed out.");
-          this.handleVisibilityFailure();
+        Logger.info("VM", "<<<VM_BOOT_COMPLETE>>>");
+        if (this.onSerialOutput) {
+          this.onSerialOutput("\r\n\x1b[1;32m<<<VM_BOOT_COMPLETE>>>\x1b[0m\r\n");
         }
-      );
+        this.bootCompleted = true;
+        this.lifecycle.setBootComplete(true);
 
-      this.provisioningSearchBuffer = "";
+        // Wait for interactive shell gate to fully open before sending any serial commands
+        void this.waitForInteractiveShell().then(() => {
+          this.startFileVisibilityVerification(
+            "/root/.provision/mount_prepare.sh",
+            () => {
+              Logger.info("VM", "[PROVISIONING] mount_prepare.sh guest visibility verified. Transitioning to interactive.");
+              this.transitionState("interactive", "handleSerialLifecycle");
+
+              // Flush any deferred inputs that were queued before shell was ready
+              this._flushDeferredInputQueue();
+
+              Logger.info("VM", "[PROVISIONING] Executing guest mount stabilization helper script...");
+              void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+
+              this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
+                Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
+                this.handleVisibilityFailure();
+              });
+            },
+            () => {
+              Logger.error("VM", "[PROVISIONING] mount_prepare.sh guest visibility check timed out.");
+              this.handleVisibilityFailure();
+            }
+          );
+        });
+
+        this.provisioningSearchBuffer = "";
+      });
+    }
+  }
+
+  // ─── Shell Readiness Gate ─────────────────────────────────────────────────
+
+  /**
+   * Returns a Promise that resolves only when the interactive shell is confirmed
+   * ready. All conditions must be met:
+   *   1. SERIAL_READY received from worker
+   *   2. A root shell prompt was observed in serial output
+   *   3. No INIT_STAGE transition is pending
+   *   4. Runtime state is not 'loading' or 'booting'
+   * If the gate is already open, resolves immediately.
+   */
+  public waitForInteractiveShell(): Promise<void> {
+    if (this.shellReadinessResolved) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.shellReadinessResolvers.push(resolve);
+    });
+  }
+
+  /**
+   * Called whenever any shell readiness condition changes.
+   * Opens the gate if all conditions are now satisfied.
+   */
+  private checkInteractiveShellReadiness(): void {
+    if (this.shellReadinessResolved) return;
+
+    const state = this.lifecycle.getState().state;
+    const isEarlyBoot = state === "loading" || state === "booting";
+    const allConditionsMet =
+      this.receivedSerialReady &&
+      this.hasSeenPrompt &&
+      !this.pendingInitStage &&
+      !isEarlyBoot;
+
+    // In practice the prompt may arrive before SERIAL_READY or after — handle both orderings.
+    // Allow the gate to open if prompt AND state are valid even before SERIAL_READY if the prompt
+    // unambiguously arrived during the booting state (we relax receivedSerialReady in that case).
+    const promptReceivedInBootingState = this.hasSeenPrompt && state === "booting";
+
+    if (allConditionsMet || promptReceivedInBootingState) {
+      this.shellReadinessResolved = true;
+      Logger.info("VM", "[SHELL GATE] Interactive shell readiness confirmed. Flushing deferred input queue.");
+      // Resolve all waiting callers
+      const resolvers = this.shellReadinessResolvers.splice(0);
+      for (const resolve of resolvers) resolve();
+    }
+  }
+
+  /**
+   * Waits for the serial stream to be quiet for at least `quietMs` milliseconds
+   * (no new characters arriving), then resolves. This is the event-driven
+   * replacement for setTimeout-based prompt stabilization.
+   */
+  private awaitPromptStable(quietMs: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const check = () => {
+        const age = Date.now() - this.lastSerialOutputTimestamp;
+        if (age >= quietMs) {
+          resolve();
+        } else {
+          // Re-check after the remaining quiet period has elapsed
+          this.timeouts.register("prompt_stabilization", quietMs - age, check);
+        }
+      };
+      this.timeouts.cancel("prompt_stabilization");
+      check();
+    });
+  }
+
+  /**
+   * Flush all deferred programmatic inputs that were queued while the shell
+   * was not yet interactive. Called after the gate opens.
+   */
+  private _flushDeferredInputQueue(): void {
+    if (this.deferredInputQueue.length === 0) return;
+    Logger.info("VM", `[SHELL GATE] Flushing ${this.deferredInputQueue.length} deferred input(s) now that shell is interactive.`);
+    const queue = this.deferredInputQueue.splice(0);
+    for (const item of queue) {
+      void this.transport.send(item.port, item.data);
     }
   }
 
@@ -1524,7 +1665,7 @@ export class VMController {
     // Interactivity is decoupled: keyboard input allowed when VM is booting/provisioning/running
     // sendInput does NOT mutate lifecycle — no dispatch() needed.
     const status = this.lifecycle.getState().state;
-    if (status !== "ready" && status !== "booting" && status !== "provision_preparing" && status !== "provisioning" && status !== "shell_ready" && status !== "terminal_ready") {
+    if (status !== "ready" && status !== "booting" && status !== "interactive" && status !== "provisioning" && status !== "shell_ready" && status !== "terminal_ready") {
       Logger.warn("VM", `Refusing input: VM in state: ${status}`);
       return;
     }
@@ -1543,10 +1684,35 @@ export class VMController {
     }
   }
 
+  /**
+   * Queue a programmatic serial input for deferred delivery.
+   * The input will be sent once the interactive shell gate is open.
+   * Use this instead of sendProgrammaticInput when the gate may not yet be open.
+   */
+  public queueProgrammaticInput(port: number, data: string): void {
+    if (this.shellReadinessResolved) {
+      // Gate already open — send immediately
+      void this.transport.send(port, data);
+    } else {
+      Logger.info("VM", `[SHELL GATE] Deferring serial input (port=${port}): ${JSON.stringify(data.slice(0, 64))}`);
+      this.deferredInputQueue.push({ port, data });
+    }
+  }
+
   public sendProgrammaticInput(port: number, data: string): Promise<void> {
     const stateName = this.lifecycle.getState().state;
+
+    // Hard block: never send programmatic input during early boot phases.
+    // Commands sent during loading/booting would be injected before the shell
+    // is interactive, causing "Ignored serial input in non-interactive state" errors
+    // and TTY desynchronization.
+    if (stateName === "loading" || stateName === "booting") {
+      Logger.warn("VM", `[SHELL GATE] Deferring programmatic input during '${stateName}' phase (port=${port}): ${JSON.stringify(data.slice(0, 64))}`);
+      this.deferredInputQueue.push({ port, data });
+      return Promise.resolve();
+    }
+
     if (
-      stateName === "ready" ||
       stateName === "error" ||
       stateName === "stopped" ||
       stateName === "stopping" ||

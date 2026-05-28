@@ -120,7 +120,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
     case "SET_RUNNING":
       if (
         getLifecycleState() === "booting" ||
-        getLifecycleState() === "provision_preparing" ||
+        getLifecycleState() === "interactive" ||
         getLifecycleState() === "provisioning" ||
         getLifecycleState() === "shell_ready" ||
         getLifecycleState() === "terminal_ready"
@@ -133,7 +133,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       break;
 
     case "SET_PROVISIONING":
-      if (getLifecycleState() === "booting") {
+      if (getLifecycleState() === "booting" || getLifecycleState() === "interactive") {
         setLifecycleState("provisioning", "SET_PROVISIONING");
         log("info", "Emulator transitioned to provisioning state");
       } else {
@@ -284,7 +284,7 @@ async function handleStop() {
   if (
     currentState !== "ready" &&
     currentState !== "booting" &&
-    currentState !== "provision_preparing" &&
+    currentState !== "interactive" &&
     currentState !== "provisioning" &&
     currentState !== "shell_ready" &&
     currentState !== "terminal_ready"
@@ -320,7 +320,7 @@ async function handleRestart() {
   if (
     currentState === "ready" ||
     currentState === "booting" ||
-    currentState === "provision_preparing" ||
+    currentState === "interactive" ||
     currentState === "provisioning" ||
     currentState === "shell_ready" ||
     currentState === "terminal_ready"
@@ -359,7 +359,7 @@ async function handleDestroy() {
   if (
     currentState === "ready" ||
     currentState === "booting" ||
-    currentState === "provision_preparing" ||
+    currentState === "interactive" ||
     currentState === "provisioning" ||
     currentState === "shell_ready" ||
     currentState === "terminal_ready"

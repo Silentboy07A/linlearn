@@ -37,8 +37,8 @@ export class VMLifecycleManager {
   private static readonly VALID_TRANSITIONS: Record<VMStateName, Set<VMStateName>> = {
     idle:                new Set<VMStateName>(["loading", "stopped"]),
     loading:             new Set<VMStateName>(["booting", "ready", "error", "stopped"]),
-    booting:             new Set<VMStateName>(["provision_preparing", "ready", "error", "stopped"]),
-    provision_preparing: new Set<VMStateName>(["provisioning", "ready", "error", "stopped"]),
+    booting:             new Set<VMStateName>(["interactive", "ready", "error", "stopped"]),
+    interactive:         new Set<VMStateName>(["provisioning", "ready", "error", "stopped"]),
     provisioning:        new Set<VMStateName>(["shell_ready", "ready", "error", "stopped"]),
     shell_ready:         new Set<VMStateName>(["terminal_ready", "ready", "error", "stopped"]),
     terminal_ready:      new Set<VMStateName>(["ready", "error", "stopped"]),
@@ -227,7 +227,7 @@ export class VMLifecycleManager {
     return (
       this.currentState.state === "loading" ||
       this.currentState.state === "booting" ||
-      this.currentState.state === "provision_preparing" ||
+      this.currentState.state === "interactive" ||
       this.currentState.state === "provisioning" ||
       this.currentState.state === "shell_ready" ||
       this.currentState.state === "terminal_ready"

@@ -177,7 +177,7 @@ function flushSerialBuffer() {
  */
 function setLifecycleState(newState) {
   if (lifecycleState !== newState) {
-    var stateOrder = ["idle", "loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready"];
+    var stateOrder = ["idle", "loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
     var currentIndex = stateOrder.indexOf(lifecycleState);
     var targetIndex = stateOrder.indexOf(newState);
     if (currentIndex !== -1 && targetIndex !== -1 && targetIndex < currentIndex) {
@@ -208,7 +208,7 @@ function canSendInput() {
   return (
     lifecycleState === "ready" ||
     lifecycleState === "terminal_ready" ||
-    lifecycleState === "provision_preparing" ||
+    lifecycleState === "interactive" ||
     lifecycleState === "provisioning"
   );
 }
@@ -415,11 +415,11 @@ var FilesystemAccessPolicy = {
                " | path=" + path);
 
     // Rule 1: Trusted Internal Operations Bypass (PROVISIONING_SYSTEM, RECOVERY_SYSTEM, INTERNAL_RUNTIME)
-    // Allowed during: booting, provision_preparing, provisioning, shell_ready, terminal_ready, and ready.
+    // Allowed during: booting, interactive, provisioning, shell_ready, terminal_ready, and ready.
     if (source === this.SOURCES.PROVISIONING_SYSTEM || 
         source === this.SOURCES.RECOVERY_SYSTEM || 
         source === this.SOURCES.INTERNAL_RUNTIME) {
-      if (state === "booting" || state === "provision_preparing" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "ready") {
+      if (state === "booting" || state === "interactive" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "ready") {
         return { allowed: true };
       }
       return {
@@ -1326,7 +1326,7 @@ self.onmessage = async function (e) {
         log("warn", "Ignored serial input in non-interactive state: " + lifecycleState);
         break;
       }
-      if (lifecycleState === "provision_preparing" || lifecycleState === "provisioning") {
+      if (lifecycleState === "interactive" || lifecycleState === "provisioning") {
         inputBuffer += payload;
         if (inputBuffer.indexOf("\n") !== -1) {
           var parts = inputBuffer.split("\n");
@@ -1356,7 +1356,7 @@ self.onmessage = async function (e) {
       break;
 
     case "SET_RUNNING":
-      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "provision_preparing" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready") {
+      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "interactive" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready") {
         setLifecycleState("ready");
         log("info", "Emulator successfully transitioned to ready state (boot complete)");
       } else {
@@ -1365,7 +1365,7 @@ self.onmessage = async function (e) {
       break;
 
     case "SET_PROVISIONING":
-      if (lifecycleState === "booting") {
+      if (lifecycleState === "booting" || lifecycleState === "interactive") {
         setLifecycleState("provisioning");
         log("info", "Emulator transitioned to provisioning state");
       } else {
