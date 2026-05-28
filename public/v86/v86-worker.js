@@ -687,8 +687,16 @@ var WorkerProvisioner = {
     log("info", "[WorkerProvisioner] Waiting 500ms for 9p FS propagation to guest namespace...");
     await new Promise(function(r) { setTimeout(r, 500); });
 
+    // Pre-write all FSM helper scripts before starting the MountVisibilityFSM.
+    // This ensures doMount(), doVerify(), doRemount(), and doDiagnostics() can
+    // dispatch via short single-line tty commands ("sh /root/.provision/prov_XXX_N.sh")
+    // instead of inline compound shell programs that trigger PS2 continuation deadlocks.
+    log("info", "[WorkerProvisioner] Pre-writing FSM helper scripts via create_file()...");
+    await this.prepareHelperScripts(emu, this.execId, filePath);
+
     // Guest namespace synchronization & verification step
     var guestVerification = await this.verifyGuestVisibility(emu, filePath, this.execId);
+
     
     this.transitionTo("executable");
     var writeLatency = Date.now() - startTime;
@@ -736,6 +744,183 @@ var WorkerProvisioner = {
    *
    * Always resolves — never rejects. Returns { visible: bool, elapsedMs: number }.
    */
+  /**
+   * Prepare FSM helper scripts by writing them to the VM filesystem via create_file().
+   * These scripts replace long inline shell one-liners sent over the interactive tty.
+   * Each script is short, self-contained, and emits a single FSM marker to /dev/ttyS0.
+   * The tty then only receives: "sh /root/.provision/prov_XXX_N.sh\n" (one short line).
+   */
+  prepareHelperScripts: async function(emu, execId, filePath) {
+    var base = "/root/.provision";
+    var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+
+    function encode(s) {
+      if (encoder) return encoder.encode(s);
+      var b = new Uint8Array(s.length);
+      for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xFF;
+      return b;
+    }
+
+    function makeTag(state, result) {
+      return "<<<FSM:" + execId + ":" + state + ":" + result + ">>>";
+    }
+
+    // ── Mount script ───────────────────────────────────────────────────────────
+    // Mounts host9p at /mnt/9p and emits OK or ERR marker.
+    var mountScript =
+      "#!/bin/sh\n" +
+      "stty -echo > /dev/null 2>&1\n" +
+      "# Check kernel 9p filesystem support\n" +
+      "b_i=0; b_ok=0\n" +
+      "while [ $b_i -lt 30 ]; do\n" +
+      "  if [ -f /proc/filesystems ] && grep -q 9p /proc/filesystems && [ -f /proc/mounts ]; then\n" +
+      "    b_ok=1; break\n" +
+      "  fi\n" +
+      "  sleep 1; b_i=$((b_i+1))\n" +
+      "done\n" +
+      "if [ $b_ok -eq 0 ]; then\n" +
+      "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0; exit 1\n" +
+      "fi\n" +
+      "# Mount if not already mounted\n" +
+      "mkdir -p /mnt/9p /root/.provision > /dev/null 2>&1\n" +
+      "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
+      "  mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+      "fi\n" +
+      "# Poll until /mnt/9p is accessible with debounce\n" +
+      "i=0; ok=0\n" +
+      "while [ $i -lt 15 ]; do\n" +
+      "  if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
+      "    sleep 1\n" +
+      "    if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
+      "      ok=1; break\n" +
+      "    fi\n" +
+      "  fi\n" +
+      "  sleep 1; i=$((i+1))\n" +
+      "done\n" +
+      "if [ $ok -eq 1 ]; then\n" +
+      "  echo '" + makeTag("MOUNTING", "OK") + "' > /dev/ttyS0\n" +
+      "else\n" +
+      "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0\n" +
+      "fi\n";
+
+    // ── Verify script ──────────────────────────────────────────────────────────
+    // Checks that the provisioning file exists and is readable; emits VIS or NOVIS.
+    var fp = filePath;
+    var verifyScript =
+      "#!/bin/sh\n" +
+      "stty -echo > /dev/null 2>&1\n" +
+      "sync\n" +
+      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1 && cat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "  inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "  echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
+      "else\n" +
+      "  echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
+      "fi\n";
+
+    // ── Remount script ─────────────────────────────────────────────────────────
+    // Unmounts and remounts host9p, then emits OK or ERR.
+    var remountScript =
+      "#!/bin/sh\n" +
+      "stty -echo > /dev/null 2>&1\n" +
+      "umount -f /mnt/9p > /dev/null 2>&1; umount /mnt/9p > /dev/null 2>&1\n" +
+      "mkdir -p /mnt/9p > /dev/null 2>&1\n" +
+      "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null ||\n" +
+      "   mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null ||\n" +
+      "   mount -t 9p host9p /mnt/9p 2>/dev/null; then\n" +
+      "  mkdir -p /root/.provision > /dev/null 2>&1\n" +
+      "  i=0; ok=0\n" +
+      "  while [ $i -lt 15 ]; do\n" +
+      "    if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
+      "      sleep 1\n" +
+      "      if stat /mnt/9p > /dev/null 2>&1 && ls /mnt/9p > /dev/null 2>&1; then\n" +
+      "        ok=1; break\n" +
+      "      fi\n" +
+      "    fi\n" +
+      "    sleep 1; i=$((i+1))\n" +
+      "  done\n" +
+      "  if [ $ok -eq 1 ]; then\n" +
+      "    echo '" + makeTag("REMOUNT", "OK") + "' > /dev/ttyS0\n" +
+      "  else\n" +
+      "    echo '" + makeTag("REMOUNT", "ERR") + "' > /dev/ttyS0\n" +
+      "  fi\n" +
+      "else\n" +
+      "  echo '" + makeTag("REMOUNT", "ERR") + "' > /dev/ttyS0\n" +
+      "fi\n";
+
+    // ── Diagnostics script ─────────────────────────────────────────────────────
+    var diagScript =
+      "#!/bin/sh\n" +
+      "stty -echo > /dev/null 2>&1\n" +
+      "echo '[DIAG:MOUNT]' > /dev/ttyS0\n" +
+      "mount 2>/dev/null > /dev/ttyS0 || echo 'mount-failed' > /dev/ttyS0\n" +
+      "echo '[DIAG:DF]' > /dev/ttyS0\n" +
+      "df 2>/dev/null > /dev/ttyS0 || echo 'df-failed' > /dev/ttyS0\n" +
+      "echo '[DIAG:LS]' > /dev/ttyS0\n" +
+      "ls -la /mnt/9p 2>/dev/null > /dev/ttyS0 || echo 'ls-failed' > /dev/ttyS0\n" +
+      "echo '[DIAG:LS_PROVISION]' > /dev/ttyS0\n" +
+      "ls -la /root/.provision 2>/dev/null > /dev/ttyS0 || echo 'ls-failed' > /dev/ttyS0\n" +
+      "echo '[DIAG:STAT]' > /dev/ttyS0\n" +
+      "stat '" + fp + "' 2>/dev/null > /dev/ttyS0 || echo 'stat-failed' > /dev/ttyS0\n" +
+      "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>' > /dev/ttyS0\n";
+
+    // ── Revalidation script ────────────────────────────────────────────────────
+    var okMarkerPrefix = "<<<EXEC_REVAL:" + execId + ":OK>>>";
+    var failMarker = "<<<EXEC_REVAL:" + execId + ":FAIL>>>";
+    var revalScript =
+      "#!/bin/sh\n" +
+      "stty -echo > /dev/null 2>&1\n" +
+      "sync\n" +
+      "echo '[EXEC_DIAG:PWD]' > /dev/ttyS0; pwd > /dev/ttyS0\n" +
+      "echo '[EXEC_DIAG:MOUNTS]' > /dev/ttyS0\n" +
+      "cat /proc/mounts > /dev/ttyS0 2>/dev/null || echo none > /dev/ttyS0\n" +
+      "echo '[EXEC_DIAG:LSPROVISION]' > /dev/ttyS0\n" +
+      "ls -la /root/.provision > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
+      "echo '[EXEC_DIAG:STAT]' > /dev/ttyS0\n" +
+      "stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
+      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1 && cat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "  inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "  echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "else\n" +
+      "  sleep 1\n" +
+      "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1 && cat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "    echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "  else\n" +
+      "    echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "  fi\n" +
+      "fi\n";
+
+    // Write all helper scripts via create_file()
+    try {
+      await emu.create_file(base + "/prov_mount_" + execId + ".sh", encode(mountScript));
+      log("info", "[WorkerProvisioner] Helper: prov_mount_" + execId + ".sh written (" + mountScript.length + " bytes)");
+      await emu.create_file(base + "/prov_verify_" + execId + ".sh", encode(verifyScript));
+      log("info", "[WorkerProvisioner] Helper: prov_verify_" + execId + ".sh written (" + verifyScript.length + " bytes)");
+      await emu.create_file(base + "/prov_remount_" + execId + ".sh", encode(remountScript));
+      log("info", "[WorkerProvisioner] Helper: prov_remount_" + execId + ".sh written (" + remountScript.length + " bytes)");
+      await emu.create_file(base + "/prov_diag_" + execId + ".sh", encode(diagScript));
+      log("info", "[WorkerProvisioner] Helper: prov_diag_" + execId + ".sh written (" + diagScript.length + " bytes)");
+      await emu.create_file(base + "/prov_reval_" + execId + ".sh", encode(revalScript));
+      log("info", "[WorkerProvisioner] Helper: prov_reval_" + execId + ".sh written (" + revalScript.length + " bytes)");
+      log("info", "[WorkerProvisioner] All FSM helper scripts written. TTY will only receive short dispatch commands.");
+    } catch (e) {
+      log("error", "[WorkerProvisioner] Failed to write helper scripts: " + String(e));
+      throw e;
+    }
+  },
+
+  /**
+   * MountVisibilityFSM — deterministic 9p mount, verify, and retry state machine.
+   *
+   * States: MOUNTING -> VERIFYING -> RETRY_VERIFY -> REMOUNT -> VERIFIED | FALLBACK
+   *
+   * CRITICAL: All shell logic is in pre-written helper script files.
+   * The TTY receives ONLY short single-line dispatch commands:
+   *   "sh /root/.provision/prov_mount_N.sh\n"
+   * This prevents shell continuation prompt (>) deadlocks entirely.
+   */
   verifyGuestVisibility: function(emu, filePath, execId) {
     var MAX_VERIFY_RETRIES = 6;
     var MAX_MOUNT_RETRIES = 3;
@@ -765,6 +950,9 @@ var WorkerProvisioner = {
     var readdirSuccess = false;
     var inodeReadiness = false;
     var stabilityCount = 0;
+
+    // Helper script base path
+    var base = "/root/.provision";
 
     log("info", "[MountVisibilityFSM] Starting for path: " + filePath + " execId=" + execId);
 
@@ -881,70 +1069,21 @@ var WorkerProvisioner = {
       };
       emu.add_listener("serial0-output-byte", listener);
 
-      function sendCmd(script) {
+      // sendCmd: reset buffer, set parserState, send a SHORT single-line dispatch command.
+      // All logic is in the helper scripts — the tty only receives "sh /path/to/script.sh\n".
+      function sendCmd(scriptPath) {
         rawBuffer = "";
         parserState = "waiting";
-        SerialChannelManager.send(0, script);
-      }
-
-      // Build a tagged shell command. Uses PS1='' and stty -echo to suppress noise.
-      // Each command emits a unique marker: <<<FSM:<execId>:<STATE>:OK/ERR/VIS/NOVIS>>>
-      function makeTag(state, result) {
-        return "<<<FSM:" + execId + ":" + state + ":" + result + ">>>";
+        log("info", "[MountVisibilityFSM] Dispatching: sh " + scriptPath);
+        SerialChannelManager.send(0, "sh " + scriptPath + "\n");
       }
 
       function doMount() {
         fsmState = "MOUNTING";
         mountStartTime = Date.now();
-        log("info", "[MountVisibilityFSM] MOUNTING: checking barriers and mounting host9p");
-        armTimeout(CMD_TIMEOUT_MS);
-        
-        var cmd =
-          "stty -echo 2>/dev/null; PS1=''; " +
-          // 1. Wait barriers function
-          "wait_barriers() { " +
-          "  [ -f /proc/filesystems ] || return 1; " +
-          "  grep -q 9p /proc/filesystems || return 1; " +
-          "  [ -f /proc/mounts ] || return 1; " +
-          "  cat /proc/mounts >/dev/null 2>&1 || return 1; " +
-          "  return 0; " +
-          "}; " +
-          // 2. Poll barriers
-          "b_i=0; b_ok=0; " +
-          "while [ $b_i -lt 30 ]; do " +
-          "  if wait_barriers; then b_ok=1; break; fi; " +
-          "  sleep 0.1; b_i=$((b_i+1)); " +
-          "done; " +
-          "if [ $b_ok -eq 0 ]; then echo '" + makeTag("MOUNTING", "ERR") + "'; exit 1; fi; " +
-          // 3. Perform mount if not already mounted
-          "check_mnt() { " +
-          "  stat /mnt/9p >/dev/null 2>&1 || return 1; " +
-          "  ls /mnt/9p >/dev/null 2>&1 || return 1; " +
-          "  _ino=$(stat -c %i /mnt/9p 2>/dev/null); [ -n \"$_ino\" ] || return 1; " +
-          "  ls -f /mnt/9p >/dev/null 2>&1 || return 1; " +
-          "  return 0; " +
-          "}; " +
-          "if ! grep -q host9p /proc/mounts 2>/dev/null; then " +
-          "  mkdir -p /mnt/9p 2>/dev/null; " +
-          "  mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          "  mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-          "  mount -t 9p host9p /mnt/9p 2>/dev/null; " +
-          "fi; " +
-          "mkdir -p /root/.provision 2>/dev/null; " +
-          // 4. Poll check_mnt with debounce stabilization
-          "i=0; ok=0; " +
-          "while [ $i -lt 15 ]; do " +
-          "  if check_mnt; then " +
-          "    sleep 0.5; " +
-          "    if check_mnt; then ok=1; break; fi; " +
-          "  fi; " +
-          "  sleep 0.2; i=$((i+1)); " +
-          "done; " +
-          "if [ $ok -eq 1 ]; then " +
-          "  echo '" + makeTag("MOUNTING", "OK") + "'; " +
-          "else echo '" + makeTag("MOUNTING", "ERR") + "'; fi\n";
-          
-        sendCmd(cmd);
+        log("info", "[MountVisibilityFSM] MOUNTING: dispatching helper script");
+        armTimeout(CMD_TIMEOUT_MS + 30000); // Mount can take up to ~30s extra for sleep loops
+        sendCmd(base + "/prov_mount_" + execId + ".sh");
       }
 
       function doVerify(isStabilityCheck) {
@@ -954,67 +1093,27 @@ var WorkerProvisioner = {
           retryCount = verifyAttempt;
         }
         
-        // Calculate exponential backoff delay: base 300ms, backoff factor 2, capped at 4000ms.
-        // For stability check cycles, we use a quick 200ms delay.
         var delay = isStabilityCheck ? 200 : Math.min(4000, 300 * Math.pow(2, verifyAttempt - 1));
         log("info", "[MountVisibilityFSM] VERIFYING" + (isStabilityCheck ? " (stability check " + (stabilityCount + 1) + "/" + STABILITY_CHECKS + ")" : " attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES) + " for " + filePath + " after delay of " + delay + "ms");
         
         setTimeout(function() {
           if (finished) return;
           armTimeout(CMD_TIMEOUT_MS);
-          var cmd =
-            "stty -echo 2>/dev/null; PS1=''; " +
-            "sync; " +
-            "if [ -f '" + filePath + "' ] && stat '" + filePath + "' >/dev/null 2>&1 && ls '" + filePath + "' >/dev/null 2>&1 && cat '" + filePath + "' >/dev/null 2>&1; then " +
-            "inode=$(stat -c %i '" + filePath + "' 2>/dev/null || echo 'unknown'); " +
-            "echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\"; " +
-            "else echo '" + makeTag("VERIFYING", "NOVIS") + "'; fi\n";
-          sendCmd(cmd);
+          sendCmd(base + "/prov_verify_" + execId + ".sh");
         }, delay);
       }
 
       function doRemount() {
         fsmState = "REMOUNT";
-        log("info", "[MountVisibilityFSM] REMOUNT: unmounting and remounting host9p and polling readiness (attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + ")");
-        armTimeout(CMD_TIMEOUT_MS);
-        
-        var cmd =
-          "stty -echo 2>/dev/null; PS1=''; " +
-          "umount -f /mnt/9p 2>/dev/null; " +
-          "umount /mnt/9p 2>/dev/null; " +
-          "check_mnt() { " +
-          "  stat /mnt/9p >/dev/null 2>&1 || return 1; " +
-          "  ls /mnt/9p >/dev/null 2>&1 || return 1; " +
-          "  _ino=$(stat -c %i /mnt/9p 2>/dev/null); [ -n \"$_ino\" ] || return 1; " +
-          "  ls -f /mnt/9p >/dev/null 2>&1 || return 1; " +
-          "  return 0; " +
-          "}; " +
-          "mkdir -p /mnt/9p 2>/dev/null; " +
-          "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p host9p /mnt/9p 2>/dev/null; then " +
-          "  mkdir -p /root/.provision 2>/dev/null; " +
-          "  i=0; ok=0; " +
-          "  while [ $i -lt 15 ]; do " +
-          "    if check_mnt; then " +
-          "      sleep 0.5; " +
-          "      if check_mnt; then ok=1; break; fi; " +
-          "    fi; " +
-          "    sleep 0.2; i=$((i+1)); " +
-          "  done; " +
-          "  if [ $ok -eq 1 ]; then echo '" + makeTag("REMOUNT", "OK") + "'; " +
-          "  else echo '" + makeTag("REMOUNT", "ERR") + "'; fi; " +
-          "else echo '" + makeTag("REMOUNT", "ERR") + "'; fi\n";
-          
-        sendCmd(cmd);
+        log("info", "[MountVisibilityFSM] REMOUNT: dispatching helper script (attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + ")");
+        armTimeout(CMD_TIMEOUT_MS + 20000);
+        sendCmd(base + "/prov_remount_" + execId + ".sh");
       }
 
       function scheduleRemount() {
         if (remountAttemptsCount < MAX_MOUNT_RETRIES) {
           remountAttemptsCount++;
-          // Exponential backoff: base 500ms, backoff factor 2, capped at 6000ms
           var delay = Math.min(6000, 500 * Math.pow(2, remountAttemptsCount - 1));
-          // Jitter: add random 0-300ms
           var jitter = Math.floor(Math.random() * 300);
           var finalDelay = delay + jitter;
           log("warn", "[MountVisibilityFSM] Scheduling remount attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + " in " + finalDelay + "ms (backoff=" + delay + "ms, jitter=" + jitter + "ms)");
@@ -1031,18 +1130,8 @@ var WorkerProvisioner = {
       function doDiagnostics() {
         fsmState = "DIAGNOSTICS";
         log("warn", "[MountVisibilityFSM] Verification exhausted. Dumping namespace diagnostics.");
-        armTimeout(5000);
-        
-        var cmd =
-          "stty -echo 2>/dev/null; PS1=''; " +
-          "echo '[DIAG:MOUNT]'; mount 2>/dev/null || echo 'mount-failed'; " +
-          "echo '[DIAG:DF]'; df 2>/dev/null || echo 'df-failed'; " +
-          "echo '[DIAG:LS]'; ls -la /mnt/9p 2>/dev/null || echo 'ls-failed'; " +
-          "echo '[DIAG:LS_PROVISION]'; ls -la /root/.provision 2>/dev/null || echo 'ls-failed'; " +
-          "echo '[DIAG:STAT]'; stat '" + filePath + "' 2>/dev/null || echo 'stat-failed'; " +
-          "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>'\n";
-          
-        sendCmd(cmd);
+        armTimeout(5000 + CMD_TIMEOUT_MS);
+        sendCmd(base + "/prov_diag_" + execId + ".sh");
       }
 
       function advance(event, extra) {
@@ -1108,7 +1197,8 @@ var WorkerProvisioner = {
 
   /**
    * Pre-execution revalidation.
-   * Compares inodes, checks file visibility/readability, gathers diagnostics.
+   * Verifies file visibility/readability before triggering execution.
+   * Uses a pre-written helper script instead of inline tty commands.
    */
   revalidateBeforeExecution: function(emu, filePath, execId, expectedInode) {
     var CMD_TIMEOUT_MS = 6000;
@@ -1121,7 +1211,6 @@ var WorkerProvisioner = {
     log("info", "[WorkerProvisioner] Starting pre-execution revalidation for: " + filePath + 
                " | Expected Inode: " + expectedInode + " | Exec ID: " + execId);
 
-    // Persistence Telemetry (Requirement 7)
     log("info", "[WorkerProvisioner PERSISTENCE TELEMETRY] Path: " + filePath + 
                " | Expected Inode: " + expectedInode + 
                " | Exec ID: " + execId +
@@ -1151,9 +1240,8 @@ var WorkerProvisioner = {
         }, ms);
       }
 
-      var tag = "EXEC_REVAL:" + execId;
-      var okMarkerPrefix = "<<<" + tag + ":OK>>>";
-      var failMarker = "<<<" + tag + ":FAIL>>>";
+      var okMarkerPrefix = "<<<EXEC_REVAL:" + execId + ":OK>>>";
+      var failMarker = "<<<EXEC_REVAL:" + execId + ":FAIL>>>";
 
       listener = function(byte) {
         if (finished) return;
@@ -1190,27 +1278,12 @@ var WorkerProvisioner = {
       };
       emu.add_listener("serial0-output-byte", listener);
 
-      // Start revalidation command after a minor delay
-      armTimeout(CMD_TIMEOUT_MS);
-      var cmd =
-        "stty -echo 2>/dev/null; PS1=''; " +
-        "sync; " +
-        "echo '[EXEC_DIAG:PWD]'; pwd; " +
-        "echo '[EXEC_DIAG:MOUNTS]'; cat /proc/mounts 2>/dev/null || echo 'none'; " +
-        "echo '[EXEC_DIAG:LSPROVISION]'; ls -la /root/.provision 2>/dev/null || echo 'ls-failed'; " +
-        "echo '[EXEC_DIAG:STAT]'; stat '" + filePath + "' 2>/dev/null || echo 'stat-failed'; " +
-        "check_file() { [ -f '" + filePath + "' ] && stat '" + filePath + "' >/dev/null 2>&1 && ls '" + filePath + "' >/dev/null 2>&1 && cat '" + filePath + "' >/dev/null 2>&1; }; " +
-        "if check_file; then " +
-        "inode=$(stat -c %i '" + filePath + "' 2>/dev/null || echo 'unknown'); " +
-        "echo '" + okMarkerPrefix + "':\"$inode\"; " +
-        "else " +
-        "sleep 1; " +
-        "if check_file; then " +
-        "inode=$(stat -c %i '" + filePath + "' 2>/dev/null || echo 'unknown'); " +
-        "echo '" + okMarkerPrefix + "':\"$inode\"; " +
-        "else echo '" + failMarker + "'; fi; fi\n";
-
-      SerialChannelManager.send(0, cmd);
+      // Dispatch the pre-written revalidation helper script.
+      // Short single-line command — no inline shell over tty.
+      armTimeout(CMD_TIMEOUT_MS + 10000);
+      var helperPath = "/root/.provision/prov_reval_" + execId + ".sh";
+      log("info", "[WorkerProvisioner] Dispatching revalidation helper: sh " + helperPath);
+      SerialChannelManager.send(0, "sh " + helperPath + "\n");
     });
   },
 

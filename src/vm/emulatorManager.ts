@@ -960,6 +960,27 @@ export class VMController {
       }
     }
 
+    // ── PS2 continuation prompt recovery ──────────────────────────────────────
+    // If ash emits '> ' (PS2 prompt) during provisioning, it means the shell received
+    // an incomplete compound command and is waiting for more input. This is a deadlock.
+    // Recovery: send Ctrl+C (\x03) to abort, then a newline to clear the line.
+    const provisioningActive =
+      this.provisioning.getState() === "preparing" ||
+      this.provisioning.getState() === "transferring" ||
+      this.provisioning.getState() === "executing" ||
+      this.provisioning.getState() === "waiting_completion";
+
+    if (provisioningActive && (
+      this.provisioningSearchBuffer.endsWith("\n> ") ||
+      this.provisioningSearchBuffer.endsWith("\r\n> ") ||
+      this.provisioningSearchBuffer.endsWith("\n>\r") ||
+      this.provisioningSearchBuffer.endsWith("> \r")
+    )) {
+      Logger.warn("VM", "[PROVISIONING] PS2 continuation prompt detected (shell awaiting more input). Aborting with Ctrl+C...");
+      Logger.warn("VM", `[PROVISIONING] Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
+      void this.sendProgrammaticInput(0, "\x03\n");
+    }
+
     // ── Boot ready: root prompt detected, start provisioning ──
     if (hasRootPrompt && this.provisioning.getState() === "idle") {
       // Ensure prompt is stable for a minimum duration (1000ms of quiet/silence)
@@ -975,9 +996,11 @@ export class VMController {
       this.timeouts.cancel("prompt_stabilization");
       this.timeouts.cancel("boot_watchdog");
       
-      // Disable echo and canonical mode immediately to isolate the stream
-      Logger.info("VM", "[PROVISIONING] Disabling serial echo and line discipline (stty -echo -icanon) immediately...");
-      void this.sendProgrammaticInput(0, "stty -echo -icanon\n");
+      // Disable echo only — keep canonical mode (icanon) so ash can read full newline-terminated lines.
+      // Removing -icanon (raw mode) because it causes ash to receive characters without line buffering,
+      // which breaks long compound shell commands and triggers PS2 continuation prompt (>).
+      Logger.info("VM", "[PROVISIONING] Disabling serial echo (stty -echo) — canonical mode preserved...");
+      void this.sendProgrammaticInput(0, "stty -echo\n");
 
       this.transitionState("provisioning", "handleSerialLifecycle");
       this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
