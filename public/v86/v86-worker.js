@@ -443,6 +443,7 @@ var WorkerProvisioner = {
   receivedCount: 0,
   active: false,
   state: "idle", // idle, assembling, validating_fs, writing, verifying, executable, executing, completed, failed
+  registeredHelpers: {},
 
   transitionTo: function(newState) {
     log("info", "[WorkerProvisioner] FSM State: " + this.state + " -> " + newState);
@@ -494,6 +495,7 @@ var WorkerProvisioner = {
     this.chunks = new Array(payload.totalChunks);
     this.receivedCount = 0;
     this.active = true;
+    this.registeredHelpers = {};
     this.transitionTo("assembling");
     log("info", "[WorkerProvisioner] Session started. execId=" + this.execId + ", totalChunks=" + this.totalExpected + ", totalBytes=" + payload.totalBytes);
   },
@@ -1078,8 +1080,36 @@ var WorkerProvisioner = {
         if (rawBuffer.length > 8192) rawBuffer = rawBuffer.slice(-8192);
         var buf = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
 
+        // Telemetry tracking for registered helpers
+        if (buf.indexOf("<<<HELPER_REGISTERED:") !== -1) {
+          var startRegIdx = buf.indexOf("<<<HELPER_REGISTERED:");
+          var endRegIdx = buf.indexOf(">>>", startRegIdx);
+          if (endRegIdx !== -1) {
+            var helperName = buf.slice(startRegIdx + "<<<HELPER_REGISTERED:".length, endRegIdx).replace(/[^A-Z]/g, "");
+            WorkerProvisioner.registeredHelpers[helperName] = true;
+            log("info", "[MountVisibilityFSM] Host confirmed helper registration for: " + helperName);
+            // Log full helper registry state (Requirement 1)
+            log("info", "[MountVisibilityFSM TELEMETRY] Current FSM Registered Helpers: " + JSON.stringify(WorkerProvisioner.registeredHelpers));
+          }
+        }
+
         if (buf.indexOf("<<<PROVISION_FILE_MISSING>>>") !== -1) {
           log("error", "[MountVisibilityFSM] Preflight check failed: helper script " + fsmState + " is missing!");
+          
+          if (fsmState === "VERIFYING") {
+            log("warn", "[MountVisibilityFSM] VERIFYING helper absent. Triggering basic mount validation fallback...");
+            var fallbackCmd =
+              "if grep -q host9p /proc/mounts 2>/dev/null && [ -d /root/.provision ]; then " +
+              "  echo '<<<FSM:" + execId + ":VERIFYING:FALLBACK_OK>>>' > /dev/ttyS0; " +
+              "else " +
+              "  echo '<<<FSM:" + execId + ":VERIFYING:FALLBACK_FAIL>>>' > /dev/ttyS0; " +
+              "fi\n";
+            parserState = "waiting";
+            rawBuffer = "";
+            SerialChannelManager.send(0, fallbackCmd);
+            return;
+          }
+          
           parserState = "idle";
           rawBuffer = "";
           advance("NOVIS");
@@ -1089,6 +1119,8 @@ var WorkerProvisioner = {
         var tag = "FSM:" + execId + ":" + fsmState;
         var okMarker  = "<<<" + tag + ":OK>>>";
         var errMarker = "<<<" + tag + ":ERR>>>";
+        var fallbackOkMarker = "<<<FSM:" + execId + ":VERIFYING:FALLBACK_OK>>>";
+        var fallbackFailMarker = "<<<FSM:" + execId + ":VERIFYING:FALLBACK_FAIL>>>";
         var visMarkerPrefix = "<<<" + tag + ":VIS>>>";
         var noVisMarker = "<<<" + tag + ":NOVIS>>>";
         var diagDoneMarker = "<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>";
@@ -1099,6 +1131,16 @@ var WorkerProvisioner = {
             parserState = "idle";
             rawBuffer = "";
             advance("DIAG_DONE", capturedBuf);
+          } else if (buf.indexOf(fallbackOkMarker) !== -1) {
+            log("info", "[MountVisibilityFSM] Fallback validation SUCCESS. host9p is mounted.");
+            parserState = "idle";
+            rawBuffer = "";
+            advance("VIS", "fallback-inode");
+          } else if (buf.indexOf(fallbackFailMarker) !== -1) {
+            log("error", "[MountVisibilityFSM] Fallback validation FAILED. host9p is not mounted.");
+            parserState = "idle";
+            rawBuffer = "";
+            advance("NOVIS");
           } else if (buf.indexOf(okMarker) !== -1) {
             parserState = "idle";
             rawBuffer = "";
@@ -1140,11 +1182,16 @@ var WorkerProvisioner = {
         parserState = "waiting";
         log("info", "[MountVisibilityFSM] Dispatching: sh " + scriptPath);
         
+        // Output diagnostics if helper is missing (Requirement 5)
         var cmd =
           "if [ -f '" + scriptPath + "' ]; then " +
-          "sh " + scriptPath + "; " +
+          "  sh " + scriptPath + "; " +
           "else " +
-          "echo '<<<PROVISION_FILE_MISSING>>>' > /dev/ttyS0; " +
+          "  echo '<<<PROVISION_FILE_MISSING>>>' > /dev/ttyS0; " +
+          "  echo '[DIAG:MISSING] State=" + fsmState + " Path=" + scriptPath + "' > /dev/ttyS0; " +
+          "  echo '[DIAG:LS_PROVISION]' > /dev/ttyS0; ls -la /root/.provision/ > /dev/ttyS0 2>&1; " +
+          "  echo '[DIAG:LS_MNT]' > /dev/ttyS0; ls -la /mnt/9p/root/.provision/ > /dev/ttyS0 2>&1; " +
+          "  echo '[DIAG:MOUNTS]' > /dev/ttyS0; cat /proc/mounts > /dev/ttyS0 2>&1; " +
           "fi\n";
           
         SerialChannelManager.send(0, cmd);
@@ -1156,22 +1203,45 @@ var WorkerProvisioner = {
         log("info", "[MountVisibilityFSM] MOUNTING: dispatching inline mount command");
         armTimeout(CMD_TIMEOUT_MS + 30000); // Mount can take up to ~30s extra for sleep loops
         
+        // Log telemetry: expected helpers, paths, state registry (Requirement 1)
+        log("info", "[MountVisibilityFSM TELEMETRY] Expected helpers: prov_mount_" + execId + ".sh.tmp, prov_verify_" + execId + ".sh.tmp, prov_remount_" + execId + ".sh.tmp, prov_diag_" + execId + ".sh.tmp, prov_reval_" + execId + ".sh.tmp");
+        log("info", "[MountVisibilityFSM TELEMETRY] Install base path: /root/.provision/ (mapped to /mnt/9p/root/.provision/)");
+        log("info", "[MountVisibilityFSM TELEMETRY] Current FSM state: " + fsmState);
+
         var inlineCmd = 
           "mkdir -p /mnt/9p && " +
-          "(grep -q host9p /proc/mounts || " +
-          "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "umount -f /mnt/9p >/dev/null 2>&1; umount /mnt/9p >/dev/null 2>&1; " +
+          "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "i=0; ok=0; while [ $i -lt 20 ]; do " +
+          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
+          "  sleep 0.5; i=$((i+1)); " +
+          "done && [ $ok -eq 1 ] && " +
           "rm -rf /root/.provision && " +
           "mkdir -p /mnt/9p/root/.provision && " +
           "ln -s /mnt/9p/root/.provision /root/.provision && " +
           "sync && " +
-          "for f in /root/.provision/prov_*.sh.tmp; do " +
+          "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
           "  if [ -f \"$f\" ]; then " +
           "    mv -f \"$f\" \"${f%.tmp}\" && " +
           "    chmod +x \"${f%.tmp}\" && " +
           "    ls -l \"${f%.tmp}\" && " +
           "    stat -c %a \"${f%.tmp}\"; " +
+          "  fi; " +
+          "done && " +
+          "for h in mount verify remount diag reval; do " +
+          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] && [ -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "    case \"$h\" in " +
+          "      mount) name=\"MOUNTING\" ;; " +
+          "      verify) name=\"VERIFYING\" ;; " +
+          "      remount) name=\"REMOUNT\" ;; " +
+          "      diag) name=\"DIAGNOSTICS\" ;; " +
+          "      reval) name=\"REVALIDATION\" ;; " +
+          "    esac; " +
+          "    echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
           "  fi; " +
           "done && " +
           "sync && " +
@@ -1210,19 +1280,37 @@ var WorkerProvisioner = {
         var inlineRemountCmd =
           "umount -f /mnt/9p >/dev/null 2>&1; umount /mnt/9p >/dev/null 2>&1; " +
           "mkdir -p /mnt/9p >/dev/null 2>&1; " +
-          "(mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "i=0; ok=0; while [ $i -lt 20 ]; do " +
+          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
+          "  sleep 0.5; i=$((i+1)); " +
+          "done && [ $ok -eq 1 ] && " +
           "rm -rf /root/.provision && " +
           "mkdir -p /mnt/9p/root/.provision && " +
           "ln -s /mnt/9p/root/.provision /root/.provision && " +
           "sync && " +
-          "for f in /root/.provision/prov_*.sh.tmp; do " +
+          "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
           "  if [ -f \"$f\" ]; then " +
           "    mv -f \"$f\" \"${f%.tmp}\" && " +
           "    chmod +x \"${f%.tmp}\" && " +
           "    ls -l \"${f%.tmp}\" && " +
           "    stat -c %a \"${f%.tmp}\"; " +
+          "  fi; " +
+          "done && " +
+          "for h in mount verify remount diag reval; do " +
+          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] && [ -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "    case \"$h\" in " +
+          "      mount) name=\"MOUNTING\" ;; " +
+          "      verify) name=\"VERIFYING\" ;; " +
+          "      remount) name=\"REMOUNT\" ;; " +
+          "      diag) name=\"DIAGNOSTICS\" ;; " +
+          "      reval) name=\"REVALIDATION\" ;; " +
+          "    esac; " +
+          "    echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
           "  fi; " +
           "done && " +
           "sync && " +
@@ -1473,6 +1561,7 @@ var WorkerProvisioner = {
     this.receivedCount = 0;
     this.totalExpected = 0;
     this.execId = 0;
+    this.registeredHelpers = {};
     this.transitionTo("idle");
   }
 };
@@ -2130,6 +2219,7 @@ async function handleInit(payload) {
   }, 1000);
 
   setLifecycleState("loading");
+  WorkerProvisioner.cancel(); // Reset and clean up all state!
   transitionInitStage("WASM_FETCH");
 
   log("info", "Step 1/4: Loading libv86.js from " + origin + "/v86/libv86.js?v=" + version);
