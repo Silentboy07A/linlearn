@@ -177,12 +177,16 @@ function flushSerialBuffer() {
  */
 function setLifecycleState(newState) {
   if (lifecycleState !== newState) {
-    var stateOrder = ["idle", "loading", "booting", "interactive", "fs9p_ready", "provisioning", "shell_ready", "terminal_ready", "ready"];
+    var stateOrder = ["idle", "loading", "booting", "fs9p_ready", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
     var currentIndex = stateOrder.indexOf(lifecycleState);
     var targetIndex = stateOrder.indexOf(newState);
     if (currentIndex !== -1 && targetIndex !== -1 && targetIndex < currentIndex) {
       log("warn", "[TRANSITION BLOCKED] Dropped backward transition: " + lifecycleState + " -> " + newState);
       return;
+    }
+
+    if (lifecycleState === "fs9p_ready" && newState === "interactive") {
+      log("info", "[FSM_TRANSITION] fs9p_ready -> interactive");
     }
 
     console.log("[WORKER STATE_CHANGED EMISSION]", newState);

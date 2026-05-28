@@ -171,6 +171,8 @@ export class VMController {
   private pendingMaterializationFailed: (() => void) | null = null;
   private mountPrepareVerified = false;
   private isProvisioningAttemptStarted = false;
+  private provisioningExecutionStarted = false;
+  private provisioningExecutionCompleted = false;
 
   private lastOrigin: string = "";
   private useMinimalFallback: boolean = false;
@@ -574,6 +576,8 @@ export class VMController {
     this.provisioningSearchBuffer = "";
     this.mountPrepareVerified = false;
     this.isProvisioningAttemptStarted = false;
+    this.provisioningExecutionStarted = false;
+    this.provisioningExecutionCompleted = false;
 
     // Reset shell readiness preconditions for new session
     this.receivedSerialReady = false;
@@ -864,7 +868,7 @@ export class VMController {
               }
 
               // Prevent host backward FSM transitions for the bootstrap-to-ready sequence
-              const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "fs9p_ready", "provisioning", "shell_ready", "terminal_ready", "ready"];
+              const stateOrder: VMStateName[] = ["idle", "loading", "booting", "fs9p_ready", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
               const currentState = this.lifecycle.getState().state;
               const currentIndex = stateOrder.indexOf(currentState);
               const targetIndex = stateOrder.indexOf(mappedState);
@@ -875,6 +879,9 @@ export class VMController {
               }
 
               this.transitionState(mappedState, "worker STATE_CHANGED", true, "STATE_CHANGED");
+              if (mappedState === "fs9p_ready") {
+                this._tryTransitionToInteractive("worker-fs9p-ready");
+              }
             }
             break;
 
@@ -1051,11 +1058,12 @@ export class VMController {
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
     const activeGenId = activeGen ? activeGen.id : 0;
 
-    // Check for mount stabilization markers during fs9p_ready state
-    if (this.lifecycle.getState().state === "fs9p_ready") {
+    // Check for mount stabilization markers during interactive state
+    if (this.lifecycle.getState().state === "interactive") {
       if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_OK>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
         this.timeouts.cancel("mount_stabilization_watchdog");
         Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
+        this.provisioningExecutionCompleted = true;
         this.transitionState("provisioning", "handleSerialLifecycle");
         this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
 
@@ -1218,9 +1226,9 @@ export class VMController {
         // immediately. If not yet met, the transition will fire when they are.
         this._tryTransitionToInteractive("boot-complete-stable");
 
-        // Wait for FSM to reach "fs9p_ready" before starting mount_prepare execution.
-        // awaitFsmState() returns immediately if FSM is already "fs9p_ready" or beyond.
-        void this.awaitFsmState("fs9p_ready").then(() => {
+        // Wait for FSM to reach "interactive" before starting mount_prepare execution.
+        // awaitFsmState() returns immediately if FSM is already "interactive" or beyond.
+        void this.awaitFsmState("interactive").then(() => {
           // ARCHITECTURAL FIX: Do not poll the guest serial output for file visibility.
           // The worker emits FILE_MATERIALIZATION_VERIFIED after confirming the host-side
           // 9p inode write. We wait for that event (or a timeout), then directly execute
@@ -1241,57 +1249,86 @@ export class VMController {
   // The private booleans below are only precondition trackers that feed into
   // the FSM transition. They are never used to gate I/O directly.
 
+  private dumpDiagnosticLogs(): void {
+    const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+    const bridge = activeGen ? activeGen.bridge : null;
+    const workerState = bridge ? bridge.getState() : WorkerBridgeState.UNINITIALIZED;
+    const workerResponding = activeGen ? activeGen.isValid && workerState === WorkerBridgeState.READY : false;
+    const cpuRunning = this.healthMonitor ? (this.healthMonitor as unknown as { isHealthy: boolean }).isHealthy : true;
+    const stateName = this.lifecycle.getState().state;
+    const shellGateAllowed = (
+      stateName === "interactive" ||
+      stateName === "provisioning" ||
+      stateName === "shell_ready" ||
+      stateName === "terminal_ready" ||
+      stateName === "ready"
+    );
+
+    Logger.info("VM", "=== VM SYSTEM DIAGNOSTICS ===");
+    Logger.info("VM", `  - currentLifecycleState: ${stateName}`);
+    Logger.info("VM", `  - promptDetected: ${this.hasSeenPrompt}`);
+    Logger.info("VM", `  - serialReady: ${this.receivedSerialReady}`);
+    Logger.info("VM", `  - workerHealthy: ${workerResponding}`);
+    Logger.info("VM", `  - cpuRunning: ${cpuRunning}`);
+    Logger.info("VM", `  - shellGateAllowed: ${shellGateAllowed}`);
+    Logger.info("VM", "=============================");
+  }
+
   /**
-   * Attempt to transition the FSM from "booting" to "interactive".
+   * Attempt to transition the FSM from "booting" or "fs9p_ready" to "interactive".
    * Called whenever any precondition changes. Does nothing if:
-   *   - FSM is not in "booting" state (already transitioned or wrong state)
+   *   - FSM is not in "booting" or "fs9p_ready" state
    *   - Not all preconditions are satisfied
-   *
-   * When successful:
-   *   - FSM transitions to "interactive"
-   *   - Deferred input queue is flushed atomically
-   *   - [INTERACTIVE_ENTER] is logged
-   *
-   * If preconditions are met but FSM is still in "booting", this is a
-   * split-brain condition and is logged as [FSM_SPLIT_BRAIN].
    */
   private _tryTransitionToInteractive(trigger: string): void {
     const state = this.lifecycle.getState().state;
 
-    // Only transition from "booting"
-    if (state !== "booting") {
-      // Detect split-brain: conditions met but FSM isn't in "booting"
+    // Log diagnostic logs
+    this.dumpDiagnosticLogs();
+
+    // Only transition from "booting" or "fs9p_ready"
+    if (state !== "booting" && state !== "fs9p_ready") {
+      // Detect split-brain: conditions met but FSM isn't in "booting" or "fs9p_ready"
       if (this.hasSeenPrompt && this.receivedSerialReady && state !== "interactive" &&
           state !== "provisioning" && state !== "shell_ready" && state !== "terminal_ready" && state !== "ready") {
         Logger.warn("VM",
           `[FSM_SPLIT_BRAIN] Shell conditions met (prompt=${this.hasSeenPrompt}, serialReady=${this.receivedSerialReady}) ` +
-          `but FSM is in state '${state}' (trigger: ${trigger}). Expected 'booting' or 'interactive+'.`
+          `but FSM is in state '${state}' (trigger: ${trigger}). Expected 'booting', 'fs9p_ready', or 'interactive+'.`
         );
       }
       return;
     }
 
-    // Check all preconditions
-    const conditionsLog = `serialReady=${this.receivedSerialReady}, prompt=${this.hasSeenPrompt}, pendingStage=${this.pendingInitStage}`;
+    const promptDetected = this.hasSeenPrompt;
+    const serialReady = this.receivedSerialReady;
+    const fs9pReady = state === "fs9p_ready" || this.mountPrepareVerified;
 
-    if (!this.receivedSerialReady || !this.hasSeenPrompt || this.pendingInitStage) {
-      Logger.debug("VM", `[SHELL GATE] Preconditions not yet satisfied (trigger: ${trigger}). ${conditionsLog}`);
+    const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+    const bridge = activeGen ? activeGen.bridge : null;
+    const workerState = bridge ? bridge.getState() : WorkerBridgeState.UNINITIALIZED;
+    const workerResponding = activeGen ? activeGen.isValid && workerState === WorkerBridgeState.READY : false;
+
+    if (!promptDetected || !serialReady) {
+      Logger.debug("VM", `[SHELL GATE] Preconditions not yet satisfied (trigger: ${trigger}). promptDetected=${promptDetected}, serialReady=${serialReady}`);
       return;
     }
 
-    // All conditions met — transition FSM to "interactive"
-    Logger.info("VM", `[INTERACTIVE_ENTER] All shell preconditions satisfied (trigger: ${trigger}). ${conditionsLog}. Transitioning FSM: booting → interactive.`);
-
-    const succeeded = this.transitionState("interactive", `shell-gate:${trigger}`);
-    if (succeeded) {
-      Logger.info("VM", `[FSM_SYNC_OK] FSM successfully transitioned to 'interactive' (trigger: ${trigger}).`);
-      // Flush the deferred queue atomically AFTER the FSM state change
-      this._flushDeferredInputQueue();
+    // Invariant: if promptDetected && serialReady && fs9pReady, transition to interactive!
+    if (fs9pReady && workerResponding) {
+      Logger.info("VM", `[INTERACTIVE_ENTER] Invariant satisfied (promptDetected=${promptDetected}, serialReady=${serialReady}, fs9pReady=true, workerResponding=true). Transitioning to interactive.`);
+      const succeeded = this.transitionState("interactive", `shell-gate:${trigger}`);
+      if (succeeded) {
+        Logger.info("VM", `[FSM_SYNC_OK] FSM successfully transitioned to 'interactive' (trigger: ${trigger}).`);
+        // Flush the deferred queue atomically AFTER the FSM state change
+        this._flushDeferredInputQueue();
+      } else {
+        Logger.error("VM",
+          `[FSM_SPLIT_BRAIN] FSM transition to interactive FAILED despite all preconditions being met ` +
+          `(trigger: ${trigger}). Current state: ${this.lifecycle.getState().state}`
+        );
+      }
     } else {
-      Logger.error("VM",
-        `[FSM_SPLIT_BRAIN] FSM transition booting → interactive FAILED despite all preconditions being met ` +
-        `(trigger: ${trigger}). ${conditionsLog}. Current state: ${this.lifecycle.getState().state}`
-      );
+      Logger.debug("VM", `[SHELL GATE] Waiting for fs9pReady or workerResponding. fs9pReady=${fs9pReady}, workerResponding=${workerResponding}`);
     }
   }
 
@@ -1304,7 +1341,7 @@ export class VMController {
    * between FSM transitions and async continuation chains.
    */
   public awaitFsmState(targetState: VMStateName): Promise<void> {
-    const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "fs9p_ready", "provisioning", "shell_ready", "terminal_ready", "ready"];
+    const stateOrder: VMStateName[] = ["idle", "loading", "booting", "fs9p_ready", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
     const targetIdx = stateOrder.indexOf(targetState);
 
     const checkReached = (): boolean => {
@@ -1787,7 +1824,7 @@ export class VMController {
     }
 
     // Defer during early boot — FSM has not yet transitioned to "interactive"
-    if (stateName === "loading" || stateName === "booting") {
+    if (stateName === "loading" || stateName === "booting" || stateName === "fs9p_ready") {
       Logger.warn("VM",
         `[SHELL GATE] Deferring programmatic input: FSM in '${stateName}' (port=${port}). ` +
         `Input queued until FSM reaches 'interactive'. Data: ${JSON.stringify(data.slice(0, 64))}`
@@ -1908,8 +1945,13 @@ export class VMController {
 
     const executeMountScript = () => {
       Logger.info("VM", "[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Executing mount_prepare.sh in guest.");
+      this.provisioningExecutionStarted = true;
       void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
       this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
+        if (!this.provisioningExecutionStarted) {
+          Logger.warn("VM", "[PROVISIONING] mount_stabilization_watchdog fired, but execution was never actually attempted. Skipping.");
+          return;
+        }
         Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
         this.handleVisibilityFailure();
       });
@@ -1961,6 +2003,25 @@ export class VMController {
    * Only escalates to full recovery chain if reinject itself fails.
    */
   private handleVisibilityFailure(): void {
+    const stateName = this.lifecycle.getState().state;
+    const isInteractiveOrBeyond = (
+      stateName === "interactive" ||
+      stateName === "provisioning" ||
+      stateName === "shell_ready" ||
+      stateName === "terminal_ready" ||
+      stateName === "ready"
+    );
+
+    if (!isInteractiveOrBeyond) {
+      Logger.warn("VM", `[PROVISIONING] handleVisibilityFailure: FSM in non-interactive state '${stateName}'. Aborting reinjection.`);
+      return;
+    }
+
+    if (!this.provisioningExecutionStarted && stateName !== "interactive") {
+      Logger.warn("VM", `[PROVISIONING] handleVisibilityFailure: Execution not started and FSM in state '${stateName}'. Aborting reinjection.`);
+      return;
+    }
+
     Logger.error("VM", "[PROVISIONING] handleVisibilityFailure: Triggering PROVISIONING_REINJECTION (targeted file reinject).");
     Logger.error("VM", "[PROVISIONING] This targets the host-side 9p file injection layer, NOT the TTY/shell/serial transport.");
 

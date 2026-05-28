@@ -68,6 +68,27 @@ export class RecoveryPolicyEngine {
     const isBootingOrLoading = health.runtimeState === "loading" || health.runtimeState === "booting";
     const isProvisioning = health.runtimeState === "provisioning" || health.runtimeState === "shell_ready" || health.runtimeState === "terminal_ready";
     
+    // Calculate serial health based on serial activity or serial1 heartbeat response
+    const isSerialHealthy = health.lastSerialOutputAgeMs < 30000 || (health.hasSerial1 && health.lastHeartbeatAgeMs < 30000);
+    const promptDetected = health.runtimeState !== "loading" && health.runtimeState !== "booting";
+    
+    // Check if VM runtime is healthy
+    const isRuntimeHealthy = 
+      health.runtimeState !== "error" && 
+      health.runtimeState !== "stopped" && 
+      health.workerResponding && 
+      health.cpuRunning && 
+      isSerialHealthy && 
+      promptDetected;
+
+    if (isRuntimeHealthy) {
+      Logger.info("VM", "[RecoveryOrchestrator] VM runtime is verified healthy. Suppressing destructive/re-init actions.");
+      return {
+        decision: "no-op",
+        reason: "Recovery suppressed: VM runtime is verified healthy (CPU running, worker responding, serial healthy, prompt detected)."
+      };
+    }
+
     // Active boot protection: during loading/booting/provisioning, limit destructive actions
     if (isBootingOrLoading || isProvisioning) {
       if (health.workerResponding && health.cpuRunning) {
@@ -203,6 +224,15 @@ export class RecoveryOrchestrator {
       Logger.warn("VM", `Skipping recovery trigger: VM is in ${this.recoveryState} state.`);
       return;
     }
+
+    // Classify failure trigger
+    let classification = "UNKNOWN_FAILURE";
+    if (reason.includes("split-brain") || reason.includes("coordination") || reason.includes("deadlock") || reason.includes("FSM") || reason.includes("interactive")) {
+      classification = "STATE_COORDINATION_FAILURE";
+    } else if (reason.includes("mount") || reason.includes("file") || reason.includes("reinject") || reason.includes("materialization")) {
+      classification = "FILESYSTEM_FAILURE";
+    }
+    Logger.warn("VM", `[RECOVERY_CLASSIFICATION] Classifying recovery trigger "${reason}" as failure category: ${classification}`);
 
     Logger.warn("VM", `Triggering recovery flow due to: ${reason}`);
     this.lastRecoveryTimestamp = now;

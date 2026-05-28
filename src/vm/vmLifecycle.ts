@@ -37,9 +37,9 @@ export class VMLifecycleManager {
   private static readonly VALID_TRANSITIONS: Record<VMStateName, Set<VMStateName>> = {
     idle:                new Set<VMStateName>(["loading", "stopped"]),
     loading:             new Set<VMStateName>(["booting", "ready", "error", "stopped"]),
-    booting:             new Set<VMStateName>(["interactive", "fs9p_ready", "ready", "error", "stopped"]),
-    interactive:         new Set<VMStateName>(["fs9p_ready", "provisioning", "ready", "error", "stopped"]),
-    fs9p_ready:          new Set<VMStateName>(["provisioning", "ready", "error", "stopped"]),
+    booting:             new Set<VMStateName>(["fs9p_ready", "interactive", "ready", "error", "stopped"]),
+    fs9p_ready:          new Set<VMStateName>(["interactive", "provisioning", "ready", "error", "stopped"]),
+    interactive:         new Set<VMStateName>(["provisioning", "ready", "error", "stopped"]),
     provisioning:        new Set<VMStateName>(["shell_ready", "ready", "error", "stopped"]),
     shell_ready:         new Set<VMStateName>(["terminal_ready", "ready", "error", "stopped"]),
     terminal_ready:      new Set<VMStateName>(["ready", "error", "stopped"]),
@@ -86,6 +86,10 @@ export class VMLifecycleManager {
     const oldState = this.currentState.state;
 
     if (oldState === newState) return true;
+
+    if (oldState === "fs9p_ready" && newState === "interactive") {
+      Logger.info("VM", "[FSM_TRANSITION] fs9p_ready -> interactive");
+    }
 
     const allowed = VMLifecycleManager.VALID_TRANSITIONS[oldState]?.has(newState) ?? false;
 
