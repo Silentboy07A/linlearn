@@ -454,13 +454,16 @@ export class ProvisioningController {
 
   private onStateChange: (state: ProvisioningState) => void;
   private onPostMessage: (type: string, payload: unknown) => void;
+  private verifyFileVisibility: (filePath: string, onVerified: () => void, onError: () => void) => void;
 
   constructor(
     onStateChange: (state: ProvisioningState) => void,
-    onPostMessage: (type: string, payload: unknown) => void
+    onPostMessage: (type: string, payload: unknown) => void,
+    verifyFileVisibility: (filePath: string, onVerified: () => void, onError: () => void) => void
   ) {
     this.onStateChange = onStateChange;
     this.onPostMessage = onPostMessage;
+    this.verifyFileVisibility = verifyFileVisibility;
   }
 
   // ─── Public getters ───────────────────────────────────────────────────────
@@ -983,14 +986,25 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
         // Start timer waiting for execution to start
         this._startExecStartTimer(ready.execId);
 
-        // Send execution trigger — worker will write single serial command
-        this.onPostMessage("PROVISION_EXECUTE", {
-          execId: this.currentExecutionId,
-          generation: this.activeBridgeGeneration,
-          filePath: ready.filePath,
-          verifiedInode: ready.telemetry?.verifiedInode || "unknown",
-          fallbackRequired: false
-        });
+        // Verify that the execute helper script is visible on guest before sending PROVISION_EXECUTE (Requirement 1 & 9)
+        const execScriptPath = `/root/.provision/prov_execute_${ready.execId}.sh`;
+        this.verifyFileVisibility(
+          execScriptPath,
+          () => {
+            Logger.info("VM", `[PROVISIONING] prov_execute_${ready.execId}.sh guest visibility confirmed. Sending execution trigger...`);
+            this.onPostMessage("PROVISION_EXECUTE", {
+              execId: this.currentExecutionId,
+              generation: this.activeBridgeGeneration,
+              filePath: ready.filePath,
+              verifiedInode: ready.telemetry?.verifiedInode || "unknown",
+              fallbackRequired: false
+            });
+          },
+          () => {
+            Logger.error("VM", `[PROVISIONING] prov_execute_${ready.execId}.sh visibility verification timed out.`);
+            this.handleProvisioningFailed(ready.execId, this.activeBridgeGeneration);
+          }
+        );
       } else {
         // Check again in 100ms
         setTimeout(checkStabilizationAndExecute, 100);

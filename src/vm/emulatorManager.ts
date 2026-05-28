@@ -157,6 +157,13 @@ export class VMController {
   // Provisioning matching buffer
   private provisioningSearchBuffer = "";
 
+  private fileVisibilityRetries = 0;
+  private fileVisibilityTimer: NodeJS.Timeout | null = null;
+  private isVerifyingVisibility = false;
+  private pendingOnVerified: (() => void) | null = null;
+  private pendingOnVisibilityError: (() => void) | null = null;
+  private verifyingFilePath = "";
+
   private lastOrigin: string = "";
   private useMinimalFallback: boolean = false;
 
@@ -187,7 +194,8 @@ export class VMController {
     // message channel, bypassing the serial write queue entirely.
     this.provisioning = new ProvisioningController(
       (state) => this.lifecycle.transitionProvisioningTo(state, "ProvisioningController"),
-      (type, payload) => this.transport.postProvision(type, payload)
+      (type, payload) => this.transport.postProvision(type, payload),
+      (filePath, onVerified, onError) => this.startFileVisibilityVerification(filePath, onVerified, onError)
     );
 
     // Initialize recovery orchestrator
@@ -928,6 +936,23 @@ export class VMController {
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.substring(this.provisioningSearchBuffer.length - 512);
     }
 
+    if (this.isVerifyingVisibility && this.provisioningSearchBuffer.includes("<<<PROVISION_FILES_VISIBLE>>>")) {
+      Logger.info("VM", `[PROVISIONING WATCHDOG] Visibility confirmed for ${this.verifyingFilePath} (STAGE:PROVISION_FILES_VISIBLE).`);
+      this.isVerifyingVisibility = false;
+      if (this.fileVisibilityTimer) {
+        clearTimeout(this.fileVisibilityTimer);
+        this.fileVisibilityTimer = null;
+      }
+      this.provisioningSearchBuffer = "";
+      this.pendingOnVisibilityError = null;
+      if (this.pendingOnVerified) {
+        const cb = this.pendingOnVerified;
+        this.pendingOnVerified = null;
+        cb();
+      }
+      return;
+    }
+
     const hasRootPrompt = this.provisioningSearchBuffer.endsWith("~% ") || 
                           this.provisioningSearchBuffer.endsWith("# ") || 
                           this.provisioningSearchBuffer.endsWith("~# ") ||
@@ -940,7 +965,7 @@ export class VMController {
       this.provisioning.getState() === "executing" ||
       this.provisioning.getState() === "waiting_completion";
 
-    if (provisioningActive && hasRootPrompt) {
+    if (provisioningActive && hasRootPrompt && !this.isVerifyingVisibility) {
       Logger.error("VM", `[PROVISIONING WATCHDOG] Prompt leakage detected: root prompt found in serial stream while provisioning is active. Aborting, resetting TTY, and restarting execution.`);
       Logger.warn("VM", `[PROVISIONING WATCHDOG] Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
       
@@ -955,7 +980,7 @@ export class VMController {
       return;
     }
 
-    if (provisioningActive && (char === "\n" || hasRootPrompt)) {
+    if (provisioningActive && (char === "\n" || hasRootPrompt) && !this.isVerifyingVisibility) {
       const lastOpen = this.provisioningSearchBuffer.lastIndexOf("<<<");
       const lastClose = this.provisioningSearchBuffer.lastIndexOf(">>>");
       if (lastOpen > lastClose) {
@@ -1118,15 +1143,25 @@ export class VMController {
       }
       this.bootCompleted = true;
       this.lifecycle.setBootComplete(true);
-      this.transitionState("provision_preparing", "handleSerialLifecycle");
-      
-      Logger.info("VM", "[PROVISIONING] Executing guest mount stabilization helper script...");
-      void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+      this.startFileVisibilityVerification(
+        "/root/.provision/mount_prepare.sh",
+        () => {
+          Logger.info("VM", "[PROVISIONING] mount_prepare.sh guest visibility verified. Transitioning to provision_preparing.");
+          this.transitionState("provision_preparing", "handleSerialLifecycle");
+          
+          Logger.info("VM", "[PROVISIONING] Executing guest mount stabilization helper script...");
+          void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
 
-      this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
-        Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
-        this.orchestrator.triggerRecovery("mount stabilization timeout");
-      });
+          this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
+            Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired. Guest mount did not stabilize in 15 seconds.");
+            this.handleVisibilityFailure();
+          });
+        },
+        () => {
+          Logger.error("VM", "[PROVISIONING] mount_prepare.sh guest visibility check timed out.");
+          this.handleVisibilityFailure();
+        }
+      );
 
       this.provisioningSearchBuffer = "";
     }
@@ -1598,6 +1633,58 @@ export class VMController {
       this.transport.hasSerial1Support()
     );
     this.healthMonitor.start();
+  }
+ 
+  public startFileVisibilityVerification(filePath: string, onVerified: () => void, onError: () => void) {
+    if (this.fileVisibilityTimer) {
+      clearTimeout(this.fileVisibilityTimer);
+      this.fileVisibilityTimer = null;
+    }
+    this.fileVisibilityRetries = 0;
+    this.isVerifyingVisibility = true;
+    this.verifyingFilePath = filePath;
+    this.pendingOnVerified = onVerified;
+    this.pendingOnVisibilityError = onError;
+    
+    this.pollFileVisibility();
+  }
+
+  private pollFileVisibility() {
+    if (!this.isVerifyingVisibility) return;
+    this.fileVisibilityRetries++;
+    if (this.fileVisibilityRetries > 8) {
+      Logger.error("VM", `[PROVISIONING WATCHDOG] Visibility check failed for ${this.verifyingFilePath} after 8 attempts.`);
+      this.isVerifyingVisibility = false;
+      if (this.pendingOnVisibilityError) {
+        const errCb = this.pendingOnVisibilityError;
+        this.pendingOnVisibilityError = null;
+        this.pendingOnVerified = null;
+        errCb();
+      }
+      return;
+    }
+
+    Logger.info("VM", `[PROVISIONING WATCHDOG] Polling guest visibility for ${this.verifyingFilePath} (attempt ${this.fileVisibilityRetries})...`);
+    
+    const checkCmd = `sync; echo 3 > /proc/sys/vm/drop_caches; [ -f "${this.verifyingFilePath}" ] && [ -s "${this.verifyingFilePath}" ] && [ -x "${this.verifyingFilePath}" ] && echo '<<<PROVISION_FILES_VISIBLE>>>'\n`;
+    void this.sendProgrammaticInput(0, checkCmd);
+
+    const delay = Math.min(1000 + (this.fileVisibilityRetries * 250), 3000);
+    this.fileVisibilityTimer = setTimeout(() => {
+      this.pollFileVisibility();
+    }, delay);
+  }
+
+  private runVisibilityDiagnostics() {
+    Logger.error("VM", "[PROVISIONING WATCHDOG] Visibility timeout reached. Running diagnostics...");
+    void this.sendProgrammaticInput(0, "ls -la /root/.provision\n");
+    void this.sendProgrammaticInput(0, "ls -la /mnt/9p/root/.provision\n");
+    void this.sendProgrammaticInput(0, "cat /proc/mounts\n");
+  }
+
+  private handleVisibilityFailure() {
+    this.runVisibilityDiagnostics();
+    this.orchestrator.triggerRecovery("file visibility timeout");
   }
 
   private stopHealthMonitoring(): void {
