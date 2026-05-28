@@ -197,7 +197,7 @@ function canInitialize() {
 }
 
 function canSendInput() {
-  return lifecycleState === "booting" || lifecycleState === "provisioning" || lifecycleState === "running";
+  return lifecycleState === "booting" || lifecycleState === "provision_preparing" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready" || lifecycleState === "ready";
 }
 
 // ─── 3. ASSET LOADER MODULE ──────────────────────────────────────────────────
@@ -402,11 +402,11 @@ var FilesystemAccessPolicy = {
                " | path=" + path);
 
     // Rule 1: Trusted Internal Operations Bypass (PROVISIONING_SYSTEM, RECOVERY_SYSTEM, INTERNAL_RUNTIME)
-    // Allowed during: booting, provisioning, and running.
+    // Allowed during: booting, provision_preparing, provisioning, shell_ready, terminal_ready, and ready.
     if (source === this.SOURCES.PROVISIONING_SYSTEM || 
         source === this.SOURCES.RECOVERY_SYSTEM || 
         source === this.SOURCES.INTERNAL_RUNTIME) {
-      if (state === "booting" || state === "provisioning" || state === "running") {
+      if (state === "booting" || state === "provision_preparing" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "ready") {
         return { allowed: true };
       }
       return {
@@ -416,14 +416,14 @@ var FilesystemAccessPolicy = {
     }
 
     // Rule 2: User interactive writes (USER_TERMINAL)
-    // Only allowed during "running" (standard VM operation).
+    // Only allowed during "ready" (standard VM operation).
     if (source === this.SOURCES.USER_TERMINAL) {
-      if (state === "running") {
+      if (state === "ready") {
         return { allowed: true };
       }
       return {
         allowed: false,
-        reason: "User write denied in non-running lifecycle state: " + state
+        reason: "User write denied in non-ready lifecycle state: " + state
       };
     }
 
@@ -1798,9 +1798,9 @@ self.onmessage = async function (e) {
       break;
 
     case "SET_RUNNING":
-      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready") {
-        setLifecycleState("running");
-        log("info", "Emulator successfully transitioned to running state (boot complete)");
+      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "provision_preparing" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready") {
+        setLifecycleState("ready");
+        log("info", "Emulator successfully transitioned to ready state (boot complete)");
       } else {
         log("warn", "Ignored SET_RUNNING: current state: " + lifecycleState);
       }
@@ -2405,8 +2405,8 @@ async function handleInit(payload) {
       hasSerial1: !!(SerialChannelManager.ports['1'] && SerialChannelManager.ports['1'].ready)
     });
     if (payload.initial_state) {
-      log("info", "v86 emulator successfully restored from snapshot. Transitioning to running...");
-      setLifecycleState("running");
+      log("info", "v86 emulator successfully restored from snapshot. Transitioning to ready...");
+      setLifecycleState("ready");
     } else {
       log("info", "v86 emulator successfully created. Transitioned to booting guest...");
       setLifecycleState("booting");

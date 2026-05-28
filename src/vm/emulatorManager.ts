@@ -96,7 +96,7 @@ export type EmulatorAction =
 // Maps each action type to the set of lifecycle states from which it is valid.
 const ACTION_VALID_FROM: Record<EmulatorAction["type"], Set<VMStateName> | "always" | "alive"> = {
   START:         new Set<VMStateName>(["idle", "stopped", "error"]),
-  STOP:          new Set<VMStateName>(["loading", "booting", "provisioning", "shell_ready", "terminal_ready", "running", "stopping", "ready"]),
+  STOP:          new Set<VMStateName>(["loading", "booting", "provision_preparing", "provisioning", "shell_ready", "terminal_ready", "ready", "stopping"]),
   RECOVER_SHELL: "alive",
   SOFT_REBOOT:   "alive",
   COLD_BOOT:     "alive",
@@ -296,7 +296,7 @@ export class VMController {
     token: number
   ): Promise<void> {
     const state = this.lifecycle.getState().state;
-    if (this.initPromise || state === "loading" || state === "booting" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "running") {
+    if (this.initPromise || state === "loading" || state === "booting" || state === "provision_preparing" || state === "provisioning" || state === "shell_ready" || state === "terminal_ready" || state === "ready") {
       Logger.warn("VM", `[START IGNORED] VM is already starting, booting, or active (state: ${state}). Ignoring duplicate START.`);
       this.orchestrator.recordDuplicateStartSuppression();
       return;
@@ -407,7 +407,7 @@ export class VMController {
     onState(this.lifecycle.getState().state);
 
     this.lifecycle.transitionTerminalTo("attached", "VMController.reattach");
-    if (this.lifecycle.getState().state === "running") {
+    if (this.lifecycle.getState().state === "ready") {
       this.lifecycle.transitionTerminalTo("interactive", "VMController.reattach");
     }
   }
@@ -796,7 +796,7 @@ export class VMController {
           case "STATE_CHANGED":
             {
               const rawState = payload as string;
-              if (rawState === "booting" || rawState === "running") {
+              if (rawState === "booting" || rawState === "ready") {
                 this.timeouts.cancel("init_watchdog");
               }
               if (!this.firstStateChangedTimestamp) {
@@ -1019,7 +1019,7 @@ export class VMController {
       }
       this.bootCompleted = true;
       this.lifecycle.setBootComplete(true);
-      this.transitionState("ready", "handleSerialLifecycle");
+      this.transitionState("provision_preparing", "handleSerialLifecycle");
       
       // Disable echo only — keep canonical mode (icanon) so ash can read full newline-terminated lines.
       // Removing -icanon (raw mode) because it causes ash to receive characters without line buffering,
@@ -1299,7 +1299,12 @@ export class VMController {
     // Finalize provisioning
     this.provisioning.handleProvisioningComplete(execId, activeGenId);
 
-    const isTransitioned = this.transitionState("running", "resolveTerminalReadinessConvergence");
+    Logger.info("VM", "<<<PROVISIONING_COMPLETE>>>");
+    if (this.onSerialOutput) {
+      this.onSerialOutput("\r\n\x1b[1;32m<<<PROVISIONING_COMPLETE>>>\x1b[0m\r\n");
+    }
+
+    const isTransitioned = this.transitionState("ready", "resolveTerminalReadinessConvergence");
     if (isTransitioned) {
       this.lifecycle.transitionTerminalTo("interactive", "resolveTerminalReadinessConvergence");
       
@@ -1317,9 +1322,9 @@ export class VMController {
       const duration = Date.now() - startTime;
       Logger.info("VM", `[Telemetry] Convergence completed successfully. Duration: ${duration}ms. execId: ${execId}, activeGenId: ${activeGenId}`);
     } else {
-      Logger.error("VM", "[Convergence] State transition to running failed.");
-      this.dumpConvergenceDiagnostics("State transition to running failed");
-      this.orchestrator.triggerRecovery("running transition failed");
+      Logger.error("VM", "[Convergence] State transition to ready failed.");
+      this.dumpConvergenceDiagnostics("State transition to ready failed");
+      this.orchestrator.triggerRecovery("ready transition failed");
     }
   }
 
@@ -1391,7 +1396,7 @@ export class VMController {
 
   public async saveState(): Promise<ArrayBuffer> {
     const currentState = this.lifecycle.getState().state;
-    if (currentState !== "running") {
+    if (currentState !== "ready") {
       throw new Error(`Cannot save state while VM is in state: ${currentState}`);
     }
 
@@ -1415,7 +1420,7 @@ export class VMController {
     // Interactivity is decoupled: keyboard input allowed when VM is booting/provisioning/running
     // sendInput does NOT mutate lifecycle — no dispatch() needed.
     const status = this.lifecycle.getState().state;
-    if (status !== "running" && status !== "booting" && status !== "provisioning" && status !== "shell_ready" && status !== "terminal_ready") {
+    if (status !== "ready" && status !== "booting" && status !== "provision_preparing" && status !== "provisioning" && status !== "shell_ready" && status !== "terminal_ready") {
       Logger.warn("VM", `Refusing input: VM in state: ${status}`);
       return;
     }
@@ -1436,7 +1441,13 @@ export class VMController {
 
   public sendProgrammaticInput(port: number, data: string): Promise<void> {
     const stateName = this.lifecycle.getState().state;
-    if (stateName !== "running" && stateName !== "booting" && stateName !== "provisioning" && stateName !== "shell_ready" && stateName !== "terminal_ready") {
+    if (
+      stateName === "ready" ||
+      stateName === "error" ||
+      stateName === "stopped" ||
+      stateName === "stopping" ||
+      stateName === "idle"
+    ) {
       Logger.warn("VM", `Refusing programmatic input in non-interactive state: ${stateName}`);
       return Promise.resolve();
     }
@@ -1472,8 +1483,7 @@ export class VMController {
       this.transport.post("SET_STATE", workerState);
     }
 
-    // Coordinated timeout updates on state transition
-    if (newState === "running") {
+    if (newState === "ready") {
       this.timeouts.cancel("boot_watchdog");
       this.timeouts.cancel("provisioning_watchdog");
       this.startHealthMonitoring();

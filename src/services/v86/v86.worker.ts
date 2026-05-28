@@ -118,9 +118,15 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
     }
 
     case "SET_RUNNING":
-      if (getLifecycleState() === "booting") {
-        setLifecycleState("running", "SET_RUNNING (boot complete)");
-        log("info", "Emulator successfully transitioned to running state (boot complete)");
+      if (
+        getLifecycleState() === "booting" ||
+        getLifecycleState() === "provision_preparing" ||
+        getLifecycleState() === "provisioning" ||
+        getLifecycleState() === "shell_ready" ||
+        getLifecycleState() === "terminal_ready"
+      ) {
+        setLifecycleState("ready", "SET_RUNNING (boot complete)");
+        log("info", "Emulator successfully transitioned to ready state (boot complete)");
       } else {
         log("warn", `Ignored SET_RUNNING: current state: ${getLifecycleState()}`);
       }
@@ -251,8 +257,13 @@ async function handleInit(payload: InitPayload) {
     await createEmulator(config, win);
 
     workerCtx.postMessage({ type: "INIT_SUCCESS" });
-    log("info", "v86 emulator successfully created. Transitioned to booting guest...");
-    setLifecycleState("booting", "handleInit: emulator created");
+    if (payload.initial_state) {
+      log("info", "v86 emulator successfully restored from snapshot. Transitioning to ready...");
+      setLifecycleState("ready", "handleInit: restored from snapshot");
+    } else {
+      log("info", "v86 emulator successfully created. Transitioned to booting guest...");
+      setLifecycleState("booting", "handleInit: emulator created");
+    }
   } catch (err: unknown) {
     setLifecycleState("error", "handleInit: emulator creation failed");
     await destroyEmulator();
@@ -270,7 +281,14 @@ async function handleStop() {
   }
 
   const currentState = getLifecycleState();
-  if (currentState !== "running" && currentState !== "booting" && currentState !== "provisioning") {
+  if (
+    currentState !== "ready" &&
+    currentState !== "booting" &&
+    currentState !== "provision_preparing" &&
+    currentState !== "provisioning" &&
+    currentState !== "shell_ready" &&
+    currentState !== "terminal_ready"
+  ) {
     log("debug", `Stop request ignored: VM is in state ${currentState}`);
     return;
   }
@@ -298,8 +316,15 @@ async function handleRestart() {
   const currentState = getLifecycleState();
   log("info", `Restart requested. Current state: ${currentState}`);
 
-  // Must go through proper shutdown first: running -> stopping -> stopped -> booting
-  if (currentState === "running" || currentState === "booting" || currentState === "provisioning") {
+  // Must go through proper shutdown first: ready -> stopping -> stopped -> booting
+  if (
+    currentState === "ready" ||
+    currentState === "booting" ||
+    currentState === "provision_preparing" ||
+    currentState === "provisioning" ||
+    currentState === "shell_ready" ||
+    currentState === "terminal_ready"
+  ) {
     setLifecycleState("stopping", "handleRestart: stopping before restart");
     try {
       await emulator.stop();
@@ -331,7 +356,14 @@ async function handleDestroy() {
   log("info", "Destroying emulator worker context...");
   const currentState = getLifecycleState();
   // Ensure we go through stopping if currently alive
-  if (currentState === "running" || currentState === "booting" || currentState === "provisioning") {
+  if (
+    currentState === "ready" ||
+    currentState === "booting" ||
+    currentState === "provision_preparing" ||
+    currentState === "provisioning" ||
+    currentState === "shell_ready" ||
+    currentState === "terminal_ready"
+  ) {
     setLifecycleState("stopping", "handleDestroy: stopping first");
   }
   setLifecycleState("stopped", "handleDestroy");

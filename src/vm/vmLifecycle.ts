@@ -35,17 +35,17 @@ export class VMLifecycleManager {
   private static readonly MAX_HISTORY = 50;
 
   private static readonly VALID_TRANSITIONS: Record<VMStateName, Set<VMStateName>> = {
-    idle:         new Set<VMStateName>(["loading", "stopped"]),
-    loading:      new Set<VMStateName>(["booting", "running", "error", "stopped"]),
-    booting:      new Set<VMStateName>(["provisioning", "running", "error", "stopped", "ready"]),
-    provisioning: new Set<VMStateName>(["shell_ready", "running", "error", "stopped"]),
-    shell_ready:  new Set<VMStateName>(["terminal_ready", "error", "stopped"]),
-    terminal_ready: new Set<VMStateName>(["running", "error", "stopped"]),
-    running:      new Set<VMStateName>(["stopping", "stopped", "error"]),
-    stopping:     new Set<VMStateName>(["stopped", "error"]),
-    stopped:      new Set<VMStateName>(["idle", "loading", "booting"]),
-    error:        new Set<VMStateName>(["idle", "loading", "booting", "stopped"]),
-    ready:        new Set<VMStateName>(["provisioning", "running", "error", "stopped"]),
+    idle:                new Set<VMStateName>(["loading", "stopped"]),
+    loading:             new Set<VMStateName>(["booting", "ready", "error", "stopped"]),
+    booting:             new Set<VMStateName>(["provision_preparing", "ready", "error", "stopped"]),
+    provision_preparing: new Set<VMStateName>(["provisioning", "ready", "error", "stopped"]),
+    provisioning:        new Set<VMStateName>(["shell_ready", "ready", "error", "stopped"]),
+    shell_ready:         new Set<VMStateName>(["terminal_ready", "ready", "error", "stopped"]),
+    terminal_ready:      new Set<VMStateName>(["ready", "error", "stopped"]),
+    ready:               new Set<VMStateName>(["stopping", "stopped", "error", "provisioning"]),
+    stopping:            new Set<VMStateName>(["stopped", "error"]),
+    stopped:             new Set<VMStateName>(["idle", "loading", "booting"]),
+    error:               new Set<VMStateName>(["idle", "loading", "booting", "stopped"]),
   };
 
   private static readonly VALID_PROVISIONING_TRANSITIONS: Record<ProvisioningState, Set<ProvisioningState>> = {
@@ -132,7 +132,7 @@ export class VMLifecycleManager {
 
     if (newState === "loading") {
       this.bootStartTimestamp = now;
-    } else if (newState === "running" && this.bootStartTimestamp) {
+    } else if (newState === "ready" && this.bootStartTimestamp) {
       this.currentState.bootTimeMs = now - this.bootStartTimestamp;
       this.bootStartTimestamp = null;
     }
@@ -220,13 +220,14 @@ export class VMLifecycleManager {
   }
 
   public isRunning(): boolean {
-    return this.currentState.state === "running";
+    return this.currentState.state === "ready";
   }
 
   public isBooting(): boolean {
     return (
       this.currentState.state === "loading" ||
       this.currentState.state === "booting" ||
+      this.currentState.state === "provision_preparing" ||
       this.currentState.state === "provisioning" ||
       this.currentState.state === "shell_ready" ||
       this.currentState.state === "terminal_ready"

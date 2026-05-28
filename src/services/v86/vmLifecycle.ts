@@ -1,7 +1,7 @@
 // src/services/v86/vmLifecycle.ts
 import { log } from "./logger";
 
-export type EmulatorState = "idle" | "loading" | "booting" | "provisioning" | "shell_ready" | "terminal_ready" | "running" | "stopping" | "stopped" | "error";
+export type EmulatorState = "idle" | "loading" | "booting" | "provision_preparing" | "provisioning" | "shell_ready" | "terminal_ready" | "ready" | "stopping" | "stopped" | "error";
 
 interface DedicatedWorkerGlobal {
   postMessage(message: unknown, transfer?: Transferable[]): void;
@@ -13,16 +13,17 @@ let lastTransitionTimestamp = 0;
 
 // ─── Valid transition map (deterministic FSM) ───────────────────────────────
 const VALID_TRANSITIONS: Record<EmulatorState, Set<EmulatorState>> = {
-  idle:         new Set<EmulatorState>(["loading", "stopped"]),
-  loading:      new Set<EmulatorState>(["booting", "running", "error", "stopped"]),
-  booting:      new Set<EmulatorState>(["provisioning", "running", "error", "stopped"]),
-  provisioning: new Set<EmulatorState>(["shell_ready", "running", "error", "stopped"]),
-  shell_ready:  new Set<EmulatorState>(["terminal_ready", "error", "stopped"]),
-  terminal_ready: new Set<EmulatorState>(["running", "error", "stopped"]),
-  running:      new Set<EmulatorState>(["stopping", "stopped", "error"]),
-  stopping:     new Set<EmulatorState>(["stopped", "error"]),
-  stopped:      new Set<EmulatorState>(["idle", "loading", "booting"]),
-  error:        new Set<EmulatorState>(["idle", "loading", "booting", "stopped"]),
+  idle:                new Set<EmulatorState>(["loading", "stopped"]),
+  loading:             new Set<EmulatorState>(["booting", "ready", "error", "stopped"]),
+  booting:             new Set<EmulatorState>(["provision_preparing", "ready", "error", "stopped"]),
+  provision_preparing: new Set<EmulatorState>(["provisioning", "ready", "error", "stopped"]),
+  provisioning:        new Set<EmulatorState>(["shell_ready", "ready", "error", "stopped"]),
+  shell_ready:         new Set<EmulatorState>(["terminal_ready", "ready", "error", "stopped"]),
+  terminal_ready:      new Set<EmulatorState>(["ready", "error", "stopped"]),
+  ready:               new Set<EmulatorState>(["stopping", "stopped", "error", "provisioning"]),
+  stopping:            new Set<EmulatorState>(["stopped", "error"]),
+  stopped:             new Set<EmulatorState>(["idle", "loading", "booting"]),
+  error:               new Set<EmulatorState>(["idle", "loading", "booting", "stopped"]),
 };
 
 const DEBOUNCE_MS = 50;
@@ -84,11 +85,18 @@ export function canInitialize(): boolean {
 }
 
 export function canSaveState(): boolean {
-  return lifecycleState === "running";
+  return lifecycleState === "ready";
 }
 
 export function canSendInput(): boolean {
-  return lifecycleState === "booting" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready" || lifecycleState === "running";
+  return (
+    lifecycleState === "booting" ||
+    lifecycleState === "provision_preparing" ||
+    lifecycleState === "provisioning" ||
+    lifecycleState === "shell_ready" ||
+    lifecycleState === "terminal_ready" ||
+    lifecycleState === "ready"
+  );
 }
 
 /**

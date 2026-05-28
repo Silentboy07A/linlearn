@@ -928,7 +928,7 @@ export function TerminalSimulator({
                 setIsV86Running(false);
               }
             }
-          } else if (newState === "running" || (isBooted && (newState === "provisioning" || newState === "shell_ready" || newState === "terminal_ready"))) {
+          } else if (newState === "ready" || (isBooted && (newState === "provision_preparing" || newState === "provisioning" || newState === "shell_ready" || newState === "terminal_ready"))) {
             setV86Booting(false);
             setIsV86Running(true);
             setTimeout(() => {
@@ -964,7 +964,7 @@ export function TerminalSimulator({
           setBootComplete(fullState.bootComplete);
 
           const isBooted = fullState.bootComplete;
-          if (currentVmState === "running" || (isBooted && (currentVmState === "provisioning" || currentVmState === "shell_ready" || currentVmState === "terminal_ready"))) {
+          if (currentVmState === "ready" || (isBooted && (currentVmState === "provision_preparing" || currentVmState === "provisioning" || currentVmState === "shell_ready" || currentVmState === "terminal_ready"))) {
             setV86Booting(false);
             setIsV86Running(true);
             setTimeout(() => {
@@ -1059,7 +1059,7 @@ export function TerminalSimulator({
             return;
           }
 
-          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready" && vmState !== "ready") {
+          if (vmState !== "ready" && vmState !== "provision_preparing" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready") {
             console.warn("[xterm DEBUG] onData ignored: VM not in interactive state:", vmState);
             return;
           }
@@ -1107,7 +1107,7 @@ export function TerminalSimulator({
           }
           if (!v86EmulatorRef.current) return false;
           const vmState = v86EmulatorRef.current.getLifecycleState().state;
-          if (vmState !== "running" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready") {
+          if (vmState !== "ready" && vmState !== "provision_preparing" && vmState !== "provisioning" && vmState !== "booting" && vmState !== "shell_ready" && vmState !== "terminal_ready") {
             console.warn("[xterm DEBUG] attachCustomKeyEventHandler rejected: VM not in interactive state:", vmState);
             return false;
           }
@@ -1537,6 +1537,7 @@ export function TerminalSimulator({
                    recoveryState === "recovering" ? "Attempting Self-Healing Recovery..." :
                    vmStateName === "loading" ? "Downloading WebAssembly & Linux Kernel..." :
                    vmStateName === "booting" ? "Booting Real Linux Kernel in WASM..." :
+                   vmStateName === "provision_preparing" ? "Preparing Environment Configuration..." :
                    vmStateName === "provisioning" ? "Provisioning User Environment Silently..." :
                    vmStateName === "shell_ready" ? "Verifying Shell Readiness..." :
                    vmStateName === "terminal_ready" ? "Synchronizing Terminal Interface..." :
@@ -1547,6 +1548,7 @@ export function TerminalSimulator({
                    recoveryState === "recovering" ? "Running recovery escalation routines..." :
                    vmStateName === "loading" ? "Downloading Buildroot disk image (~10MB)" :
                    vmStateName === "booting" ? "Decompressing kernel & starting x86 CPU" :
+                   vmStateName === "provision_preparing" ? "Initializing atomic transport layer" :
                    vmStateName === "provisioning" ? "Configuring user login & inspect hooks" :
                    vmStateName === "shell_ready" ? "Establishing deterministic login shell handshake" :
                    vmStateName === "terminal_ready" ? "Draining stdout buffers & running health checks" :
@@ -1566,8 +1568,8 @@ export function TerminalSimulator({
                     <span className={`h-2 w-2 rounded-full ${
                       recoveryState === "crashloop" ? "bg-rose-600 animate-ping" :
                       recoveryState === "recovering" ? "bg-amber-500 animate-ping" :
-                      vmStateName === "running" ? "bg-emerald-500 animate-pulse" : 
-                      (vmStateName === "booting" || vmStateName === "provisioning" || vmStateName === "loading" || vmStateName === "shell_ready" || vmStateName === "terminal_ready") ? "bg-amber-500 animate-pulse" : 
+                      vmStateName === "ready" ? "bg-emerald-500 animate-pulse" : 
+                      (vmStateName === "booting" || vmStateName === "provision_preparing" || vmStateName === "provisioning" || vmStateName === "loading" || vmStateName === "shell_ready" || vmStateName === "terminal_ready") ? "bg-amber-500 animate-pulse" : 
                       vmStateName === "stopping" ? "bg-orange-500 animate-pulse" :
                       vmStateName === "error" ? "bg-rose-500 animate-pulse" : "bg-gray-500"
                     }`} />
