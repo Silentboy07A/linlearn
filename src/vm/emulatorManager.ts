@@ -1,4 +1,4 @@
-﻿// src/vm/emulatorManager.ts
+// src/vm/emulatorManager.ts
 import { VMLifecycleManager } from "./vmLifecycle";
 import { ResourceLimitsValidator } from "./resourceLimits";
 import { VMSessionConfig, VMStateName, VMSnapshotMetadata } from "../lib/types";
@@ -170,6 +170,7 @@ export class VMController {
   private pendingMaterializationVerified: (() => void) | null = null;
   private pendingMaterializationFailed: (() => void) | null = null;
   private mountPrepareVerified = false;
+  private isProvisioningAttemptStarted = false;
 
   private lastOrigin: string = "";
   private useMinimalFallback: boolean = false;
@@ -571,6 +572,8 @@ export class VMController {
 
     this.provisioning.reset();
     this.provisioningSearchBuffer = "";
+    this.mountPrepareVerified = false;
+    this.isProvisioningAttemptStarted = false;
 
     // Reset shell readiness preconditions for new session
     this.receivedSerialReady = false;
@@ -861,7 +864,7 @@ export class VMController {
               }
 
               // Prevent host backward FSM transitions for the bootstrap-to-ready sequence
-              const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
+              const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "fs9p_ready", "provisioning", "shell_ready", "terminal_ready", "ready"];
               const currentState = this.lifecycle.getState().state;
               const currentIndex = stateOrder.indexOf(currentState);
               const targetIndex = stateOrder.indexOf(mappedState);
@@ -1048,8 +1051,8 @@ export class VMController {
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
     const activeGenId = activeGen ? activeGen.id : 0;
 
-    // Check for mount stabilization markers during interactive state
-    if (this.lifecycle.getState().state === "interactive") {
+    // Check for mount stabilization markers during fs9p_ready state
+    if (this.lifecycle.getState().state === "fs9p_ready") {
       if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_OK>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
         this.timeouts.cancel("mount_stabilization_watchdog");
         Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
@@ -1179,7 +1182,9 @@ export class VMController {
     }
 
     // ── Boot ready: root prompt detected → update FSM precondition, try interactive transition ──
-    const isBootingState = this.lifecycle.getState().state === "booting";
+    const state = this.lifecycle.getState().state;
+    const canCompleteBoot = (state === "booting" || state === "interactive" || state === "fs9p_ready") && !this.bootCompleted;
+
     if (hasRootPrompt) {
       // Record prompt seen — precondition 2 for FSM transition to "interactive"
       if (!this.hasSeenPrompt) {
@@ -1190,10 +1195,11 @@ export class VMController {
       }
     }
 
-    if (hasRootPrompt && isBootingState && this.provisioning.getState() === "idle") {
+    if (hasRootPrompt && canCompleteBoot && this.provisioning.getState() === "idle") {
       // Wait for prompt to be stable using event-driven awaitPromptStable()
       void this.awaitPromptStable(1000).then(() => {
-        if (this.lifecycle.getState().state !== "booting" && this.lifecycle.getState().state !== "interactive") return;
+        const curState = this.lifecycle.getState().state;
+        if (curState !== "booting" && curState !== "interactive" && curState !== "fs9p_ready") return;
         if (this.provisioning.getState() !== "idle") return;
 
         this.timeouts.cancel("prompt_stabilization");
@@ -1212,9 +1218,9 @@ export class VMController {
         // immediately. If not yet met, the transition will fire when they are.
         this._tryTransitionToInteractive("boot-complete-stable");
 
-        // Wait for FSM to reach "interactive" before starting mount_prepare execution.
-        // awaitFsmState() returns immediately if FSM is already "interactive" or beyond.
-        void this.awaitFsmState("interactive").then(() => {
+        // Wait for FSM to reach "fs9p_ready" before starting mount_prepare execution.
+        // awaitFsmState() returns immediately if FSM is already "fs9p_ready" or beyond.
+        void this.awaitFsmState("fs9p_ready").then(() => {
           // ARCHITECTURAL FIX: Do not poll the guest serial output for file visibility.
           // The worker emits FILE_MATERIALIZATION_VERIFIED after confirming the host-side
           // 9p inode write. We wait for that event (or a timeout), then directly execute
@@ -1298,7 +1304,7 @@ export class VMController {
    * between FSM transitions and async continuation chains.
    */
   public awaitFsmState(targetState: VMStateName): Promise<void> {
-    const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
+    const stateOrder: VMStateName[] = ["idle", "loading", "booting", "interactive", "fs9p_ready", "provisioning", "shell_ready", "terminal_ready", "ready"];
     const targetIdx = stateOrder.indexOf(targetState);
 
     const checkReached = (): boolean => {
@@ -1894,6 +1900,12 @@ export class VMController {
    *   3. A 10-second timeout guard triggers PROVISIONING_REINJECTION on failure.
    */
   private _waitForMaterializationThenMount(): void {
+    if (this.isProvisioningAttemptStarted) {
+      Logger.warn("VM", "[PROVISIONING] Provisioning attempt already in progress. Ignoring duplicate trigger.");
+      return;
+    }
+    this.isProvisioningAttemptStarted = true;
+
     const executeMountScript = () => {
       Logger.info("VM", "[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Executing mount_prepare.sh in guest.");
       void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");

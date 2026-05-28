@@ -177,7 +177,7 @@ function flushSerialBuffer() {
  */
 function setLifecycleState(newState) {
   if (lifecycleState !== newState) {
-    var stateOrder = ["idle", "loading", "booting", "interactive", "provisioning", "shell_ready", "terminal_ready", "ready"];
+    var stateOrder = ["idle", "loading", "booting", "interactive", "fs9p_ready", "provisioning", "shell_ready", "terminal_ready", "ready"];
     var currentIndex = stateOrder.indexOf(lifecycleState);
     var targetIndex = stateOrder.indexOf(newState);
     if (currentIndex !== -1 && targetIndex !== -1 && targetIndex < currentIndex) {
@@ -209,6 +209,7 @@ function canSendInput() {
     lifecycleState === "ready" ||
     lifecycleState === "terminal_ready" ||
     lifecycleState === "interactive" ||
+    lifecycleState === "fs9p_ready" ||
     lifecycleState === "provisioning"
   );
 }
@@ -1326,7 +1327,7 @@ self.onmessage = async function (e) {
         log("warn", "Ignored serial input in non-interactive state: " + lifecycleState);
         break;
       }
-      if (lifecycleState === "interactive" || lifecycleState === "provisioning") {
+      if (lifecycleState === "interactive" || lifecycleState === "fs9p_ready" || lifecycleState === "provisioning") {
         inputBuffer += payload;
         if (inputBuffer.indexOf("\n") !== -1) {
           var parts = inputBuffer.split("\n");
@@ -1356,7 +1357,7 @@ self.onmessage = async function (e) {
       break;
 
     case "SET_RUNNING":
-      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "interactive" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready") {
+      if (lifecycleState === "initialized" || lifecycleState === "booting" || lifecycleState === "interactive" || lifecycleState === "fs9p_ready" || lifecycleState === "provisioning" || lifecycleState === "shell_ready" || lifecycleState === "terminal_ready") {
         setLifecycleState("ready");
         log("info", "Emulator successfully transitioned to ready state (boot complete)");
       } else {
@@ -1365,7 +1366,7 @@ self.onmessage = async function (e) {
       break;
 
     case "SET_PROVISIONING":
-      if (lifecycleState === "booting" || lifecycleState === "interactive") {
+      if (lifecycleState === "booting" || lifecycleState === "interactive" || lifecycleState === "fs9p_ready") {
         setLifecycleState("provisioning");
         log("info", "Emulator transitioned to provisioning state");
       } else {
@@ -1860,6 +1861,116 @@ function teardownTimersAndCallbacks(emuInstance) {
   serialSendBuffer = [];
 }
 
+async function checkAndInitializeFs9p() {
+  log("info", "[FS9P] Starting fs9p subsystem validation...");
+  var retries = 5;
+  var delay = 500;
+  var fsReady = false;
+
+  for (var i = 0; i < retries; i++) {
+    if (emulator && emulator.fs9p && typeof emulator.fs9p.CreateFile === "function") {
+      fsReady = true;
+      break;
+    }
+    log("warn", "[FS9P] fs9p not ready yet. Retrying in " + delay + "ms... (attempt " + (i + 1) + "/" + retries + ")");
+    await new Promise(function(resolve) { setTimeout(resolve, delay); });
+  }
+
+  if (!fsReady) {
+    log("error", "[FS9P] Hard validation failed: fs9p subsystem not available after retries.");
+    setLifecycleState("failed");
+    postToHost("INIT_FAILURE", "fs9p subsystem initialization failed (CreateFile not available)");
+    return;
+  }
+
+  log("info", "[FS9P] fs9p subsystem validation passed. Transitioning to fs9p_ready.");
+  setLifecycleState("fs9p_ready");
+
+  var mpPath = "/root/.provision/mount_prepare.sh";
+  try {
+    log("info", "[CREATE_FILE_BEGIN] Writing mount_prepare.sh to host 9p filesystem. path=" + mpPath);
+    WorkerProvisioner.ensureParentDirectories(emulator, mpPath);
+
+    var mpFs = emulator.fs9p;
+    var mpParentSearch = mpFs.SearchPath("/root/.provision");
+    if (mpParentSearch.id === -1) {
+      throw new Error("Parent directory /root/.provision not found in 9p filesystem after ensureParentDirectories");
+    }
+    log("info", "[HOST_FS_SYNC] Parent directory /root/.provision confirmed in 9p inode table. inode=" + mpParentSearch.id);
+
+    var mpScript =
+      "#!/bin/sh\n" +
+      "export PS1=''\n" +
+      "unset PROMPT_COMMAND\n" +
+      "stty -echo\n" +
+      "echo '<<<STAGE:BOOT_OK>>>' > /dev/ttyS0\n" +
+      "echo '<<<STAGE:MOUNT_START>>>' > /dev/ttyS0\n" +
+      "mkdir -p /mnt/9p >/dev/null 2>&1\n" +
+      "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
+      "  mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+      "fi\n" +
+      "sync\n" +
+      "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
+      "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "sync\n" +
+      "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
+      "if [ -d /root/.provision ]; then\n" +
+      "  echo '<<<STAGE:MOUNT_OK>>>' > /dev/ttyS0\n" +
+      "else\n" +
+      "  echo '<<<STAGE:MOUNT_FAIL>>>' > /dev/ttyS0\n" +
+      "fi\n";
+
+    var mpEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+    var mpBytes = mpEncoder ? mpEncoder.encode(mpScript) : new Uint8Array(mpScript.length);
+    if (!mpEncoder) {
+      for (var j = 0; j < mpScript.length; j++) mpBytes[j] = mpScript.charCodeAt(j) & 0xFF;
+    }
+
+    await emulator.create_file(mpPath, mpBytes);
+
+    var mpSearch = { id: -1 };
+    var mpInode = null;
+    var mpMaxRetries = 8;
+    var mpRetryDelay = 50;
+    for (var mpAttempt = 1; mpAttempt <= mpMaxRetries; mpAttempt++) {
+      mpSearch = mpFs.SearchPath(mpPath);
+      if (mpSearch.id !== -1) {
+        mpInode = mpFs.GetInode(mpSearch.id);
+        if (mpInode && mpInode.size === mpBytes.length) break;
+      }
+      log("warn", "[CREATE_FILE_BEGIN] Inode not yet stable for " + mpPath + " on attempt " + mpAttempt + ". Retrying...");
+      if (mpAttempt < mpMaxRetries) {
+        await new Promise(function(res) { setTimeout(res, mpRetryDelay); });
+      }
+    }
+
+    if (mpSearch.id === -1 || !mpInode || mpInode.size !== mpBytes.length) {
+      var mpFailReason = mpSearch.id === -1
+        ? "inode not found in 9p filesystem after write"
+        : ("inode size mismatch: wrote " + mpBytes.length + ", got " + (mpInode ? mpInode.size : "null"));
+      log("error", "[CREATE_FILE_FAILURE] mount_prepare.sh inode verification failed: " + mpFailReason);
+      throw new Error("[CREATE_FILE_FAILURE] mount_prepare.sh host-side verification failed: " + mpFailReason);
+    }
+
+    log("info", "[CREATE_FILE_SUCCESS] mount_prepare.sh written and verified. inode=" + mpSearch.id + ", size=" + mpInode.size + " bytes");
+    log("info", "[HOST_FS_SYNC] mount_prepare.sh materialized in 9p inode table. Notifying host.");
+
+    postToHost("FILE_MATERIALIZATION_VERIFIED", {
+      path: mpPath,
+      inodeId: mpSearch.id,
+      size: mpInode.size
+    });
+
+  } catch (mpErr) {
+    log("error", "[CREATE_FILE_FAILURE] Failed to write mount_prepare.sh after fs9p became ready: " + (mpErr.stack || mpErr));
+    setLifecycleState("failed");
+    postToHost("INIT_FAILURE", "mount_prepare.sh injection failed: " + (mpErr.message || String(mpErr)));
+  }
+}
+
 /**
  * Initialize the v86 emulator inside this worker.
  * @param {{ origin: string, version?: string, memory_size?: number, cmdline?: string }} payload
@@ -2014,101 +2125,10 @@ async function handleInit(payload) {
     await createEmulator(config, self);
     initTelemetry.emulatorConstructorDuration = Date.now() - tEmuCreateStart;
 
-    // Write mount_prepare.sh right here — hard failure if this fails.
-    // This is the critical file injection step. Without it, the guest cannot mount
-    // the 9p filesystem or start provisioning. Any failure here is fatal.
-    var mpPath = "/root/.provision/mount_prepare.sh";
-    try {
-      log("info", "[CREATE_FILE_BEGIN] Writing mount_prepare.sh to host 9p filesystem. path=" + mpPath);
-      WorkerProvisioner.ensureParentDirectories(emulator, mpPath);
-
-      // Verify parent directory was created on host side before proceeding
-      var mpFs = emulator.fs9p;
-      if (!mpFs) {
-        throw new Error("fs9p not initialized on emulator — cannot write mount_prepare.sh");
-      }
-      var mpParentSearch = mpFs.SearchPath("/root/.provision");
-      if (mpParentSearch.id === -1) {
-        throw new Error("Parent directory /root/.provision not found in 9p filesystem after ensureParentDirectories");
-      }
-      log("info", "[HOST_FS_SYNC] Parent directory /root/.provision confirmed in 9p inode table. inode=" + mpParentSearch.id);
-
-      var mpScript =
-        "#!/bin/sh\n" +
-        "export PS1=''\n" +
-        "unset PROMPT_COMMAND\n" +
-        "stty -echo\n" +
-        "echo '<<<STAGE:BOOT_OK>>>' > /dev/ttyS0\n" +
-        "echo '<<<STAGE:MOUNT_START>>>' > /dev/ttyS0\n" +
-        "mkdir -p /mnt/9p >/dev/null 2>&1\n" +
-        "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
-        "  mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-        "  mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-        "  mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-        "  mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
-        "fi\n" +
-        "sync\n" +
-        "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
-        "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
-        "sync\n" +
-        "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
-        "if [ -d /root/.provision ]; then\n" +
-        "  echo '<<<STAGE:MOUNT_OK>>>' > /dev/ttyS0\n" +
-        "else\n" +
-        "  echo '<<<STAGE:MOUNT_FAIL>>>' > /dev/ttyS0\n" +
-        "fi\n";
-
-      var mpEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
-      var mpBytes = mpEncoder ? mpEncoder.encode(mpScript) : new Uint8Array(mpScript.length);
-      if (!mpEncoder) {
-        for (var i = 0; i < mpScript.length; i++) mpBytes[i] = mpScript.charCodeAt(i) & 0xFF;
-      }
-
-      await emulator.create_file(mpPath, mpBytes);
-
-      // Host-side inode verification — hard fail if the file is not present after write
-      var mpSearch = { id: -1 };
-      var mpInode = null;
-      var mpMaxRetries = 8;
-      var mpRetryDelay = 50;
-      for (var mpAttempt = 1; mpAttempt <= mpMaxRetries; mpAttempt++) {
-        mpSearch = mpFs.SearchPath(mpPath);
-        if (mpSearch.id !== -1) {
-          mpInode = mpFs.GetInode(mpSearch.id);
-          if (mpInode && mpInode.size === mpBytes.length) break;
-        }
-        log("warn", "[CREATE_FILE_BEGIN] Inode not yet stable for " + mpPath + " on attempt " + mpAttempt + ". Retrying...");
-        if (mpAttempt < mpMaxRetries) {
-          await new Promise(function(res) { setTimeout(res, mpRetryDelay); });
-        }
-      }
-
-      if (mpSearch.id === -1 || !mpInode || mpInode.size !== mpBytes.length) {
-        var mpFailReason = mpSearch.id === -1
-          ? "inode not found in 9p filesystem after write"
-          : ("inode size mismatch: wrote " + mpBytes.length + ", got " + (mpInode ? mpInode.size : "null"));
-        log("error", "[CREATE_FILE_FAILURE] mount_prepare.sh inode verification failed: " + mpFailReason);
-        throw new Error("[CREATE_FILE_FAILURE] mount_prepare.sh host-side verification failed: " + mpFailReason);
-      }
-
-      log("info", "[CREATE_FILE_SUCCESS] mount_prepare.sh written and verified. inode=" + mpSearch.id + ", size=" + mpInode.size + " bytes");
-      log("info", "[HOST_FS_SYNC] mount_prepare.sh materialized in 9p inode table. Notifying host.");
-
-      // Notify host that file materialization is confirmed — host can skip serial visibility poll
-      postToHost("FILE_MATERIALIZATION_VERIFIED", {
-        path: mpPath,
-        inodeId: mpSearch.id,
-        size: mpInode.size
-      });
-
-    } catch (mpErr) {
-      log("error", "[CREATE_FILE_FAILURE] Fatal: Failed to write mount_prepare.sh during init. Boot cannot proceed. Error: " + (mpErr.stack || mpErr));
-      // Hard-fail: this is a critical provisioning prerequisite. Do NOT silently continue.
-      setLifecycleState("failed");
-      clearInterval(heartbeatInterval);
-      postToHost("INIT_FAILURE", "[CREATE_FILE_FAILURE] mount_prepare.sh host-side injection failed: " + (mpErr.message || String(mpErr)));
-      return;
-    }
+    // Defer fs9p check and file injection asynchronously to decouple boot from file injection
+    setTimeout(function() {
+      checkAndInitializeFs9p();
+    }, 0);
 
     transitionInitStage("CPU_BOOT");
     var tCpuBootStart = Date.now();
