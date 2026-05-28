@@ -738,7 +738,7 @@ sleep 1
 echo "<<<PROTO:${executionId}:6:EXEC_COMPLETE>>>" > /dev/ttyS0
 sync
 
-while read -r ack_line; do
+while read -t 15 -r ack_line; do
   case "$ack_line" in
     "PROVISIONING_ACK:${executionId}"*)
       break

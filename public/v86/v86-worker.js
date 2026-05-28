@@ -779,11 +779,6 @@ var WorkerProvisioner = {
     });
     log("info", "[VISIBILITY] FILE_READY emitted: path=" + filePath + ".tmp, inode=" + search.id + ", size=" + inode.size + ", sha=" + sha256 + ", ts=" + creationTimestamp);
 
-    // FS propagation delay: give virtio-9p driver time to sync the inode
-    // to the guest namespace before the visibility probe runs.
-    log("info", "[WorkerProvisioner] Waiting 500ms for 9p FS propagation to guest namespace...");
-    await new Promise(function(r) { setTimeout(r, 500); });
-
     // Pre-write all FSM helper scripts before starting the MountVisibilityFSM.
     // This ensures doMount(), doVerify(), doRemount(), and doDiagnostics() can
     // dispatch via short single-line tty commands ("sh /root/.provision/prov_XXX_N.sh")
@@ -870,14 +865,7 @@ var WorkerProvisioner = {
       "stty -echo > /dev/null 2>&1\n" +
       "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "# Check kernel 9p filesystem support\n" +
-      "b_i=0; b_ok=0\n" +
-      "while [ \"$b_i\" -lt 30 ]; do\n" +
-      "  if [ -f /proc/filesystems ] && grep -q 9p /proc/filesystems && [ -f /proc/mounts ]; then\n" +
-      "    b_ok=1; break\n" +
-      "  fi\n" +
-      "  sleep 1; b_i=$((b_i + 1))\n" +
-      "done\n" +
-      "if [ \"$b_ok\" -eq 0 ]; then\n" +
+      "if ! grep -q 9p /proc/filesystems 2>/dev/null; then\n" +
       "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0; exit 1\n" +
       "fi\n" +
       "# Mount if not already mounted\n" +
@@ -910,12 +898,6 @@ var WorkerProvisioner = {
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "\n" +
-      "visibility_barrier() {\n" +
-      "  sync\n" +
-      "  sleep 1\n" +
-      "  ls \"$1\" >/dev/null 2>&1\n" +
-      "}\n" +
-      "\n" +
       "expected_path=\"" + fp + "\"\n" +
       "expected_size=" + scriptSize + "\n" +
       "expected_sha=\"" + sha256 + "\"\n" +
@@ -928,54 +910,37 @@ var WorkerProvisioner = {
       "  sync\n" +
       "fi\n" +
       "\n" +
-      "i=0; ok=0; inode=; size=;\n" +
-      "while [ \"$i\" -lt 10 ]; do\n" +
-      "  echo \"[FSM] [MOUNT] MOUNT_VISIBLE\" > /dev/ttyS0\n" +
-      "  # 1. verify parent directory first\n" +
-      "  if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
-      "    echo \"[FSM] [VISIBILITY] DIRECTORY_VISIBLE\" > /dev/ttyS0\n" +
-      "    visibility_barrier \"$expected_path\"\n" +
-      "    # 2. verify inode existence second\n" +
-      "    if [ -f \"$expected_path\" ] && stat \"$expected_path\" >/dev/null 2>&1; then\n" +
-      "      echo \"[FSM] [VISIBILITY] FILE_VISIBLE\" > /dev/ttyS0\n" +
-      "      inode=$(ls -i \"$expected_path\" 2>/dev/null | awk '{print $1}')\n" +
-      "      if [ -n \"$inode\" ]; then\n" +
-      "        echo \"[FSM] [INODE] Inode existence verified: $inode\" > /dev/ttyS0\n" +
-      "        # 3. verify file size third\n" +
-      "        size=$(wc -c < \"$expected_path\" 2>/dev/null)\n" +
-      "        if [ \"$size\" -eq \"$expected_size\" ]; then\n" +
-      "          echo \"[FSM] [VISIBILITY] File size verified: $size bytes\" > /dev/ttyS0\n" +
-      "          # 4. verify checksum fourth\n" +
-      "          actual_sha=$(sha256sum \"$expected_path\" 2>/dev/null | awk '{print $1}')\n" +
-      "          if [ -z \"$actual_sha\" ] || [ \"$actual_sha\" = \"$expected_sha\" ]; then\n" +
-      "            echo \"[FSM] [CHECKSUM] CHECKSUM_VALID\" > /dev/ttyS0\n" +
-      "            echo \"[FSM] [EXEC] EXEC_READY\" > /dev/ttyS0\n" +
-      "            ok=1; break;\n" +
-      "          else\n" +
-      "            echo \"[FSM] [CHECKSUM] Checksum mismatch: expected $expected_sha, got $actual_sha\" > /dev/ttyS0\n" +
-      "          fi\n" +
+      "echo \"[FSM] [MOUNT] MOUNT_VISIBLE\" > /dev/ttyS0\n" +
+      "if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
+      "  echo \"[FSM] [VISIBILITY] DIRECTORY_VISIBLE\" > /dev/ttyS0\n" +
+      "  if stat \"$expected_path\" >/dev/null 2>&1; then\n" +
+      "    echo \"[FSM] [VISIBILITY] FILE_VISIBLE\" > /dev/ttyS0\n" +
+      "    inode=$(ls -i \"$expected_path\" 2>/dev/null | awk '{print $1}')\n" +
+      "    if [ -z \"$inode\" ]; then inode=$(stat -c %i \"$expected_path\" 2>/dev/null); fi\n" +
+      "    if [ -n \"$inode\" ]; then\n" +
+      "      echo \"[FSM] [INODE] Inode existence verified: $inode\" > /dev/ttyS0\n" +
+      "      size=$(wc -c < \"$expected_path\" 2>/dev/null)\n" +
+      "      if [ \"$size\" -eq \"$expected_size\" ]; then\n" +
+      "        echo \"[FSM] [VISIBILITY] File size verified: $size bytes\" > /dev/ttyS0\n" +
+      "        actual_sha=$(sha256sum \"$expected_path\" 2>/dev/null | awk '{print $1}')\n" +
+      "        if [ \"$actual_sha\" = \"$expected_sha\" ]; then\n" +
+      "          echo \"[FSM] [CHECKSUM] CHECKSUM_VALID\" > /dev/ttyS0\n" +
+      "          echo \"[FSM] [EXEC] EXEC_READY\" > /dev/ttyS0\n" +
+      "          echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
+      "          exit 0\n" +
       "        else\n" +
-      "          echo \"[FSM] [VISIBILITY] Size mismatch: expected $expected_size, got $size\" > /dev/ttyS0\n" +
+      "          echo \"[FSM] [CHECKSUM] Checksum mismatch: expected $expected_sha, got $actual_sha\" > /dev/ttyS0\n" +
       "        fi\n" +
+      "      else\n" +
+      "        echo \"[FSM] [VISIBILITY] Size mismatch: expected $expected_size, got $size\" > /dev/ttyS0\n" +
       "      fi\n" +
       "    fi\n" +
-      "  else\n" +
-      "    echo \"[FSM] [MOUNT] MOUNT_DISAPPEARED\" > /dev/ttyS0\n" +
       "  fi\n" +
-      "  # Exponential backoff\n" +
-      "  sleep_time=$((1 << i))\n" +
-      "  if [ \"$sleep_time\" -gt 8 ]; then sleep_time=8; fi\n" +
-      "  echo \"[SYNC] Propagation delay. Sleeping $sleep_time s...\" > /dev/ttyS0\n" +
-      "  sleep \"$sleep_time\"\n" +
-      "  i=$((i + 1))\n" +
-      "done\n" +
-      "\n" +
-      "if [ \"$ok\" -eq 1 ]; then\n" +
-      "  echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
       "else\n" +
-      "  echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
+      "  echo \"[FSM] [MOUNT] MOUNT_DISAPPEARED\" > /dev/ttyS0\n" +
       "fi\n" +
-      "trap - ERR\n";
+      "echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
+      "exit 1\n";
 
     // ── Remount script ─────────────────────────────────────────────────────────
     // Unmounts and remounts host9p, then emits OK or ERR.
@@ -990,7 +955,7 @@ var WorkerProvisioner = {
       "   mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
       "   mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null; then\n" +
       "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
-      "  sync\n" +
+      "  sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "  if [ -d /root/.provision ]; then\n" +
       "    echo '" + makeTag("REMOUNT", "OK") + "' > /dev/ttyS0\n" +
       "  else\n" +
@@ -1035,27 +1000,21 @@ var WorkerProvisioner = {
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "\n" +
-      "visibility_barrier() {\n" +
-      "  sync\n" +
-      "  sleep 1\n" +
-      "  ls \"$1\" >/dev/null 2>&1\n" +
-      "}\n" +
-      "\n" +
       "# Symlink drift check\n" +
       "prov_link=$(readlink -f /root/.provision 2>/dev/null)\n" +
       "if [ \"$prov_link\" != \"/mnt/9p/root/.provision\" ]; then\n" +
       "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '/mnt/9p/root/.provision'\" > /dev/ttyS0\n" +
       "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
-      "  sync\n" +
+      "  sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "fi\n" +
       "\n" +
-      "visibility_barrier \"" + fp + "\"\n" +
       "# 1. verify parent directory first\n" +
       "if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
-      "  # 2. verify inode existence second\n" +
-      "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
+      "  # 2. verify inode existence second using stat & ls -li\n" +
+      "  if stat '" + fp + "' > /dev/null 2>&1; then\n" +
       "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
-      "    if [ -n \"$inode\" ]; then\n" +
+      "    if [ -z \"$inode\" ]; then inode=$(stat -c %i '" + fp + "' 2>/dev/null); fi\n" +
+      "    if [ -n \"$inode\" ] && [ \"$inode\" = \"" + expectedInode + "\" ]; then\n" +
       "      # 3. verify file size third\n" +
       "      size=$(wc -c < \"" + fp + "\" 2>/dev/null)\n" +
       "      if [ \"$size\" -eq " + scriptSize + " ]; then\n" +
@@ -1063,26 +1022,22 @@ var WorkerProvisioner = {
       "        actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
       "        if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
       "          echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
-      "        elif [ -z \"$actual_sha\" ]; then\n" +
-      "          echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "          exit 0\n" +
       "        else\n" +
       "          echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
-      "          echo '" + failMarker + "' > /dev/ttyS0\n" +
       "        fi\n" +
       "      else\n" +
       "        echo '[EXEC_DIAG:SIZE_MISMATCH] expected=" + scriptSize + " got='$size > /dev/ttyS0\n" +
-      "        echo '" + failMarker + "' > /dev/ttyS0\n" +
       "      fi\n" +
       "    else\n" +
-      "      echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "      echo '[EXEC_DIAG:INODE_MISMATCH] expected=" + expectedInode + " got='$inode > /dev/ttyS0\n" +
       "    fi\n" +
       "  else\n" +
-      "    echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "    echo '[EXEC_DIAG:FILE_MISSING] " + fp + " not visible via stat' > /dev/ttyS0\n" +
       "  fi\n" +
-      "else\n" +
-      "  echo '" + failMarker + "' > /dev/ttyS0\n" +
       "fi\n" +
-      "trap - ERR\n";
+      "echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "exit 1\n";
 
     // ── Execute script ─────────────────────────────────────────────────────────
     // Validates the framed payload, extracts the original script, validates size and sha256,
@@ -1094,18 +1049,14 @@ var WorkerProvisioner = {
       "stty -echo > /dev/null 2>&1\n" +
       "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "\n" +
-      "visibility_barrier() {\n" +
-      "  sync\n" +
-      "  sleep 1\n" +
-      "  ls \"$1\" >/dev/null 2>&1\n" +
-      "}\n" +
+      "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "\n" +
       "# Symlink drift check\n" +
       "prov_link=$(readlink -f /root/.provision 2>/dev/null)\n" +
       "if [ \"$prov_link\" != \"/mnt/9p/root/.provision\" ]; then\n" +
       "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '/mnt/9p/root/.provision'\" > /dev/ttyS0\n" +
       "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
-      "  sync\n" +
+      "  sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "fi\n" +
       "\n" +
       "tmp_file=\"/root/.provision/runtime_exec.sh.tmp\"\n" +
@@ -1113,15 +1064,18 @@ var WorkerProvisioner = {
       "\n" +
       "echo \"[EXEC_PREFLIGHT] Starting execute preflight checks... Expected size: " + scriptSize + ", chunks: " + totalChunks + "\" > /dev/ttyS0\n" +
       "\n" +
-      "visibility_barrier \"$tmp_file\"\n" +
       "# 1. verify parent directory first\n" +
       "if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
-      "  # 2. verify inode existence second\n" +
-      "  if [ ! -f \"$tmp_file\" ]; then\n" +
-      "    echo \"[EXEC_PREFLIGHT] Error: Temporary script file $tmp_file not found\" > /dev/ttyS0\n" +
+      "  # 2. verify inode existence second using stat & ls -li\n" +
+      "  if ! stat \"$tmp_file\" >/dev/null 2>&1; then\n" +
+      "    echo \"[EXEC_PREFLIGHT] Error: Temporary script file $tmp_file not found via stat\" > /dev/ttyS0\n" +
       "    echo \"<<<PROTO:" + execId + ":7:FAIL:provision_file_missing>>>\" > /dev/ttyS0\n" +
       "    exit 1\n" +
       "  fi\n" +
+      "\n" +
+      "  tmp_inode=$(ls -i \"$tmp_file\" 2>/dev/null | awk '{print $1}')\n" +
+      "  if [ -z \"$tmp_inode\" ]; then tmp_inode=$(stat -c %i \"$tmp_file\" 2>/dev/null); fi\n" +
+      "  echo \"[EXEC_PREFLIGHT] Temporary script inode: $tmp_inode\" > /dev/ttyS0\n" +
       "\n" +
       "  # Validate header format and contents\n" +
       "  header=$(head -n 1 \"$tmp_file\" 2>/dev/null)\n" +
@@ -1153,12 +1107,16 @@ var WorkerProvisioner = {
       "  sed '1d;$d' \"$tmp_file\" > \"$exec_file.tmp\"\n" +
       "  (fsync \"$exec_file.tmp\" || sync)\n" +
       "  mv -f \"$exec_file.tmp\" \"$exec_file\"\n" +
-      "  sync\n" +
-      "  if [ ! -f \"$exec_file\" ]; then\n" +
+      "  sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
+      "  if ! stat \"$exec_file\" >/dev/null 2>&1; then\n" +
       "    echo \"[EXEC_PREFLIGHT] Error: Final executable $exec_file not visible after rename\" > /dev/ttyS0\n" +
       "    echo \"<<<PROTO:" + execId + ":7:FAIL:rename_not_visible>>>\" > /dev/ttyS0\n" +
       "    exit 1\n" +
       "  fi\n" +
+      "\n" +
+      "  exec_inode=$(ls -i \"$exec_file\" 2>/dev/null | awk '{print $1}')\n" +
+      "  if [ -z \"$exec_inode\" ]; then exec_inode=$(stat -c %i \"$exec_file\" 2>/dev/null); fi\n" +
+      "  echo \"[EXEC_PREFLIGHT] Executable script inode: $exec_inode\" > /dev/ttyS0\n" +
       "\n" +
       "  # 3. verify file size third\n" +
       "  actual_size=$(wc -c < \"$exec_file\" 2>/dev/null)\n" +
@@ -1221,9 +1179,9 @@ var WorkerProvisioner = {
    * This prevents shell continuation prompt (>) deadlocks entirely.
    */
   verifyGuestVisibility: function(emu, filePath, execId) {
-    var MAX_VERIFY_RETRIES = 6;
+    var MAX_VERIFY_RETRIES = 1;
     var MAX_MOUNT_RETRIES = 3;
-    var STABILITY_CHECKS = 3;
+    var STABILITY_CHECKS = 1;
     var CMD_TIMEOUT_MS = 8000;
     var fsmState = "MOUNTING";
     var startTime = Date.now();
@@ -1512,74 +1470,64 @@ var WorkerProvisioner = {
           " mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
           "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
-          "echo '[INLINE_MOUNT] Waiting for verify script visibility'; " +
-          "i=0; ok=0; while [ \"$i\" -lt 20 ]; do " +
-          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ] && [ -s /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
-          "  sleep 1; i=$((i+1)); " +
-          "done && [ \"$ok\" -eq 1 ] && " +
-          "echo '[INLINE_MOUNT] Verify script visible, setting up symlink'; " +
-          "rm -rf /root/.provision && " +
-          "mkdir -p /mnt/9p/root/.provision && " +
-          "ln -s /mnt/9p/root/.provision /root/.provision && " +
-          "sync && " +
-          "echo '[INLINE_MOUNT] Renaming .tmp helpers to final atomically'; " +
-          "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
-          "  if [ -f \"$f\" ]; then " +
-          "    target=\"/mnt/9p/root/.provision/$(basename \"$f\" .tmp)\"; " +
-          "    (fsync \"$f\" || sync) && " +
-          "    mv -f \"$f\" \"$target\" && " +
-          "    sync && " +
-          "    [ -f \"$target\" ] && " +
-          "    chmod +x \"$target\"; " +
-          "  fi; " +
-          "done && " +
-          "echo '[INLINE_MOUNT] Validating helper executables'; " +
-          "h_ok=1; for h in mount verify remount diag reval execute; do " +
-          "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
-          "    h_ok=0; " +
-          "  fi; " +
-          "done && " +
-          "[ \"$h_ok\" -eq 1 ] && " +
-          "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
-          "for h in mount verify remount diag reval execute; do " +
-          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
-          "    case \"$h\" in " +
-          "      mount) name=\"MOUNTING\" ;; " +
-          "      verify) name=\"VERIFYING\" ;; " +
-          "      remount) name=\"REMOUNT\" ;; " +
-          "      diag) name=\"DIAGNOSTICS\" ;; " +
-          "      reval) name=\"REVALIDATION\" ;; " +
-          "      execute) name=\"EXECUTION\" ;; " +
-          "    esac; " +
-          "    echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
-          "  fi; " +
-          "done && " +
-          "sync && " +
-          "[ -d /root/.provision ] && " +
-          "echo '<<<FSM:" + execId + ":MOUNTING:OK>>>' > /dev/ttyS0 || " +
-          "echo '<<<FSM:" + execId + ":MOUNTING:ERR>>>' > /dev/ttyS0\n";
-          
+          "if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then " +
+          "  rm -rf /root/.provision && " +
+          "  mkdir -p /mnt/9p/root/.provision && " +
+          "  ln -s /mnt/9p/root/.provision /root/.provision && " +
+          "  sync && " +
+          "  echo '[INLINE_MOUNT] Renaming .tmp helpers to final atomically'; " +
+          "  for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
+          "    if [ -f \"$f\" ]; then " +
+          "      target=\"/mnt/9p/root/.provision/$(basename \"$f\" .tmp)\"; " +
+          "      (fsync \"$f\" || sync) && " +
+          "      mv -f \"$f\" \"$target\" && " +
+          "      sync && " +
+          "      [ -f \"$target\" ] && " +
+          "      chmod +x \"$target\"; " +
+          "    fi; " +
+          "  done && " +
+          "  echo '[INLINE_MOUNT] Validating helper executables'; " +
+          "  h_ok=1; for h in mount verify remount diag reval execute; do " +
+          "    if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "      h_ok=0; " +
+          "    fi; " +
+          "  done && " +
+          "  [ \"$h_ok\" -eq 1 ] && " +
+          "  echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
+          "  for h in mount verify remount diag reval execute; do " +
+          "    if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "      case \"$h\" in " +
+          "        mount) name=\"MOUNTING\" ;; " +
+          "        verify) name=\"VERIFYING\" ;; " +
+          "        remount) name=\"REMOUNT\" ;; " +
+          "        diag) name=\"DIAGNOSTICS\" ;; " +
+          "        reval) name=\"REVALIDATION\" ;; " +
+          "        execute) name=\"EXECUTION\" ;; " +
+          "      esac; " +
+          "      echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
+          "    fi; " +
+          "  done && " +
+          "  sync && [ -d /root/.provision ] && " +
+          "  echo '<<<FSM:" + execId + ":MOUNTING:OK>>>' > /dev/ttyS0; " +
+          "else " +
+          "  echo '<<<FSM:" + execId + ":MOUNTING:ERR>>>' > /dev/ttyS0; " +
+          "fi\n";
+
         rawBuffer = "";
         parserState = "waiting";
         log("info", "[MountVisibilityFSM] Dispatching inline mount command: " + inlineCmd.trim());
         SerialChannelManager.send(0, inlineCmd);
       }
 
-      function doVerify(isStabilityCheck) {
-        if (!isStabilityCheck) {
-          verifyAttempt++;
-          retryCount = verifyAttempt;
-        }
+      function doVerify() {
+        verifyAttempt++;
+        retryCount = verifyAttempt;
+        log("info", "[MountVisibilityFSM] verifyGuestVisibility attempt " + verifyAttempt + " for " + filePath);
         
-        var delay = isStabilityCheck ? 200 : Math.min(4000, 300 * Math.pow(2, verifyAttempt - 1));
-        log("info", "[MountVisibilityFSM] verifyGuestVisibility" + (isStabilityCheck ? " (stability check " + (stabilityCount + 1) + "/" + STABILITY_CHECKS + ")" : " attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES) + " for " + filePath + " after delay of " + delay + "ms");
-        
-        setTimeout(function() {
-          if (finished) return;
-          armTimeout(CMD_TIMEOUT_MS);
-          verificationStart = Date.now();
-          sendCmd(base + "/prov_verify_" + execId + ".sh");
-        }, delay);
+        if (finished) return;
+        armTimeout(CMD_TIMEOUT_MS);
+        verificationStart = Date.now();
+        sendCmd(base + "/prov_verify_" + execId + ".sh");
       }
 
       function doRemount() {
@@ -1598,52 +1546,48 @@ var WorkerProvisioner = {
           " mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
           "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
-          "echo '[INLINE_REMOUNT] Waiting for verify script visibility'; " +
-          "i=0; ok=0; while [ \"$i\" -lt 20 ]; do " +
-          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ] && [ -s /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
-          "  sleep 1; i=$((i+1)); " +
-          "done && [ \"$ok\" -eq 1 ] && " +
-          "echo '[INLINE_REMOUNT] Verify script visible, setting up symlink'; " +
-          "rm -rf /root/.provision && " +
-          "mkdir -p /mnt/9p/root/.provision && " +
-          "ln -s /mnt/9p/root/.provision /root/.provision && " +
-          "sync && " +
-          "echo '[INLINE_REMOUNT] Renaming .tmp helpers to final atomically'; " +
-          "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
-          "  if [ -f \"$f\" ]; then " +
-          "    target=\"/mnt/9p/root/.provision/$(basename \"$f\" .tmp)\"; " +
-          "    (fsync \"$f\" || sync) && " +
-          "    mv -f \"$f\" \"$target\" && " +
-          "    sync && " +
-          "    [ -f \"$target\" ] && " +
-          "    chmod +x \"$target\"; " +
-          "  fi; " +
-          "done && " +
-          "echo '[INLINE_REMOUNT] Validating helper executables'; " +
-          "h_ok=1; for h in mount verify remount diag reval execute; do " +
-          "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
-          "    h_ok=0; " +
-          "  fi; " +
-          "done && " +
-          "[ \"$h_ok\" -eq 1 ] && " +
-          "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
-          "for h in mount verify remount diag reval execute; do " +
-          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
-          "    case \"$h\" in " +
-          "      mount) name=\"MOUNTING\" ;; " +
-          "      verify) name=\"VERIFYING\" ;; " +
-          "      remount) name=\"REMOUNT\" ;; " +
-          "      diag) name=\"DIAGNOSTICS\" ;; " +
-          "      reval) name=\"REVALIDATION\" ;; " +
-          "      execute) name=\"EXECUTION\" ;; " +
-          "    esac; " +
-          "    echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
-          "  fi; " +
-          "done && " +
-          "sync && " +
-          "[ -d /root/.provision ] && " +
-          "echo '<<<FSM:" + execId + ":REMOUNT:OK>>>' > /dev/ttyS0 || " +
-          "echo '<<<FSM:" + execId + ":REMOUNT:ERR>>>' > /dev/ttyS0\n";
+          "if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then " +
+          "  rm -rf /root/.provision && " +
+          "  mkdir -p /mnt/9p/root/.provision && " +
+          "  ln -s /mnt/9p/root/.provision /root/.provision && " +
+          "  sync && " +
+          "  echo '[INLINE_REMOUNT] Renaming .tmp helpers to final atomically'; " +
+          "  for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
+          "    if [ -f \"$f\" ]; then " +
+          "      target=\"/mnt/9p/root/.provision/$(basename \"$f\" .tmp)\"; " +
+          "      (fsync \"$f\" || sync) && " +
+          "      mv -f \"$f\" \"$target\" && " +
+          "      sync && " +
+          "      [ -f \"$target\" ] && " +
+          "      chmod +x \"$target\"; " +
+          "    fi; " +
+          "  done && " +
+          "  echo '[INLINE_REMOUNT] Validating helper executables'; " +
+          "  h_ok=1; for h in mount verify remount diag reval execute; do " +
+          "    if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "      h_ok=0; " +
+          "    fi; " +
+          "  done && " +
+          "  [ \"$h_ok\" -eq 1 ] && " +
+          "  echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
+          "  for h in mount verify remount diag reval execute; do " +
+          "    if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "      case \"$h\" in " +
+          "        mount) name=\"MOUNTING\" ;; " +
+          "        verify) name=\"VERIFYING\" ;; " +
+          "        remount) name=\"REMOUNT\" ;; " +
+          "        diag) name=\"DIAGNOSTICS\" ;; " +
+          "        reval) name=\"REVALIDATION\" ;; " +
+          "        execute) name=\"EXECUTION\" ;; " +
+          "      esac; " +
+          "      echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
+          "    fi; " +
+          "  done && " +
+          "  sync && [ -d /root/.provision ] && " +
+          "  echo '<<<FSM:" + execId + ":REMOUNT:OK>>>' > /dev/ttyS0; " +
+          "else " +
+          "  echo '<<<FSM:" + execId + ":REMOUNT:ERR>>>' > /dev/ttyS0; " +
+          "fi\n";
           
         rawBuffer = "";
         parserState = "waiting";
@@ -1654,15 +1598,9 @@ var WorkerProvisioner = {
       function scheduleRemount() {
         if (remountAttemptsCount < MAX_MOUNT_RETRIES) {
           remountAttemptsCount++;
-          var delay = Math.min(8000, 1000 * Math.pow(2, remountAttemptsCount - 1));
-          var jitter = Math.floor(Math.random() * 500);
-          var finalDelay = delay + jitter;
-          log("warn", "[MountVisibilityFSM] Scheduling remount attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + " in " + finalDelay + "ms (backoff=" + delay + "ms, jitter=" + jitter + "ms)");
+          log("warn", "[MountVisibilityFSM] Triggering immediate remount attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES);
           postToHost("PROVISION_RECOVERING", { msg: "Filesystem synchronization recovering..." });
-          setTimeout(function() {
-            if (finished) return;
-            doRemount();
-          }, finalDelay);
+          doRemount();
         } else {
           log("error", "[MountVisibilityFSM] Mount retry budget (" + MAX_MOUNT_RETRIES + ") exhausted. Triggering diagnostics.");
           doDiagnostics();
@@ -1717,41 +1655,15 @@ var WorkerProvisioner = {
         } else {
           // In VERIFYING / visible FSM states
           if (event === "VIS") {
-            stabilityCount++;
-            if (stabilityCount >= STABILITY_CHECKS) {
-              log("info", "[MountVisibilityFSM] File VISIBLE and STABLE across " + STABILITY_CHECKS + " cycles. -> VERIFIED");
-              done(true, extra);
-            } else {
-              doVerify(true); // Run stability check
-            }
+            log("info", "[MountVisibilityFSM] File VISIBLE and VERIFIED. -> done");
+            done(true, extra);
           } else if (event === "NOVIS" || event === "TIMEOUT") {
-            stabilityCount = 0; // Reset stability counter since it failed!
-            
-            // Smart recovery rule: only remount if mount disappears OR checksum mismatch occurs repeatedly
-            var bufSanitized = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
-            var mountDisappeared = bufSanitized.indexOf("MOUNT_DISAPPEARED") !== -1 || bufSanitized.indexOf("[FSM] [MOUNT] MOUNT_VISIBLE") === -1;
-            var checksumMismatchCount = (bufSanitized.match(/Checksum mismatch/g) || []).length;
-            var repeatedChecksumMismatch = checksumMismatchCount >= 2;
-
-            if (mountDisappeared || repeatedChecksumMismatch) {
-              log("warn", "[MountVisibilityFSM] Recovery triggered: mountDisappeared=" + mountDisappeared + ", repeatedChecksumMismatch=" + repeatedChecksumMismatch + " (count=" + checksumMismatchCount + ")");
-              if (remountAttemptsCount < 3) {
-                log("warn", "[MountVisibilityFSM] " + (verifyAttempt) + " verify attempts done. Scheduling remount recovery.");
-                scheduleRemount();
-              } else {
-                log("error", "[MountVisibilityFSM] Remount recovery budget (3) exhausted. Triggering diagnostics.");
-                doDiagnostics();
-              }
+            log("warn", "[MountVisibilityFSM] Verification failed (event=" + event + "). Forcing remount recovery...");
+            if (remountAttemptsCount < MAX_MOUNT_RETRIES) {
+              scheduleRemount();
             } else {
-              // Do NOT remount for simple propagation delay. Just retry verification loop if below verify retries.
-              if (verifyAttempt < MAX_VERIFY_RETRIES) {
-                log("warn", "[MountVisibilityFSM] Propagation delay (mount active). Retrying verify loop. Attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES);
-                postToHost("PROVISION_RECOVERING", { msg: "Filesystem synchronization recovering..." });
-                doVerify(false);
-              } else {
-                log("error", "[MountVisibilityFSM] Maximum verification attempts (" + MAX_VERIFY_RETRIES + ") reached without visibility. Declaring failure.");
-                done(false);
-              }
+              log("error", "[MountVisibilityFSM] Remount recovery budget (" + MAX_MOUNT_RETRIES + ") exhausted. Triggering diagnostics.");
+              doDiagnostics();
             }
           } else {
             done(false);
@@ -2285,10 +2197,6 @@ self.onmessage = async function (e) {
       var execFilePath = payload.filePath;
       var execExecId = payload.execId;
       var expectedInode = payload.verifiedInode || "unknown";
-
-      // 4. Filesystem stabilization delay
-      log("info", "[WorkerProvisioner] Applying filesystem stabilization delay (800ms)...");
-      await new Promise(function(r) { setTimeout(r, 800); });
 
       // 2. Pre-execution revalidation
       var reval = await WorkerProvisioner.revalidateBeforeExecution(emulator, execFilePath, execExecId, expectedInode);
