@@ -1012,6 +1012,7 @@ var WorkerProvisioner = {
 
       // Kick off the FSM
       doMount();
+    });
   },
 
   /**
