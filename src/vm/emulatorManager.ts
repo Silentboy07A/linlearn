@@ -815,7 +815,7 @@ export class VMController {
 
     const activeGen = this.transport.getGenerationManager().getActiveGeneration();
     const activeGenId = activeGen ? activeGen.id : 0;
-    const parserEvents = this.provisioning.getCompletionParser().feed(char);
+    const parserEvents = this.provisioning.getCompletionParser().feed(char, activeGenId);
 
     for (const event of parserEvents) {
       const execId = event.id;

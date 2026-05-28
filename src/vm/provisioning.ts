@@ -18,8 +18,11 @@ import {
 
 export class ProvisioningCompletionParser {
   private buffer = "";
+  private provisioningBuffer = "";
+  private executionBuffer = "";
   private state: "IDLE" | "VERIFY_BEGIN" | "FILE_VISIBLE" | "VERIFY_END" | "EXEC_START" | "SUCCESS" | "FAIL" = "IDLE";
   private currentExecId = -1;
+  private currentEpoch = -1;
   private processedPackets = new Set<string>();
   private lastProcessedSequence = 0;
   private isExecutionMode = false;
@@ -39,17 +42,29 @@ export class ProvisioningCompletionParser {
     return this.lastMarker;
   }
 
-  public feed(data: string): { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] {
+  public feed(data: string, epoch = -1): { type: "complete" | "failed" | "heartbeat" | "shell_ready" | "exec_start"; id: number }[] {
     this.lastFeedTimestamp = Date.now();
-    // Sanitize immediately to prevent replacement mismatches caused by ANSI codes or carriage returns
-    this.buffer = this.sanitize(this.buffer + data);
-    if (this.buffer.length > 8192) {
-      this.buffer = this.buffer.slice(-8192);
+
+    // 8. Strict lifecycle epoch ownership validation
+    if (this.currentEpoch === -1 && epoch !== -1) {
+      this.currentEpoch = epoch;
+      Logger.info("VM", `[Provisioning FSM] [Telemetry] Parser epoch established: ${epoch}`);
+    }
+    if (epoch !== -1 && this.currentEpoch !== -1 && epoch !== this.currentEpoch) {
+      Logger.warn("VM", `[Provisioning FSM] [Telemetry] Ignored replay fragment from stale epoch ${epoch} (current=${this.currentEpoch})`);
+      return [];
     }
 
-    // 2. Parser Hard Barrier: ignore all FSM and VERIFYING/REVAL markers during EXECUTION_MODE
+    // 3. Parser Channel Separation: Select active buffer
+    let activeBuffer = this.isExecutionMode ? this.executionBuffer : this.provisioningBuffer;
+    activeBuffer = this.sanitize(activeBuffer + data);
+    if (activeBuffer.length > 8192) {
+      activeBuffer = activeBuffer.slice(-8192);
+    }
+
+    // 1. Harden EXECUTION_MODE isolation & Parser Hard Barrier
     if (this.isExecutionMode) {
-      this.buffer = this.buffer.replace(/<<<(FSM|EXEC_REVAL|VERIFYING|MOUNTING):[^>]*>>>/g, (match) => {
+      activeBuffer = activeBuffer.replace(/<<<(FSM|EXEC_REVAL|VERIFYING|MOUNTING):[^>]*>>>/g, (match) => {
         Logger.info("VM", `[Provisioning FSM] [Telemetry] Ignored stale FSM/verification marker during execution phase: ${match}`);
         return "";
       });
@@ -60,14 +75,21 @@ export class ProvisioningCompletionParser {
     // Parse standalone EXEC_START: <<<EXEC_START:id>>>
     const execStartRegex = /<<<EXEC_START:(\d+)>>>/g;
     let startMatch;
-    while ((startMatch = execStartRegex.exec(this.buffer)) !== null) {
+    while ((startMatch = execStartRegex.exec(activeBuffer)) !== null) {
       const raw = startMatch[0];
       const execId = parseInt(startMatch[1], 10);
       this.lastMarker = "EXEC_START:" + execId;
       
+      // Strict execId validation (Requirement 8)
+      if (this.currentExecId !== -1 && execId !== this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Rejected EXEC_START due to execId mismatch: incoming ${execId} !== current ${this.currentExecId}`);
+        activeBuffer = activeBuffer.replace(raw, "");
+        continue;
+      }
+      
       if (execId < this.currentExecId) {
         Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale EXEC_START marker for past execId=${execId} (current=${this.currentExecId})`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
       
@@ -88,21 +110,28 @@ export class ProvisioningCompletionParser {
         results.push({ type: "exec_start", id: execId });
         Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (EXEC_START): ${oldState} -> EXEC_START for execId=${execId}`);
       }
-      this.buffer = this.buffer.replace(raw, "");
+      activeBuffer = activeBuffer.replace(raw, "");
     }
 
     // Parse standalone EXEC_COMPLETE: <<<EXEC_COMPLETE:id:code>>>
     const execCompleteRegex = /<<<EXEC_COMPLETE:(\d+):([^>]+)>>>/g;
     let completeMatch;
-    while ((completeMatch = execCompleteRegex.exec(this.buffer)) !== null) {
+    while ((completeMatch = execCompleteRegex.exec(activeBuffer)) !== null) {
       const raw = completeMatch[0];
       const execId = parseInt(completeMatch[1], 10);
       const code = completeMatch[2];
       this.lastMarker = "EXEC_COMPLETE:" + execId + ":" + code;
 
+      // Strict execId validation (Requirement 8)
+      if (this.currentExecId !== -1 && execId !== this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Rejected EXEC_COMPLETE due to execId mismatch: incoming ${execId} !== current ${this.currentExecId}`);
+        activeBuffer = activeBuffer.replace(raw, "");
+        continue;
+      }
+
       if (execId < this.currentExecId) {
         Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale EXEC_COMPLETE marker for past execId=${execId} (current=${this.currentExecId})`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
 
@@ -126,20 +155,27 @@ export class ProvisioningCompletionParser {
         results.push({ type: "failed", id: execId });
         Logger.error("VM", `[Provisioning FSM] State transition SUCCESS (EXEC_COMPLETE FAILURE): ${oldState} -> FAIL for execId=${execId}. Code: ${code}`);
       }
-      this.buffer = this.buffer.replace(raw, "");
+      activeBuffer = activeBuffer.replace(raw, "");
     }
 
     // Parse standalone LLVM_PROVISION_COMPLETE: <<<LLVM_PROVISION_COMPLETE>>> or <<<LLVM_PROVISION_COMPLETE:execId>>>
     const llvmCompleteRegex = /<<<LLVM_PROVISION_COMPLETE(?::(\d+))?>>>/g;
     let llvmMatch;
-    while ((llvmMatch = llvmCompleteRegex.exec(this.buffer)) !== null) {
+    while ((llvmMatch = llvmCompleteRegex.exec(activeBuffer)) !== null) {
       const raw = llvmMatch[0];
       const execId = llvmMatch[1] ? parseInt(llvmMatch[1], 10) : this.currentExecId;
       this.lastMarker = "LLVM_PROVISION_COMPLETE:" + execId;
 
+      // Strict execId validation (Requirement 8)
+      if (this.currentExecId !== -1 && execId !== this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Rejected LLVM_PROVISION_COMPLETE due to execId mismatch: incoming ${execId} !== current ${this.currentExecId}`);
+        activeBuffer = activeBuffer.replace(raw, "");
+        continue;
+      }
+
       if (execId < this.currentExecId) {
         Logger.info("VM", `[Provisioning FSM] [Telemetry] Dropped stale LLVM_PROVISION_COMPLETE marker for past execId=${execId} (current=${this.currentExecId})`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
 
@@ -147,7 +183,7 @@ export class ProvisioningCompletionParser {
       this.state = "SUCCESS";
       results.push({ type: "complete", id: execId });
       Logger.info("VM", `[Provisioning FSM] State transition SUCCESS (LLVM_PROVISION_COMPLETE): ${oldState} -> SUCCESS for execId=${execId}`);
-      this.buffer = this.buffer.replace(raw, "");
+      activeBuffer = activeBuffer.replace(raw, "");
     }
 
     // Regex to match <<<PROTO:execId:sequence:ACTION(:reason)>>>
@@ -157,7 +193,7 @@ export class ProvisioningCompletionParser {
     // Use a temporary array of matched items
     const matchesToReplace: { raw: string; action: string; execId: number; sequence: number; reason?: string }[] = [];
 
-    while ((match = protoRegex.exec(this.buffer)) !== null) {
+    while ((match = protoRegex.exec(activeBuffer)) !== null) {
       const raw = match[0];
       const execId = parseInt(match[1], 10);
       const sequence = parseInt(match[2], 10);
@@ -171,10 +207,17 @@ export class ProvisioningCompletionParser {
       const { raw, action, execId, sequence, reason } = item;
       this.lastMarker = "PROTO:" + execId + ":" + action;
 
+      // Strict execId validation (Requirement 8)
+      if (this.currentExecId !== -1 && execId !== this.currentExecId) {
+        Logger.info("VM", `[Provisioning FSM] [Telemetry] Rejected PROTO marker due to execId mismatch: incoming ${execId} !== current ${this.currentExecId} (${action})`);
+        activeBuffer = activeBuffer.replace(raw, "");
+        continue;
+      }
+
       // 1. Monotonic Execution ID constraint
       if (execId < this.currentExecId) {
         Logger.info("VM", `[Provisioning FSM] [Telemetry] Replay fragment ignored (stale/out-of-order): ${action} (seq=${sequence}, execId=${execId}, currentExecId=${this.currentExecId})`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
 
@@ -189,11 +232,10 @@ export class ProvisioningCompletionParser {
       }
 
       // 2. Execution-Phase Parser Mode Isolation & Filtering
-      const isVerificationAction = action === "BEGIN" || action === "FILE_VISIBLE" || action === "VERIFY_END";
       if (this.isExecutionMode) {
         if (action !== "EXEC_START" && action !== "EXEC_COMPLETE" && action !== "LLVM_PROVISION_COMPLETE" && action !== "HEARTBEAT" && action !== "SHELL_READY" && action !== "FAIL") {
           Logger.info("VM", `[Provisioning FSM] [Telemetry] Execution-only filter dropped: ${action} for execId=${execId}`);
-          this.buffer = this.buffer.replace(raw, "");
+          activeBuffer = activeBuffer.replace(raw, "");
           continue;
         }
       }
@@ -202,26 +244,27 @@ export class ProvisioningCompletionParser {
       const packetKey = `${execId}:${sequence}:${action}`;
       if (action !== "HEARTBEAT" && this.processedPackets.has(packetKey)) {
         Logger.debug("VM", `[Provisioning FSM] Ignored duplicate packet '${action}' (seq=${sequence}) for execId=${execId}`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
 
       // 4. Packet Sequence Ordering Validation
       if (action !== "HEARTBEAT" && sequence <= this.lastProcessedSequence) {
         Logger.warn("VM", `[Provisioning FSM] Ignored out-of-order/stale packet '${action}' with sequence ${sequence} (last processed: ${this.lastProcessedSequence})`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
       if (action === "HEARTBEAT" && sequence < this.lastProcessedSequence) {
         Logger.warn("VM", `[Provisioning FSM] Ignored stale heartbeat with sequence ${sequence} (last processed: ${this.lastProcessedSequence})`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
 
       // 5. Stale Frame TTL Check (15 seconds verification phase timeout protection)
+      const isVerificationAction = action === "BEGIN" || action === "FILE_VISIBLE" || action === "VERIFY_END";
       if (isVerificationAction && (Date.now() - this.currentPhaseTimestamp > 15000)) {
         Logger.warn("VM", `[Provisioning FSM] Discarded stale verification marker '${action}' exceeding TTL`);
-        this.buffer = this.buffer.replace(raw, "");
+        activeBuffer = activeBuffer.replace(raw, "");
         continue;
       }
 
@@ -310,9 +353,16 @@ export class ProvisioningCompletionParser {
         Logger.warn("VM", `[Provisioning FSM] Transition REJECTED: ${this.state} -> ${action} for execId=${execId} (seq: ${sequence}, currentExecId=${this.currentExecId}). Reason: ${rejectionReason}`);
       }
 
-      // Remove the raw matched token from the original buffer
-      this.buffer = this.buffer.replace(raw, "");
+      activeBuffer = activeBuffer.replace(raw, "");
     }
+
+    // Write back to the active buffer & sync public property (for backward compatibility)
+    if (this.isExecutionMode) {
+      this.executionBuffer = activeBuffer;
+    } else {
+      this.provisioningBuffer = activeBuffer;
+    }
+    this.buffer = activeBuffer;
 
     return results;
   }
@@ -323,17 +373,23 @@ export class ProvisioningCompletionParser {
   }
 
   public enterExecutionMode(): void {
-    Logger.info("VM", `[Provisioning FSM] Explicitly entering EXECUTION_MODE. Ignoring all future FSM and verification markers.`);
+    Logger.info("VM", `[Provisioning FSM] Explicitly entering EXECUTION_MODE. Separating buffers and ignoring all future FSM and verification markers.`);
     this.isExecutionMode = true;
+    this.executionBuffer = ""; // Fresh execution buffer, no stale provisioning leftovers!
+    this.buffer = "";
   }
 
   public flush(): void {
-    Logger.info("VM", `[Provisioning FSM] Flushing parser buffer. Current state: ${this.state}, execId: ${this.currentExecId}`);
+    Logger.info("VM", `[Provisioning FSM] Flushing parser buffers. Current state: ${this.state}, execId: ${this.currentExecId}`);
+    this.provisioningBuffer = "";
+    this.executionBuffer = "";
     this.buffer = "";
   }
 
   public reset(): void {
     this.buffer = "";
+    this.provisioningBuffer = "";
+    this.executionBuffer = "";
     this.state = "IDLE";
     this.currentExecId = -1;
     this.processedPackets.clear();
@@ -342,6 +398,7 @@ export class ProvisioningCompletionParser {
     this.currentPhaseTimestamp = Date.now();
     this.lastFeedTimestamp = Date.now();
     this.lastMarker = "none";
+    this.currentEpoch = -1;
   }
 }
 
