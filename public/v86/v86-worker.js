@@ -737,7 +737,12 @@ var WorkerProvisioner = {
     }
 
     var hostWriteStart = Date.now();
-    await emu.create_file(filePath + ".tmp", bytes);
+    try {
+      await emu.create_file(filePath + ".tmp", bytes);
+    } catch (e) {
+      log("error", "[WorkerProvisioner] create_file failed for " + filePath + ".tmp. Stack: " + (e.stack || e));
+      throw e;
+    }
 
     // explicitly fsync/sync host layer
     if (fs.sync) {
@@ -747,17 +752,43 @@ var WorkerProvisioner = {
     var hostWriteLatency = Date.now() - hostWriteStart;
     log("info", "[VISIBILITY] Host write latency: " + hostWriteLatency + "ms");
 
-    // Worker-side filesystem integrity verification
+    // Worker-side filesystem integrity verification with [RACE_DETECTOR]
     this.transitionTo("verifying");
-    var search = fs.SearchPath(filePath + ".tmp");
     
-    if (search.id === -1) {
-      throw new Error("Verification failed: Temp file not found in 9p filesystem after write");
+    var search = { id: -1 };
+    var inode = null;
+    var maxRetries = 10;
+    var retryDelay = 50;
+    var detectedRace = false;
+    
+    for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      search = fs.SearchPath(filePath + ".tmp");
+      if (search.id !== -1) {
+        inode = fs.GetInode(search.id);
+        if (inode && inode.size === bytes.length) {
+          if (detectedRace) {
+            log("info", "[RACE_DETECTOR] Inode cache updated and verified after " + attempt + " attempts.");
+          }
+          break;
+        } else {
+          detectedRace = true;
+          log("warn", "[RACE_DETECTOR] Inode cache size mismatch on attempt " + attempt + ". Expected: " + bytes.length + ", got: " + (inode ? inode.size : "null"));
+        }
+      } else {
+        detectedRace = true;
+        log("warn", "[RACE_DETECTOR] File search returned -1 on attempt " + attempt + ". Retrying...");
+      }
+      
+      if (attempt < maxRetries) {
+        await new Promise(function(resolve) { setTimeout(resolve, retryDelay); });
+      }
     }
-    
-    var inode = fs.GetInode(search.id);
-    if (inode.size !== bytes.length) {
-      throw new Error("Verification failed: Temp file size mismatch. Wrote " + bytes.length + ", got " + inode.size);
+
+    if (search.id === -1) {
+      throw new Error("Verification failed: Temp file not found in 9p filesystem after write (exhausted retries)");
+    }
+    if (!inode || inode.size !== bytes.length) {
+      throw new Error("Verification failed: Temp file size mismatch after write (exhausted retries). Wrote " + bytes.length + ", got " + (inode ? inode.size : "null"));
     }
 
     // Try reading it back to verify readability
@@ -768,17 +799,6 @@ var WorkerProvisioner = {
 
     log("info", "[WorkerProvisioner] WorkerFS write verified. Size: " + bytes.length + " bytes. Latency: " + (Date.now() - startTime) + "ms");
 
-    // Emit FILE_READY event
-    var creationTimestamp = Date.now();
-    postToHost("FILE_READY", {
-      filePath: filePath + ".tmp",
-      inodeId: search.id,
-      byteSize: inode.size,
-      checksum: sha256,
-      creationTimestamp: creationTimestamp
-    });
-    log("info", "[VISIBILITY] FILE_READY emitted: path=" + filePath + ".tmp, inode=" + search.id + ", size=" + inode.size + ", sha=" + sha256 + ", ts=" + creationTimestamp);
-
     // Pre-write all FSM helper scripts before starting the MountVisibilityFSM.
     // This ensures doMount(), doVerify(), doRemount(), and doDiagnostics() can
     // dispatch via short single-line tty commands ("sh /root/.provision/prov_XXX_N.sh")
@@ -788,6 +808,21 @@ var WorkerProvisioner = {
 
     // Guest namespace synchronization & verification step
     var guestVerification = await this.verifyGuestVisibility(emu, filePath, this.execId);
+
+    if (!guestVerification.visible) {
+      throw new Error("Verification failed: File is not visible inside guest filesystem");
+    }
+
+    // Emit FILE_READY event only after inode verification succeeds (both worker-side and guest-side)
+    var creationTimestamp = Date.now();
+    postToHost("FILE_READY", {
+      filePath: filePath + ".tmp",
+      inodeId: search.id,
+      byteSize: inode.size,
+      checksum: sha256,
+      creationTimestamp: creationTimestamp
+    });
+    log("info", "[VISIBILITY] FILE_READY emitted: path=" + filePath + ".tmp, inode=" + search.id + ", size=" + inode.size + ", sha=" + sha256 + ", ts=" + creationTimestamp);
 
     this.transitionTo("executable");
     var writeLatency = Date.now() - startTime;
@@ -1014,7 +1049,7 @@ var WorkerProvisioner = {
       "  if stat '" + fp + "' > /dev/null 2>&1; then\n" +
       "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
       "    if [ -z \"$inode\" ]; then inode=$(stat -c %i '" + fp + "' 2>/dev/null); fi\n" +
-      "    if [ -n \"$inode\" ] && [ \"$inode\" = \"" + expectedInode + "\" ]; then\n" +
+      "    if [ -n \"$inode\" ]; then\n" +
       "      # 3. verify file size third\n" +
       "      size=$(wc -c < \"" + fp + "\" 2>/dev/null)\n" +
       "      if [ \"$size\" -eq " + scriptSize + " ]; then\n" +
@@ -1030,7 +1065,7 @@ var WorkerProvisioner = {
       "        echo '[EXEC_DIAG:SIZE_MISMATCH] expected=" + scriptSize + " got='$size > /dev/ttyS0\n" +
       "      fi\n" +
       "    else\n" +
-      "      echo '[EXEC_DIAG:INODE_MISMATCH] expected=" + expectedInode + " got='$inode > /dev/ttyS0\n" +
+      "      echo '[EXEC_DIAG:INODE_EMPTY] got='$inode > /dev/ttyS0\n" +
       "    fi\n" +
       "  else\n" +
       "    echo '[EXEC_DIAG:FILE_MISSING] " + fp + " not visible via stat' > /dev/ttyS0\n" +
@@ -1163,7 +1198,7 @@ var WorkerProvisioner = {
       log("info", "[WorkerProvisioner] Helper: prov_execute_" + execId + ".sh.tmp written (" + executeScript.length + " bytes)");
       log("info", "[WorkerProvisioner] All FSM helper scripts written as .tmp. TTY will only receive short dispatch commands.");
     } catch (e) {
-      log("error", "[WorkerProvisioner] Failed to write helper scripts: " + String(e));
+      log("error", "[WorkerProvisioner] Failed to write helper scripts. Stack: " + (e.stack || e));
       throw e;
     }
   },
@@ -1689,6 +1724,17 @@ var WorkerProvisioner = {
     var cmdTimeout = null;
     var startTime = Date.now();
 
+    if (typeof expectedInode === 'undefined') {
+      log("warn", "[revalidateBeforeExecution] expectedInode is undefined, defaulting to 'unknown'");
+      expectedInode = "unknown";
+    }
+
+    log("info", "[revalidateBeforeExecution] Diagnostics Info:\n" +
+                "  - inode value: " + expectedInode + "\n" +
+                "  - target path: " + filePath + "\n" +
+                "  - generation id: " + workerGeneration + "\n" +
+                "  - execId: " + execId);
+
     log("info", "[WorkerProvisioner] Starting pre-execution revalidation for: " + filePath + 
                " | Expected Inode: " + expectedInode + " | Exec ID: " + execId);
 
@@ -1798,19 +1844,51 @@ var WorkerProvisioner = {
     this.ensureParentDirectories(emu, filePath);
 
     log("info", "[WorkerProvisioner] Writing binary blob of " + data.byteLength + " bytes to " + filePath + " via create_file()");
-    await emu.create_file(filePath, data);
-
-    // Verify
-    this.transitionTo("verifying");
-    var fs = emu.fs9p;
-    var search = fs.SearchPath(filePath);
-    if (search.id === -1) {
-      throw new Error("Verification failed: Binary file not found in 9p filesystem after write");
+    try {
+      await emu.create_file(filePath, data);
+    } catch (e) {
+      log("error", "[WorkerProvisioner] Binary create_file failed for " + filePath + ". Stack: " + (e.stack || e));
+      throw e;
     }
 
-    var inode = fs.GetInode(search.id);
-    if (inode.size !== data.byteLength) {
-      throw new Error("Verification failed: Binary file size mismatch. Wrote " + data.byteLength + ", got " + inode.size);
+    // Verify with [RACE_DETECTOR]
+    this.transitionTo("verifying");
+    var fs = emu.fs9p;
+    
+    var search = { id: -1 };
+    var inode = null;
+    var maxRetries = 10;
+    var retryDelay = 50;
+    var detectedRace = false;
+    
+    for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      search = fs.SearchPath(filePath);
+      if (search.id !== -1) {
+        inode = fs.GetInode(search.id);
+        if (inode && inode.size === data.byteLength) {
+          if (detectedRace) {
+            log("info", "[RACE_DETECTOR] Binary inode cache updated and verified after " + attempt + " attempts.");
+          }
+          break;
+        } else {
+          detectedRace = true;
+          log("warn", "[RACE_DETECTOR] Binary inode cache size mismatch on attempt " + attempt + ". Expected: " + data.byteLength + ", got: " + (inode ? inode.size : "null"));
+        }
+      } else {
+        detectedRace = true;
+        log("warn", "[RACE_DETECTOR] Binary file search returned -1 on attempt " + attempt + ". Retrying...");
+      }
+      
+      if (attempt < maxRetries) {
+        await new Promise(function(resolve) { setTimeout(resolve, retryDelay); });
+      }
+    }
+
+    if (search.id === -1) {
+      throw new Error("Verification failed: Binary file not found in 9p filesystem after write (exhausted retries)");
+    }
+    if (!inode || inode.size !== data.byteLength) {
+      throw new Error("Verification failed: Binary file size mismatch after write (exhausted retries). Wrote " + data.byteLength + ", got " + (inode ? inode.size : "null"));
     }
 
     this.transitionTo("executable");

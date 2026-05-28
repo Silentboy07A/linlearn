@@ -856,6 +856,7 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     } else {
       // Fatal transport failure
       this._cancelChunkTimer();
+      this._cancelAllTimers();
       this.isLocked = false;
       this.transitionTransportTo("failed");
       this.transitionTo("failed");
