@@ -114,6 +114,11 @@ export interface ProvisionReadyPayload {
     guestVisibilityTimingMs?: number;
     remountAttempts?: number;
     verifiedInode?: string;
+    mountLatencyMs?: number;
+    visibilityLatencyMs?: number;
+    virtioReadiness?: boolean;
+    readdirSuccess?: boolean;
+    inodeReadiness?: boolean;
   };
 }
 

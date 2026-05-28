@@ -738,6 +738,8 @@ var WorkerProvisioner = {
    */
   verifyGuestVisibility: function(emu, filePath, execId) {
     var MAX_VERIFY_RETRIES = 6;
+    var MAX_MOUNT_RETRIES = 3;
+    var STABILITY_CHECKS = 3;
     var CMD_TIMEOUT_MS = 8000;
     var fsmState = "MOUNTING";
     var startTime = Date.now();
@@ -755,6 +757,14 @@ var WorkerProvisioner = {
     var retryCount = 0;
     var guestVisibilityTimingMs = -1;
     var remountAttemptsCount = 0;
+    
+    // Advanced mount telemetry
+    var mountLatencyMs = -1;
+    var visibilityLatencyMs = -1;
+    var virtioReadiness = false;
+    var readdirSuccess = false;
+    var inodeReadiness = false;
+    var stabilityCount = 0;
 
     log("info", "[MountVisibilityFSM] Starting for path: " + filePath + " execId=" + execId);
 
@@ -767,14 +777,23 @@ var WorkerProvisioner = {
         var elapsed = Date.now() - startTime;
         if (visible) {
           propagationLatencyMs = elapsed;
+          visibilityLatencyMs = elapsed;
         }
         guestVisibilityTimingMs = elapsed;
 
         var resolvedInode = inode || "unknown";
+        if (visible && resolvedInode !== "unknown" && resolvedInode !== "") {
+          inodeReadiness = true;
+        }
 
         log("info", "[MountVisibilityFSM TELEMETRY] Resolved visible=" + visible + 
                    " | inode=" + resolvedInode +
                    " | mountSuccess=" + mountSuccess +
+                   " | mountLatency=" + mountLatencyMs + "ms" +
+                   " | visibilityLatency=" + visibilityLatencyMs + "ms" +
+                   " | virtioReadiness=" + virtioReadiness +
+                   " | readdirSuccess=" + readdirSuccess +
+                   " | inodeReadiness=" + inodeReadiness +
                    " | propagationLatency=" + (propagationLatencyMs !== -1 ? propagationLatencyMs + "ms" : "N/A") +
                    " | retryCount=" + retryCount +
                    " | guestVisibilityTiming=" + guestVisibilityTimingMs + "ms" +
@@ -789,7 +808,12 @@ var WorkerProvisioner = {
             propagationLatencyMs: propagationLatencyMs,
             retryCount: retryCount,
             guestVisibilityTimingMs: guestVisibilityTimingMs,
-            remountAttempts: remountAttemptsCount
+            remountAttempts: remountAttemptsCount,
+            mountLatencyMs: mountLatencyMs,
+            visibilityLatencyMs: visibilityLatencyMs,
+            virtioReadiness: virtioReadiness,
+            readdirSuccess: readdirSuccess,
+            inodeReadiness: inodeReadiness
           }
         });
       }
@@ -872,37 +896,68 @@ var WorkerProvisioner = {
       function doMount() {
         fsmState = "MOUNTING";
         mountStartTime = Date.now();
-        log("info", "[MountVisibilityFSM] MOUNTING: checking /proc/mounts then mounting host9p and polling readiness");
+        log("info", "[MountVisibilityFSM] MOUNTING: checking barriers and mounting host9p");
         armTimeout(CMD_TIMEOUT_MS);
         
         var cmd =
           "stty -echo 2>/dev/null; PS1=''; " +
-          "check_mnt() { [ -d /mnt/9p ] && stat /mnt/9p >/dev/null 2>&1 && ls /mnt/9p >/dev/null 2>&1; }; " +
+          // 1. Wait barriers function
+          "wait_barriers() { " +
+          "  [ -f /proc/filesystems ] || return 1; " +
+          "  grep -q 9p /proc/filesystems || return 1; " +
+          "  [ -f /proc/mounts ] || return 1; " +
+          "  cat /proc/mounts >/dev/null 2>&1 || return 1; " +
+          "  return 0; " +
+          "}; " +
+          // 2. Poll barriers
+          "b_i=0; b_ok=0; " +
+          "while [ $b_i -lt 30 ]; do " +
+          "  if wait_barriers; then b_ok=1; break; fi; " +
+          "  sleep 0.1; b_i=$((b_i+1)); " +
+          "done; " +
+          "if [ $b_ok -eq 0 ]; then echo '" + makeTag("MOUNTING", "ERR") + "'; exit 1; fi; " +
+          // 3. Perform mount if not already mounted
+          "check_mnt() { " +
+          "  stat /mnt/9p >/dev/null 2>&1 || return 1; " +
+          "  ls /mnt/9p >/dev/null 2>&1 || return 1; " +
+          "  _ino=$(stat -c %i /mnt/9p 2>/dev/null); [ -n \"$_ino\" ] || return 1; " +
+          "  ls -f /mnt/9p >/dev/null 2>&1 || return 1; " +
+          "  return 0; " +
+          "}; " +
           "if ! grep -q host9p /proc/mounts 2>/dev/null; then " +
-          "mkdir -p /mnt/9p 2>/dev/null; " +
-          "mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
-          "mount -t 9p host9p /mnt/9p 2>/dev/null; fi; " +
+          "  mkdir -p /mnt/9p 2>/dev/null; " +
+          "  mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
+          "  mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "  mount -t 9p host9p /mnt/9p 2>/dev/null; " +
+          "fi; " +
           "mkdir -p /root/.provision 2>/dev/null; " +
+          // 4. Poll check_mnt with debounce stabilization
           "i=0; ok=0; " +
           "while [ $i -lt 15 ]; do " +
-          "if check_mnt; then ok=1; break; fi; " +
-          "sleep 0.2; i=$((i+1)); done; " +
+          "  if check_mnt; then " +
+          "    sleep 0.5; " +
+          "    if check_mnt; then ok=1; break; fi; " +
+          "  fi; " +
+          "  sleep 0.2; i=$((i+1)); " +
+          "done; " +
           "if [ $ok -eq 1 ]; then " +
-          "echo '" + makeTag("MOUNTING", "OK") + "'; " +
+          "  echo '" + makeTag("MOUNTING", "OK") + "'; " +
           "else echo '" + makeTag("MOUNTING", "ERR") + "'; fi\n";
           
         sendCmd(cmd);
       }
 
-      function doVerify() {
+      function doVerify(isStabilityCheck) {
         fsmState = "VERIFYING";
-        verifyAttempt++;
-        retryCount = verifyAttempt;
+        if (!isStabilityCheck) {
+          verifyAttempt++;
+          retryCount = verifyAttempt;
+        }
         
-        // Calculate exponential backoff delay: base 300ms, backoff factor 2, capped at 4000ms
-        var delay = Math.min(4000, 300 * Math.pow(2, verifyAttempt - 1));
-        log("info", "[MountVisibilityFSM] VERIFYING attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES + " for " + filePath + " after delay of " + delay + "ms");
+        // Calculate exponential backoff delay: base 300ms, backoff factor 2, capped at 4000ms.
+        // For stability check cycles, we use a quick 200ms delay.
+        var delay = isStabilityCheck ? 200 : Math.min(4000, 300 * Math.pow(2, verifyAttempt - 1));
+        log("info", "[MountVisibilityFSM] VERIFYING" + (isStabilityCheck ? " (stability check " + (stabilityCount + 1) + "/" + STABILITY_CHECKS + ")" : " attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES) + " for " + filePath + " after delay of " + delay + "ms");
         
         setTimeout(function() {
           if (finished) return;
@@ -920,28 +975,57 @@ var WorkerProvisioner = {
 
       function doRemount() {
         fsmState = "REMOUNT";
-        remountAttemptsCount++;
-        log("info", "[MountVisibilityFSM] REMOUNT: unmounting and remounting host9p and polling readiness");
+        log("info", "[MountVisibilityFSM] REMOUNT: unmounting and remounting host9p and polling readiness (attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + ")");
         armTimeout(CMD_TIMEOUT_MS);
         
         var cmd =
           "stty -echo 2>/dev/null; PS1=''; " +
-          "check_mnt() { [ -d /mnt/9p ] && stat /mnt/9p >/dev/null 2>&1 && ls /mnt/9p >/dev/null 2>&1; }; " +
+          "umount -f /mnt/9p 2>/dev/null; " +
           "umount /mnt/9p 2>/dev/null; " +
+          "check_mnt() { " +
+          "  stat /mnt/9p >/dev/null 2>&1 || return 1; " +
+          "  ls /mnt/9p >/dev/null 2>&1 || return 1; " +
+          "  _ino=$(stat -c %i /mnt/9p 2>/dev/null); [ -n \"$_ino\" ] || return 1; " +
+          "  ls -f /mnt/9p >/dev/null 2>&1 || return 1; " +
+          "  return 0; " +
+          "}; " +
           "mkdir -p /mnt/9p 2>/dev/null; " +
           "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           "mount -t 9p host9p /mnt/9p 2>/dev/null; then " +
-          "mkdir -p /root/.provision 2>/dev/null; " +
-          "i=0; ok=0; " +
-          "while [ $i -lt 15 ]; do " +
-          "if check_mnt; then ok=1; break; fi; " +
-          "sleep 0.2; i=$((i+1)); done; " +
-          "if [ $ok -eq 1 ]; then echo '" + makeTag("REMOUNT", "OK") + "'; " +
-          "else echo '" + makeTag("REMOUNT", "ERR") + "'; fi; " +
+          "  mkdir -p /root/.provision 2>/dev/null; " +
+          "  i=0; ok=0; " +
+          "  while [ $i -lt 15 ]; do " +
+          "    if check_mnt; then " +
+          "      sleep 0.5; " +
+          "      if check_mnt; then ok=1; break; fi; " +
+          "    fi; " +
+          "    sleep 0.2; i=$((i+1)); " +
+          "  done; " +
+          "  if [ $ok -eq 1 ]; then echo '" + makeTag("REMOUNT", "OK") + "'; " +
+          "  else echo '" + makeTag("REMOUNT", "ERR") + "'; fi; " +
           "else echo '" + makeTag("REMOUNT", "ERR") + "'; fi\n";
           
         sendCmd(cmd);
+      }
+
+      function scheduleRemount() {
+        if (remountAttemptsCount < MAX_MOUNT_RETRIES) {
+          remountAttemptsCount++;
+          // Exponential backoff: base 500ms, backoff factor 2, capped at 6000ms
+          var delay = Math.min(6000, 500 * Math.pow(2, remountAttemptsCount - 1));
+          // Jitter: add random 0-300ms
+          var jitter = Math.floor(Math.random() * 300);
+          var finalDelay = delay + jitter;
+          log("warn", "[MountVisibilityFSM] Scheduling remount attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + " in " + finalDelay + "ms (backoff=" + delay + "ms, jitter=" + jitter + "ms)");
+          setTimeout(function() {
+            if (finished) return;
+            doRemount();
+          }, finalDelay);
+        } else {
+          log("error", "[MountVisibilityFSM] Mount retry budget (" + MAX_MOUNT_RETRIES + ") exhausted. Triggering diagnostics.");
+          doDiagnostics();
+        }
       }
 
       function doDiagnostics() {
@@ -968,45 +1052,48 @@ var WorkerProvisioner = {
         if (fsmState === "MOUNTING") {
           if (event === "OK") {
             mountSuccess = true;
-            var mountLatency = Date.now() - mountStartTime;
-            log("info", "[MountVisibilityFSM] Mount OK. Latency: " + mountLatency + "ms. -> VERIFYING");
-            doVerify();
+            virtioReadiness = true;
+            readdirSuccess = true;
+            mountLatencyMs = Date.now() - mountStartTime;
+            log("info", "[MountVisibilityFSM] Mount OK. Latency: " + mountLatencyMs + "ms. -> VERIFYING");
+            doVerify(false);
           } else {
-            // Mount failed — try remount once, then fallback
-            if (remountAttemptsCount === 0) {
-              log("warn", "[MountVisibilityFSM] Initial mount failed. Attempting remount recovery.");
-              doRemount();
-            } else {
-              log("error", "[MountVisibilityFSM] Mount failed twice. -> FALLBACK");
-              done(false);
-            }
+            // Mount failed — schedule remount recovery
+            scheduleRemount();
           }
         } else if (fsmState === "VERIFYING") {
           if (event === "VIS") {
-            log("info", "[MountVisibilityFSM] File VISIBLE on attempt " + verifyAttempt + ". -> VERIFIED");
-            done(true, extra);
+            stabilityCount++;
+            if (stabilityCount >= STABILITY_CHECKS) {
+              log("info", "[MountVisibilityFSM] File VISIBLE and STABLE across " + STABILITY_CHECKS + " cycles. -> VERIFIED");
+              done(true, extra);
+            } else {
+              doVerify(true); // Run stability check
+            }
           } else if (event === "NOVIS" || event === "TIMEOUT") {
+            stabilityCount = 0; // Reset stability counter since it failed!
             if (verifyAttempt < MAX_VERIFY_RETRIES) {
               log("warn", "[MountVisibilityFSM] Not visible yet (attempt " + verifyAttempt + "). Retrying verify loop.");
-              doVerify();
-            } else if (remountAttemptsCount === 0) {
-              log("warn", "[MountVisibilityFSM] " + MAX_VERIFY_RETRIES + " verify attempts exhausted. Attempting remount.");
-              doRemount();
+              doVerify(false);
             } else {
-              log("error", "[MountVisibilityFSM] All retries + remount exhausted. Triggering diagnostics.");
-              doDiagnostics();
+              log("warn", "[MountVisibilityFSM] " + MAX_VERIFY_RETRIES + " verify attempts exhausted. Scheduling remount.");
+              scheduleRemount();
             }
           } else {
             done(false);
           }
         } else if (fsmState === "REMOUNT") {
           if (event === "OK") {
+            mountSuccess = true;
+            virtioReadiness = true;
+            readdirSuccess = true;
             log("info", "[MountVisibilityFSM] Remount OK. Resetting verify counter -> VERIFYING");
             verifyAttempt = 0;
-            doVerify();
+            stabilityCount = 0;
+            doVerify(false);
           } else {
-            log("error", "[MountVisibilityFSM] Remount failed. Triggering diagnostics.");
-            doDiagnostics();
+            // Remount command itself failed or timed out — schedule another remount if budget remains
+            scheduleRemount();
           }
         } else if (fsmState === "DIAGNOSTICS") {
           log("warn", "[MountVisibilityFSM DIAGNOSTICS] Guest dump:\n" + (extra || ""));

@@ -870,6 +870,17 @@ export class VMController {
 
     // ── Boot ready: root prompt detected, start provisioning ──
     if (hasRootPrompt && this.provisioning.getState() === "idle") {
+      // Ensure prompt is stable for a minimum duration (1000ms of quiet/silence)
+      const now = Date.now();
+      const quietDuration = now - this.lastSerialOutputTimestamp;
+      if (quietDuration < 1000) {
+        this.timeouts.cancel("prompt_stabilization");
+        this.timeouts.register("prompt_stabilization", 1000 - quietDuration, () => {
+          this.handleSerialLifecycle("");
+        });
+        return;
+      }
+      this.timeouts.cancel("prompt_stabilization");
       this.timeouts.cancel("boot_watchdog");
       
       // Disable echo and canonical mode immediately to isolate the stream
