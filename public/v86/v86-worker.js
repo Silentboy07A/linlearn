@@ -834,16 +834,18 @@ var WorkerProvisioner = {
     // Mounts host9p at /mnt/9p and emits OK or ERR marker.
     var mountScript =
       "#!/bin/sh\n" +
+      "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
+      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"mountScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
       "# Check kernel 9p filesystem support\n" +
       "b_i=0; b_ok=0\n" +
-      "while [ $b_i -lt 30 ]; do\n" +
+      "while [ \"$b_i\" -lt 30 ]; do\n" +
       "  if [ -f /proc/filesystems ] && grep -q 9p /proc/filesystems && [ -f /proc/mounts ]; then\n" +
       "    b_ok=1; break\n" +
       "  fi\n" +
       "  sleep 1; b_i=$((b_i+1))\n" +
       "done\n" +
-      "if [ $b_ok -eq 0 ]; then\n" +
+      "if [ \"$b_ok\" = \"0\" ]; then\n" +
       "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0; exit 1\n" +
       "fi\n" +
       "# Mount if not already mounted\n" +
@@ -860,32 +862,35 @@ var WorkerProvisioner = {
       "  echo '" + makeTag("MOUNTING", "OK") + "' > /dev/ttyS0\n" +
       "else\n" +
       "  echo '" + makeTag("MOUNTING", "ERR") + "' > /dev/ttyS0\n" +
-      "fi\n";
+      "fi\n" +
+      "trap - EXIT\n";
 
     // ── Verify script ──────────────────────────────────────────────────────────
     // Checks that the provisioning file exists and is readable; emits VIS or NOVIS.
     var fp = filePath;
     var verifyScript =
       "#!/bin/sh\n" +
+      "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
+      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"verifyScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "i=0; ok=0; inode=; size=;\n" +
-      "while [ $i -lt 10 ]; do\n" +
+      "while [ \"$i\" -lt 10 ]; do\n" +
       "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
-      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null)\n" +
-      "    size=$(stat -c %s '" + fp + "' 2>/dev/null)\n" +
+      "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
+      "    size=$(wc -c < '" + fp + "' 2>/dev/null)\n" +
       "    if [ -n \"$inode\" ] && [ -n \"$size\" ] && [ \"$size\" -gt 0 ]; then\n" +
       "      ok=1; break;\n" +
       "    fi\n" +
       "  fi\n" +
-      "  sleep 0.5\n" +
+      "  sleep 1\n" +
       "  i=$((i+1))\n" +
       "done\n" +
       "echo '[VERIFY:STAT]' > /dev/ttyS0; stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
       "echo '[VERIFY:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
-      "echo '[VERIFY:MODE]' > /dev/ttyS0; stat -c %a '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
-      "if [ $ok -eq 1 ]; then\n" +
+      "echo '[VERIFY:MODE]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
+      "if [ \"$ok\" = \"1\" ]; then\n" +
       "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
       "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
       "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
@@ -898,13 +903,16 @@ var WorkerProvisioner = {
       "  fi\n" +
       "else\n" +
       "  echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
-      "fi\n";
+      "fi\n" +
+      "trap - EXIT\n";
 
     // ── Remount script ─────────────────────────────────────────────────────────
     // Unmounts and remounts host9p, then emits OK or ERR.
     var remountScript =
       "#!/bin/sh\n" +
+      "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
+      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"remountScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
       "umount -f /mnt/9p > /dev/null 2>&1; umount /mnt/9p > /dev/null 2>&1\n" +
       "mkdir -p /mnt/9p > /dev/null 2>&1\n" +
       "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null ||\n" +
@@ -919,12 +927,15 @@ var WorkerProvisioner = {
       "  fi\n" +
       "else\n" +
       "  echo '" + makeTag("REMOUNT", "ERR") + "' > /dev/ttyS0\n" +
-      "fi\n";
+      "fi\n" +
+      "trap - EXIT\n";
 
     // ── Diagnostics script ─────────────────────────────────────────────────────
     var diagScript =
       "#!/bin/sh\n" +
+      "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
+      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"diagScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
       "echo '[DIAG:MOUNT]' > /dev/ttyS0\n" +
       "mount 2>/dev/null > /dev/ttyS0 || echo 'mount-failed' > /dev/ttyS0\n" +
       "echo '[DIAG:MOUNTPATH]' > /dev/ttyS0\n" +
@@ -938,15 +949,18 @@ var WorkerProvisioner = {
       "echo '[DIAG:STAT]' > /dev/ttyS0\n" +
       "stat '" + fp + "' 2>/dev/null > /dev/ttyS0 || echo 'stat-failed' > /dev/ttyS0\n" +
       "echo '[DIAG:MODE]' > /dev/ttyS0\n" +
-      "stat -c %a '" + fp + "' 2>/dev/null > /dev/ttyS0 || echo 'mode-failed' > /dev/ttyS0\n" +
-      "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>' > /dev/ttyS0\n";
+      "ls -l '" + fp + "' 2>/dev/null > /dev/ttyS0 || echo 'mode-failed' > /dev/ttyS0\n" +
+      "echo '<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>' > /dev/ttyS0\n" +
+      "trap - EXIT\n";
 
     // ── Revalidation script ────────────────────────────────────────────────────
     var okMarkerPrefix = "<<<EXEC_REVAL:" + execId + ":OK>>>";
     var failMarker = "<<<EXEC_REVAL:" + execId + ":FAIL>>>";
     var revalScript =
       "#!/bin/sh\n" +
+      "set -x\n" +
       "stty -echo > /dev/null 2>&1\n" +
+      "trap 'exit_code=$?; [ \"$exit_code\" -ne 0 ] && echo \"revalScript failed at line: $LINENO\" > /dev/ttyS0' EXIT\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "echo '[EXEC_DIAG:PWD]' > /dev/ttyS0; pwd > /dev/ttyS0\n" +
@@ -957,15 +971,15 @@ var WorkerProvisioner = {
       "echo '[EXEC_DIAG:STAT]' > /dev/ttyS0\n" +
       "stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
       "echo '[EXEC_DIAG:MODE]' > /dev/ttyS0\n" +
-      "stat -c %a '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
+      "ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
       "echo '[EXEC_DIAG:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
       "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
       "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
       "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
-      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
       "    echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
       "  elif [ -z \"$actual_sha\" ]; then\n" +
-      "    inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
       "    echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
       "  else\n" +
       "    echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
@@ -976,10 +990,10 @@ var WorkerProvisioner = {
       "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
       "    actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
       "    if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
-      "      inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "      inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
       "      echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
       "    elif [ -z \"$actual_sha\" ]; then\n" +
-      "      inode=$(stat -c %i '" + fp + "' 2>/dev/null || echo unknown)\n" +
+      "      inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
       "      echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
       "    else\n" +
       "      echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
@@ -988,7 +1002,8 @@ var WorkerProvisioner = {
       "  else\n" +
       "    echo '" + failMarker + "' > /dev/ttyS0\n" +
       "  fi\n" +
-      "fi\n";
+      "fi\n" +
+      "trap - EXIT\n";
 
     // Write all helper scripts via create_file() as .tmp files
     try {
@@ -1260,36 +1275,41 @@ var WorkerProvisioner = {
         log("info", "[MountVisibilityFSM TELEMETRY] Current FSM state: " + fsmState);
 
         var inlineCmd = 
+          "set -x; echo '[INLINE_MOUNT] Starting mount sequence'; " +
           "mkdir -p /mnt/9p && " +
           "umount -f /mnt/9p >/dev/null 2>&1; umount /mnt/9p >/dev/null 2>&1; " +
+          "echo '[INLINE_MOUNT] Attempting 9p mount'; " +
           "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
           "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
-          "i=0; ok=0; while [ $i -lt 20 ]; do " +
+          "echo '[INLINE_MOUNT] Waiting for verify script visibility'; " +
+          "i=0; ok=0; while [ \"$i\" -lt 20 ]; do " +
           "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ] && [ -s /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
-          "  sleep 0.5; i=$((i+1)); " +
-          "done && [ $ok -eq 1 ] && " +
+          "  sleep 1; i=$((i+1)); " +
+          "done && [ \"$ok\" -eq 1 ] && " +
+          "echo '[INLINE_MOUNT] Verify script visible, setting up symlink'; " +
           "rm -rf /root/.provision && " +
           "mkdir -p /mnt/9p/root/.provision && " +
           "ln -s /mnt/9p/root/.provision /root/.provision && " +
           "sync && " +
+          "echo '[INLINE_MOUNT] Renaming .tmp helpers to final'; " +
           "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
           "  if [ -f \"$f\" ]; then " +
           "    mv -f \"$f\" \"${f%.tmp}\" && " +
           "    chmod +x \"${f%.tmp}\" && " +
-          "    ls -l \"${f%.tmp}\" && " +
-          "    stat -c %a \"${f%.tmp}\"; " +
+          "    ls -l \"${f%.tmp}\"; " +
           "  fi; " +
           "done && " +
+          "echo '[INLINE_MOUNT] Validating helper executables'; " +
           "h_ok=1; for h in mount verify remount diag reval; do " +
           "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    h_ok=0; " +
           "  fi; " +
           "done && " +
-          "[ $h_ok -eq 1 ] && " +
+          "[ \"$h_ok\" -eq 1 ] && " +
           "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
           "for h in mount verify remount diag reval; do " +
           "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
@@ -1337,36 +1357,41 @@ var WorkerProvisioner = {
         armTimeout(CMD_TIMEOUT_MS + 20000);
         
         var inlineRemountCmd =
+          "set -x; echo '[INLINE_REMOUNT] Starting remount sequence'; " +
           "umount -f /mnt/9p >/dev/null 2>&1; umount /mnt/9p >/dev/null 2>&1; " +
           "mkdir -p /mnt/9p >/dev/null 2>&1; " +
+          "echo '[INLINE_REMOUNT] Attempting 9p remount'; " +
           "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
           "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
-          "i=0; ok=0; while [ $i -lt 20 ]; do " +
+          "echo '[INLINE_REMOUNT] Waiting for verify script visibility'; " +
+          "i=0; ok=0; while [ \"$i\" -lt 20 ]; do " +
           "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ] && [ -s /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
-          "  sleep 0.5; i=$((i+1)); " +
-          "done && [ $ok -eq 1 ] && " +
+          "  sleep 1; i=$((i+1)); " +
+          "done && [ \"$ok\" -eq 1 ] && " +
+          "echo '[INLINE_REMOUNT] Verify script visible, setting up symlink'; " +
           "rm -rf /root/.provision && " +
           "mkdir -p /mnt/9p/root/.provision && " +
           "ln -s /mnt/9p/root/.provision /root/.provision && " +
           "sync && " +
+          "echo '[INLINE_REMOUNT] Renaming .tmp helpers to final'; " +
           "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
           "  if [ -f \"$f\" ]; then " +
           "    mv -f \"$f\" \"${f%.tmp}\" && " +
           "    chmod +x \"${f%.tmp}\" && " +
-          "    ls -l \"${f%.tmp}\" && " +
-          "    stat -c %a \"${f%.tmp}\"; " +
+          "    ls -l \"${f%.tmp}\"; " +
           "  fi; " +
           "done && " +
+          "echo '[INLINE_REMOUNT] Validating helper executables'; " +
           "h_ok=1; for h in mount verify remount diag reval; do " +
           "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    h_ok=0; " +
           "  fi; " +
           "done && " +
-          "[ $h_ok -eq 1 ] && " +
+          "[ \"$h_ok\" -eq 1 ] && " +
           "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
           "for h in mount verify remount diag reval; do " +
           "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
@@ -2026,17 +2051,20 @@ self.onmessage = async function (e) {
       // 3. Minimal atomic execution trigger with atomic rename preflight and chmod validation.
       var tmpFilePath = execFilePath + ".tmp";
       var triggerCmd =
+        "set -x\n" +
         "stty -echo 2>/dev/null\n" +
         "sync\n" +
+        "echo '[TRIGGER] Checking for tmp file'\n" +
         "if [ -f '" + tmpFilePath + "' ]; then\n" +
         "  mv -f '" + tmpFilePath + "' '" + execFilePath + "'\n" +
         "  chmod +x '" + execFilePath + "'\n" +
         "  sync\n" +
         "fi\n" +
+        "echo '[TRIGGER] Checking for exec file'\n" +
         "if [ -f '" + execFilePath + "' ]; then\n" +
         "  ls -l '" + execFilePath + "'\n" +
-        "  stat -c %a '" + execFilePath + "'\n" +
-        "  sh " + execFilePath + "\n" +
+        "  echo '[TRIGGER] Executing provision script'\n" +
+        "  sh '" + execFilePath + "'\n" +
         "else\n" +
         "  echo '<<<PROTO:" + execExecId + ":7:FAIL:provision_file_missing>>>' > /dev/ttyS0\n" +
         "fi\n";
