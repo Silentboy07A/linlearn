@@ -575,7 +575,7 @@ export class ProvisioningController {
     this.isLocked = true;
     this.currentExecutionId++;
     const executionId = this.currentExecutionId;
-    const filePath = `/root/.provision/provision_${executionId}.sh`;
+    const filePath = `/root/.provision/runtime_exec.sh`;
     this.executionStartTimestamp = Date.now();
     this.lastHeartbeatTimestamp = 0;
     this.activeBridgeGeneration = bridgeGeneration;

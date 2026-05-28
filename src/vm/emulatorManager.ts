@@ -1046,14 +1046,31 @@ export class VMController {
       this.provisioning.getState() === "waiting_completion";
 
     if (provisioningActive && (
+      this.provisioningSearchBuffer.includes("> > >") ||
       this.provisioningSearchBuffer.endsWith("\n> ") ||
       this.provisioningSearchBuffer.endsWith("\r\n> ") ||
       this.provisioningSearchBuffer.endsWith("\n>\r") ||
       this.provisioningSearchBuffer.endsWith("> \r")
     )) {
-      Logger.warn("VM", "[PROVISIONING] PS2 continuation prompt detected (shell awaiting more input). Aborting with Ctrl+C...");
+      Logger.warn("VM", "[PROVISIONING] PS2 continuation prompt detected (shell awaiting more input). Aborting with Ctrl+C and running stty sane/reset...");
       Logger.warn("VM", `[PROVISIONING] Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
       void this.sendProgrammaticInput(0, "\x03\n");
+      void this.sendProgrammaticInput(0, "stty sane\nreset\n");
+      
+      const execId = this.provisioning.getExecutionId();
+      if (this.provisioning.getState() === "executing" || this.provisioning.getState() === "waiting_completion") {
+        Logger.info("VM", `[PROVISIONING] Retrying execution trigger for execId=${execId}...`);
+        const activeGen = this.transport.getGenerationManager().getActiveGeneration();
+        const activeGenId = activeGen ? activeGen.id : 0;
+        this.transport.post("PROVISION_EXECUTE", {
+          execId: execId,
+          generation: activeGenId,
+          filePath: `/root/.provision/runtime_exec.sh`,
+          verifiedInode: "unknown",
+          fallbackRequired: false
+        });
+      }
+      this.provisioningSearchBuffer = "";
     }
 
     // ── Boot ready: root prompt detected, start provisioning ──
@@ -1087,17 +1104,12 @@ export class VMController {
       void this.sendProgrammaticInput(0, "stty -echo\n");
 
       Logger.info("VM", "[PROVISIONING] Sending guest filesystem mount stabilization barrier...");
-      const mountCommand = "mkdir -p /mnt/9p 2>/dev/null\n" +
-        "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
-        "  mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
-        "fi\n" +
-        "mkdir -p /mnt/9p/root/.provision 2>/dev/null\n" +
+      const mountCommand = "mkdir -p /mnt/9p\n" +
+        "grep -q host9p /proc/mounts 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+        "mkdir -p /mnt/9p/root/.provision\n" +
         "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
-        "if [ -d /root/.provision ]; then\n" +
-        "  echo '<<<MOUNT_STABILIZED>>>'\n" +
-        "else\n" +
-        "  echo '<<<MOUNT_FAILED>>>'\n" +
-        "fi\n";
+        "sync\n" +
+        "ls -d /root/.provision >/dev/null 2>&1 && echo '<<<MOUNT_STABILIZED>>>' || echo '<<<MOUNT_FAILED>>>'\n";
       void this.sendProgrammaticInput(0, mountCommand);
 
       this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
@@ -1238,7 +1250,7 @@ export class VMController {
     if (this.onSerialOutput && this.onStateChange) {
       this._dispatchReattach(this.onSerialOutput, this.onStateChange);
     }
-    const queryCmd = `\nstty -echo; if [ -f /root/.provision/provision_${execId}.sh ]; then if ps | grep -v grep | grep -q "provision_${execId}.sh"; then echo "<<<PROTO:${execId}:5:HEARTBEAT>>>"; elif [ -f /root/.provision/provision_complete ]; then echo "<<<PROTO:${execId}:6:EXEC_COMPLETE>>>"; else echo "<<<PROTO:${execId}:7:FAIL:recovery_script_terminated>>>"; fi; else echo "<<<PROTO:${execId}:7:FAIL:recovery_script_not_found>>>"; fi\n`;
+    const queryCmd = `\nstty -echo; [ -f /root/.provision/runtime_exec.sh ] && (ps | grep -v grep | grep -q "runtime_exec.sh" && echo "<<<PROTO:${execId}:5:HEARTBEAT>>>" || ([ -f /root/.provision/provision_complete ] && echo "<<<PROTO:${execId}:6:EXEC_COMPLETE>>>" || echo "<<<PROTO:${execId}:7:FAIL:recovery_script_terminated>>>")) || echo "<<<PROTO:${execId}:7:FAIL:recovery_script_not_found>>>"\n`;
     
     // Send the query on serial0
     void this.sendProgrammaticInput(0, queryCmd);

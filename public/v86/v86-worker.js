@@ -707,24 +707,36 @@ var WorkerProvisioner = {
     );
 
     var script = this.assembleScript();
-    log("info", "[WorkerProvisioner] Writing " + script.length + " bytes to " + filePath + ".tmp via create_file()");
-
     var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+    var unframedBytes;
+    if (encoder) {
+      unframedBytes = encoder.encode(script);
+    } else {
+      unframedBytes = new Uint8Array(script.length);
+      for (var i = 0; i < script.length; i++) {
+        unframedBytes[i] = script.charCodeAt(i) & 0xFF;
+      }
+    }
+
+    // Compute SHA-256 hash for guest-side integrity check (unframed payload)
+    var sha256 = await this.computeSHA256(unframedBytes);
+    log("info", "[WorkerProvisioner] Computed SHA-256 for assembly: " + sha256);
+
+    // Frame the payload
+    var framedPayload = "BEGIN_SCRIPT:" + script.length + ":" + sha256 + "\n" + script + "\nEND_SCRIPT\n";
+    log("info", "[WorkerProvisioner] Writing " + framedPayload.length + " bytes of framed payload to " + filePath + ".tmp via create_file()");
+
     var bytes;
     if (encoder) {
-      bytes = encoder.encode(script);
+      bytes = encoder.encode(framedPayload);
     } else {
-      bytes = new Uint8Array(script.length);
-      for (var i = 0; i < script.length; i++) {
-        bytes[i] = script.charCodeAt(i) & 0xFF;
+      bytes = new Uint8Array(framedPayload.length);
+      for (var i = 0; i < framedPayload.length; i++) {
+        bytes[i] = framedPayload.charCodeAt(i) & 0xFF;
       }
     }
 
     await emu.create_file(filePath + ".tmp", bytes);
-    
-    // Compute SHA-256 hash for guest-side integrity check
-    var sha256 = await this.computeSHA256(bytes);
-    log("info", "[WorkerProvisioner] Computed SHA-256 for assembly: " + sha256);
 
     // Worker-side filesystem integrity verification
     this.transitionTo("verifying");
@@ -757,7 +769,7 @@ var WorkerProvisioner = {
     // dispatch via short single-line tty commands ("sh /root/.provision/prov_XXX_N.sh")
     // instead of inline compound shell programs that trigger PS2 continuation deadlocks.
     log("info", "[WorkerProvisioner] Pre-writing FSM helper scripts via create_file()...");
-    await this.prepareHelperScripts(emu, this.execId, filePath + ".tmp", sha256);
+    await this.prepareHelperScripts(emu, this.execId, filePath + ".tmp", sha256, script.length, this.totalExpected);
 
     // Guest namespace synchronization & verification step
     var guestVerification = await this.verifyGuestVisibility(emu, filePath, this.execId);
@@ -815,7 +827,7 @@ var WorkerProvisioner = {
    * Each script is short, self-contained, and emits a single FSM marker to /dev/ttyS0.
    * The tty then only receives: "sh /root/.provision/prov_XXX_N.sh\n" (one short line).
    */
-  prepareHelperScripts: async function(emu, execId, filePath, sha256) {
+  prepareHelperScripts: async function(emu, execId, filePath, sha256, scriptSize, totalChunks) {
     var base = "/root/.provision";
     var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
 
@@ -1007,6 +1019,81 @@ var WorkerProvisioner = {
       "fi\n" +
       "trap - ERR\n";
 
+    // ── Execute script ─────────────────────────────────────────────────────────
+    // Validates the framed payload, extracts the original script, validates size and sha256,
+    // and finally executes it with `sh`.
+    var executeScript =
+      "#!/bin/sh\n" +
+      "set -x\n" +
+      "echo \"[STAGE] execute_verify\" > /dev/ttyS0\n" +
+      "stty -echo > /dev/null 2>&1\n" +
+      "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
+      "\n" +
+      "tmp_file=\"/root/.provision/runtime_exec.sh.tmp\"\n" +
+      "exec_file=\"/root/.provision/runtime_exec.sh\"\n" +
+      "\n" +
+      "echo \"[EXEC_PREFLIGHT] Starting execute preflight checks... Expected size: " + scriptSize + ", chunks: " + totalChunks + "\" > /dev/ttyS0\n" +
+      "\n" +
+      "if [ ! -f \"$tmp_file\" ]; then\n" +
+      "  echo \"[EXEC_PREFLIGHT] Error: Temporary script file $tmp_file not found\" > /dev/ttyS0\n" +
+      "  echo \"<<<PROTO:" + execId + ":7:FAIL:provision_file_missing>>>\" > /dev/ttyS0\n" +
+      "  exit 1\n" +
+      "fi\n" +
+      "\n" +
+      "# Validate header format and contents\n" +
+      "header=$(head -n 1 \"$tmp_file\" 2>/dev/null)\n" +
+      "case \"$header\" in\n" +
+      "  \"BEGIN_SCRIPT:" + scriptSize + ":" + sha256 + "\")\n" +
+      "    echo \"[EXEC_PREFLIGHT] Header validation passed\" > /dev/ttyS0\n" +
+      "    ;;\n" +
+      "  *)\n" +
+      "    echo \"[EXEC_PREFLIGHT] Error: Header mismatch. Got '$header', expected 'BEGIN_SCRIPT:" + scriptSize + ":" + sha256 + "'\" > /dev/ttyS0\n" +
+      "    echo \"<<<PROTO:" + execId + ":7:FAIL:header_invalid>>>\" > /dev/ttyS0\n" +
+      "    exit 1\n" +
+      "    ;;\n" +
+      "esac\n" +
+      "\n" +
+      "# Validate footer format and contents\n" +
+      "footer=$(tail -n 1 \"$tmp_file\" 2>/dev/null)\n" +
+      "case \"$footer\" in\n" +
+      "  \"END_SCRIPT\")\n" +
+      "    echo \"[EXEC_PREFLIGHT] Footer validation passed\" > /dev/ttyS0\n" +
+      "    ;;\n" +
+      "  *)\n" +
+      "    echo \"[EXEC_PREFLIGHT] Error: Footer mismatch. Got '$footer', expected 'END_SCRIPT'\" > /dev/ttyS0\n" +
+      "    echo \"<<<PROTO:" + execId + ":7:FAIL:footer_invalid>>>\" > /dev/ttyS0\n" +
+      "    exit 1\n" +
+      "    ;;\n" +
+      "esac\n" +
+      "\n" +
+      "# Strip header and footer to generate final executable script\n" +
+      "sed '1d;$d' \"$tmp_file\" > \"$exec_file\"\n" +
+      "\n" +
+      "# Validate size of unframed script\n" +
+      "actual_size=$(wc -c < \"$exec_file\" 2>/dev/null)\n" +
+      "if [ \"$actual_size\" -ne " + scriptSize + " ]; then\n" +
+      "  echo \"[EXEC_PREFLIGHT] Error: Size mismatch. Got $actual_size, expected " + scriptSize + "\" > /dev/ttyS0\n" +
+      "  echo \"<<<PROTO:" + execId + ":7:FAIL:size_mismatch>>>\" > /dev/ttyS0\n" +
+      "  exit 1\n" +
+      "fi\n" +
+      "\n" +
+      "# Validate SHA256 checksum if sha256sum command exists on guest\n" +
+      "actual_sha=$(sha256sum \"$exec_file\" 2>/dev/null | awk '{print $1}')\n" +
+      "if [ -n \"$actual_sha\" ]; then\n" +
+      "  if [ \"$actual_sha\" != \"" + sha256 + "\" ]; then\n" +
+      "    echo \"[EXEC_PREFLIGHT] Error: SHA256 checksum mismatch. Got '$actual_sha', expected '" + sha256 + "'\" > /dev/ttyS0\n" +
+      "    echo \"<<<PROTO:" + execId + ":7:FAIL:sha256_mismatch>>>\" > /dev/ttyS0\n" +
+      "    exit 1\n" +
+      "  fi\n" +
+      "fi\n" +
+      "\n" +
+      "echo \"[EXEC_PREFLIGHT] Preflight checks passed. Launching script execution...\" > /dev/ttyS0\n" +
+      "chmod +x \"$exec_file\"\n" +
+      "sync\n" +
+      "trap - ERR\n" +
+      "\n" +
+      "sh \"$exec_file\"\n";
+
     // Write all helper scripts via create_file() as .tmp files
     try {
       await emu.create_file(base + "/prov_mount_" + execId + ".sh.tmp", encode(mountScript));
@@ -1019,6 +1106,8 @@ var WorkerProvisioner = {
       log("info", "[WorkerProvisioner] Helper: prov_diag_" + execId + ".sh.tmp written (" + diagScript.length + " bytes)");
       await emu.create_file(base + "/prov_reval_" + execId + ".sh.tmp", encode(revalScript));
       log("info", "[WorkerProvisioner] Helper: prov_reval_" + execId + ".sh.tmp written (" + revalScript.length + " bytes)");
+      await emu.create_file(base + "/prov_execute_" + execId + ".sh.tmp", encode(executeScript));
+      log("info", "[WorkerProvisioner] Helper: prov_execute_" + execId + ".sh.tmp written (" + executeScript.length + " bytes)");
       log("info", "[WorkerProvisioner] All FSM helper scripts written as .tmp. TTY will only receive short dispatch commands.");
     } catch (e) {
       log("error", "[WorkerProvisioner] Failed to write helper scripts: " + String(e));
@@ -1306,14 +1395,14 @@ var WorkerProvisioner = {
           "  fi; " +
           "done && " +
           "echo '[INLINE_MOUNT] Validating helper executables'; " +
-          "h_ok=1; for h in mount verify remount diag reval; do " +
+          "h_ok=1; for h in mount verify remount diag reval execute; do " +
           "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    h_ok=0; " +
           "  fi; " +
           "done && " +
           "[ \"$h_ok\" -eq 1 ] && " +
           "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
-          "for h in mount verify remount diag reval; do " +
+          "for h in mount verify remount diag reval execute; do " +
           "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    case \"$h\" in " +
           "      mount) name=\"MOUNTING\" ;; " +
@@ -1321,6 +1410,7 @@ var WorkerProvisioner = {
           "      remount) name=\"REMOUNT\" ;; " +
           "      diag) name=\"DIAGNOSTICS\" ;; " +
           "      reval) name=\"REVALIDATION\" ;; " +
+          "      execute) name=\"EXECUTION\" ;; " +
           "    esac; " +
           "    echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
           "  fi; " +
@@ -1388,14 +1478,14 @@ var WorkerProvisioner = {
           "  fi; " +
           "done && " +
           "echo '[INLINE_REMOUNT] Validating helper executables'; " +
-          "h_ok=1; for h in mount verify remount diag reval; do " +
+          "h_ok=1; for h in mount verify remount diag reval execute; do " +
           "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    h_ok=0; " +
           "  fi; " +
           "done && " +
           "[ \"$h_ok\" -eq 1 ] && " +
           "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
-          "for h in mount verify remount diag reval; do " +
+          "for h in mount verify remount diag reval execute; do " +
           "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    case \"$h\" in " +
           "      mount) name=\"MOUNTING\" ;; " +
@@ -1403,6 +1493,7 @@ var WorkerProvisioner = {
           "      remount) name=\"REMOUNT\" ;; " +
           "      diag) name=\"DIAGNOSTICS\" ;; " +
           "      reval) name=\"REVALIDATION\" ;; " +
+          "      execute) name=\"EXECUTION\" ;; " +
           "    esac; " +
           "    echo \"<<<HELPER_REGISTERED:$name>>>\" > /dev/ttyS0; " +
           "  fi; " +
@@ -2050,26 +2141,7 @@ self.onmessage = async function (e) {
       WorkerProvisioner.transitionTo("executing");
       log("info", "[WorkerProvisioner] Executing via direct file path: " + execFilePath);
 
-      // 3. Minimal atomic execution trigger with atomic rename preflight and chmod validation.
-      var tmpFilePath = execFilePath + ".tmp";
-      var triggerCmd =
-        "set -x\n" +
-        "stty -echo 2>/dev/null\n" +
-        "sync\n" +
-        "echo '[TRIGGER] Checking for tmp file'\n" +
-        "if [ -f '" + tmpFilePath + "' ]; then\n" +
-        "  mv -f '" + tmpFilePath + "' '" + execFilePath + "'\n" +
-        "  chmod +x '" + execFilePath + "'\n" +
-        "  sync\n" +
-        "fi\n" +
-        "echo '[TRIGGER] Checking for exec file'\n" +
-        "if [ -f '" + execFilePath + "' ]; then\n" +
-        "  ls -l '" + execFilePath + "'\n" +
-        "  echo '[TRIGGER] Executing provision script'\n" +
-        "  sh '" + execFilePath + "'\n" +
-        "else\n" +
-        "  echo '<<<PROTO:" + execExecId + ":7:FAIL:provision_file_missing>>>' > /dev/ttyS0\n" +
-        "fi\n";
+      var triggerCmd = "sh /root/.provision/prov_execute_" + execExecId + ".sh\n";
 
       var sent = SerialChannelManager.send(0, triggerCmd);
       if (sent) {
