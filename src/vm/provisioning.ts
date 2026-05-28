@@ -378,6 +378,7 @@ export class ProvisioningController {
   private checkpoint = 0;
   private currentExecutionId = 0;
   private executionStartTimestamp = 0;
+  private execStartTimestamp = 0;
   private lastHeartbeatTimestamp = 0;
   private activeBridgeGeneration = 0;
   private completionParser = new ProvisioningCompletionParser();
@@ -512,7 +513,8 @@ export class ProvisioningController {
 
   public handleExecStart(execId: number): void {
     if (execId !== this.currentExecutionId) return;
-    Logger.info("VM", `[PROVISIONING] Script execution started for execId=${execId}`);
+    this.execStartTimestamp = Date.now();
+    Logger.info("VM", `[EXEC] Script execution started for execId=${execId}`);
     this._cancelExecStartTimer();
     this._startHeartbeatTimer(execId);
     this._startExecCompleteTimer(execId);
@@ -549,6 +551,7 @@ export class ProvisioningController {
       checkpoint: this.checkpoint,
       executionId: this.currentExecutionId,
       executionStartTimestamp: this.executionStartTimestamp,
+      execStartTimestamp: this.execStartTimestamp,
       lastHeartbeatTimestamp: this.lastHeartbeatTimestamp,
       activeBridgeGeneration: this.activeBridgeGeneration,
       pendingChunkIndex: this.pendingChunkIndex,
@@ -556,6 +559,7 @@ export class ProvisioningController {
       totalChunks: this.chunksToSend.length,
       parserBufferLength: (this.completionParser as unknown as { buffer: string }).buffer.length,
       elapsedMs: this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0,
+      execElapsedMs: this.execStartTimestamp ? Date.now() - this.execStartTimestamp : 0,
       heartbeatAgeMs: this.lastHeartbeatTimestamp ? Date.now() - this.lastHeartbeatTimestamp : 0,
     };
   }
@@ -577,6 +581,7 @@ export class ProvisioningController {
     const executionId = this.currentExecutionId;
     const filePath = `/root/.provision/runtime_exec.sh`;
     this.executionStartTimestamp = Date.now();
+    this.execStartTimestamp = 0;
     this.lastHeartbeatTimestamp = 0;
     this.activeBridgeGeneration = bridgeGeneration;
     this.completionParser.reset();
@@ -953,7 +958,8 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     }
     this._cancelAllTimers();
     const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
-    Logger.info("VM", `[PROVISIONING] Complete! execId=${id}, bridgeGen=${bridgeGeneration}, elapsed=${elapsed}ms`);
+    const execLatency = this.execStartTimestamp ? Date.now() - this.execStartTimestamp : 0;
+    Logger.info("VM", `[EXEC] Script execution complete. execId=${id}, bridgeGen=${bridgeGeneration}, elapsed=${elapsed}ms, execLatency=${execLatency}ms`);
     this.checkpoint = 2;
     this.isLocked = false;
     this.transitionTransportTo("completed");
@@ -971,7 +977,8 @@ exec sh -c 'while true; do chown user /dev/ttyS0; su - user; done' < /dev/ttyS0 
     }
     this._cancelAllTimers();
     const elapsed = this.executionStartTimestamp ? Date.now() - this.executionStartTimestamp : 0;
-    Logger.error("VM", `[PROVISIONING] Script exited without completion marker! execId=${id}, elapsed=${elapsed}ms`);
+    const execLatency = this.execStartTimestamp ? Date.now() - this.execStartTimestamp : 0;
+    Logger.error("VM", `[EXEC] Script execution failed/exited without completion marker. execId=${id}, elapsed=${elapsed}ms, execLatency=${execLatency}ms`);
     this.isLocked = false;
     this.transitionTransportTo("failed");
     this.transitionTo("failed");

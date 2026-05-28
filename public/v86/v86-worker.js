@@ -736,7 +736,16 @@ var WorkerProvisioner = {
       }
     }
 
+    var hostWriteStart = Date.now();
     await emu.create_file(filePath + ".tmp", bytes);
+
+    // explicitly fsync/sync host layer
+    if (fs.sync) {
+      await fs.sync();
+    }
+    log("info", "[SYNC] Host layer sync completed");
+    var hostWriteLatency = Date.now() - hostWriteStart;
+    log("info", "[VISIBILITY] Host write latency: " + hostWriteLatency + "ms");
 
     // Worker-side filesystem integrity verification
     this.transitionTo("verifying");
@@ -759,6 +768,17 @@ var WorkerProvisioner = {
 
     log("info", "[WorkerProvisioner] WorkerFS write verified. Size: " + bytes.length + " bytes. Latency: " + (Date.now() - startTime) + "ms");
 
+    // Emit FILE_READY event
+    var creationTimestamp = Date.now();
+    postToHost("FILE_READY", {
+      filePath: filePath + ".tmp",
+      inodeId: search.id,
+      byteSize: inode.size,
+      checksum: sha256,
+      creationTimestamp: creationTimestamp
+    });
+    log("info", "[VISIBILITY] FILE_READY emitted: path=" + filePath + ".tmp, inode=" + search.id + ", size=" + inode.size + ", sha=" + sha256 + ", ts=" + creationTimestamp);
+
     // FS propagation delay: give virtio-9p driver time to sync the inode
     // to the guest namespace before the visibility probe runs.
     log("info", "[WorkerProvisioner] Waiting 500ms for 9p FS propagation to guest namespace...");
@@ -774,7 +794,6 @@ var WorkerProvisioner = {
     // Guest namespace synchronization & verification step
     var guestVerification = await this.verifyGuestVisibility(emu, filePath, this.execId);
 
-    
     this.transitionTo("executable");
     var writeLatency = Date.now() - startTime;
     log("info", "[WorkerProvisioner DIAGNOSTICS] WorkerFS File exists: true | GuestFS File exists: " + guestVerification.visible + " | Latency: " + writeLatency + "ms");
@@ -864,10 +883,11 @@ var WorkerProvisioner = {
       "# Mount if not already mounted\n" +
       "mkdir -p /mnt/9p /root/.provision > /dev/null 2>&1\n" +
       "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
-      "  mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null ||\n" +
-      "  mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null ||\n" +
-      "  mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+      "  mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null\n" +
       "fi\n" +
+      "sync\n" +
       "# Symlink setup\n" +
       "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
       "sync\n" +
@@ -889,32 +909,69 @@ var WorkerProvisioner = {
       "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
+      "\n" +
+      "visibility_barrier() {\n" +
+      "  sync\n" +
+      "  sleep 1\n" +
+      "  ls \"$1\" >/dev/null 2>&1\n" +
+      "}\n" +
+      "\n" +
+      "expected_path=\"" + fp + "\"\n" +
+      "expected_size=" + scriptSize + "\n" +
+      "expected_sha=\"" + sha256 + "\"\n" +
+      "\n" +
+      "# Symlink drift check\n" +
+      "prov_link=$(readlink -f /root/.provision 2>/dev/null)\n" +
+      "if [ \"$prov_link\" != \"/mnt/9p/root/.provision\" ]; then\n" +
+      "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '/mnt/9p/root/.provision'\" > /dev/ttyS0\n" +
+      "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "  sync\n" +
+      "fi\n" +
+      "\n" +
       "i=0; ok=0; inode=; size=;\n" +
       "while [ \"$i\" -lt 10 ]; do\n" +
-      "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
-      "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
-      "    size=$(wc -c < '" + fp + "' 2>/dev/null)\n" +
-      "    if [ -n \"$inode\" ] && [ -n \"$size\" ] && [ \"$size\" -gt 0 ]; then\n" +
-      "      ok=1; break;\n" +
+      "  echo \"[FSM] [MOUNT] MOUNT_VISIBLE\" > /dev/ttyS0\n" +
+      "  # 1. verify parent directory first\n" +
+      "  if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
+      "    echo \"[FSM] [VISIBILITY] DIRECTORY_VISIBLE\" > /dev/ttyS0\n" +
+      "    visibility_barrier \"$expected_path\"\n" +
+      "    # 2. verify inode existence second\n" +
+      "    if [ -f \"$expected_path\" ] && stat \"$expected_path\" >/dev/null 2>&1; then\n" +
+      "      echo \"[FSM] [VISIBILITY] FILE_VISIBLE\" > /dev/ttyS0\n" +
+      "      inode=$(ls -i \"$expected_path\" 2>/dev/null | awk '{print $1}')\n" +
+      "      if [ -n \"$inode\" ]; then\n" +
+      "        echo \"[FSM] [INODE] Inode existence verified: $inode\" > /dev/ttyS0\n" +
+      "        # 3. verify file size third\n" +
+      "        size=$(wc -c < \"$expected_path\" 2>/dev/null)\n" +
+      "        if [ \"$size\" -eq \"$expected_size\" ]; then\n" +
+      "          echo \"[FSM] [VISIBILITY] File size verified: $size bytes\" > /dev/ttyS0\n" +
+      "          # 4. verify checksum fourth\n" +
+      "          actual_sha=$(sha256sum \"$expected_path\" 2>/dev/null | awk '{print $1}')\n" +
+      "          if [ -z \"$actual_sha\" ] || [ \"$actual_sha\" = \"$expected_sha\" ]; then\n" +
+      "            echo \"[FSM] [CHECKSUM] CHECKSUM_VALID\" > /dev/ttyS0\n" +
+      "            echo \"[FSM] [EXEC] EXEC_READY\" > /dev/ttyS0\n" +
+      "            ok=1; break;\n" +
+      "          else\n" +
+      "            echo \"[FSM] [CHECKSUM] Checksum mismatch: expected $expected_sha, got $actual_sha\" > /dev/ttyS0\n" +
+      "          fi\n" +
+      "        else\n" +
+      "          echo \"[FSM] [VISIBILITY] Size mismatch: expected $expected_size, got $size\" > /dev/ttyS0\n" +
+      "        fi\n" +
+      "      fi\n" +
       "    fi\n" +
+      "  else\n" +
+      "    echo \"[FSM] [MOUNT] MOUNT_DISAPPEARED\" > /dev/ttyS0\n" +
       "  fi\n" +
-      "  sleep 1\n" +
+      "  # Exponential backoff\n" +
+      "  sleep_time=$((1 << i))\n" +
+      "  if [ \"$sleep_time\" -gt 8 ]; then sleep_time=8; fi\n" +
+      "  echo \"[SYNC] Propagation delay. Sleeping $sleep_time s...\" > /dev/ttyS0\n" +
+      "  sleep \"$sleep_time\"\n" +
       "  i=$((i + 1))\n" +
       "done\n" +
-      "echo '[VERIFY:STAT]' > /dev/ttyS0; stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
-      "echo '[VERIFY:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
-      "echo '[VERIFY:MODE]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
+      "\n" +
       "if [ \"$ok\" -eq 1 ]; then\n" +
-      "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
-      "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
-      "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
-      "  elif [ -z \"$actual_sha\" ]; then\n" +
-      "    # Fallback if sha256sum not available on guest\n" +
-      "    echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
-      "  else\n" +
-      "    echo '[VERIFY:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
-      "    echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
-      "  fi\n" +
+      "  echo '" + makeTag("VERIFYING", "VIS") + "':\"$inode\" > /dev/ttyS0\n" +
       "else\n" +
       "  echo '" + makeTag("VERIFYING", "NOVIS") + "' > /dev/ttyS0\n" +
       "fi\n" +
@@ -929,9 +986,9 @@ var WorkerProvisioner = {
       "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "umount -f /mnt/9p > /dev/null 2>&1; umount /mnt/9p > /dev/null 2>&1\n" +
       "mkdir -p /mnt/9p > /dev/null 2>&1\n" +
-      "if mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null ||\n" +
-      "   mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null ||\n" +
-      "   mount -t 9p host9p /mnt/9p 2>/dev/null; then\n" +
+      "if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "   mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "   mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null; then\n" +
       "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
       "  sync\n" +
       "  if [ -d /root/.provision ]; then\n" +
@@ -977,45 +1034,53 @@ var WorkerProvisioner = {
       "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
-      "echo '[EXEC_DIAG:PWD]' > /dev/ttyS0; pwd > /dev/ttyS0\n" +
-      "echo '[EXEC_DIAG:MOUNTS]' > /dev/ttyS0\n" +
-      "cat /proc/mounts > /dev/ttyS0 2>/dev/null || echo none > /dev/ttyS0\n" +
-      "echo '[EXEC_DIAG:LSPROVISION]' > /dev/ttyS0\n" +
-      "ls -la /root/.provision > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
-      "echo '[EXEC_DIAG:STAT]' > /dev/ttyS0\n" +
-      "stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
-      "echo '[EXEC_DIAG:MODE]' > /dev/ttyS0\n" +
-      "ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
-      "echo '[EXEC_DIAG:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
-      "if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
-      "  actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
-      "  if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
-      "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
-      "    echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
-      "  elif [ -z \"$actual_sha\" ]; then\n" +
-      "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
-      "    echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
-      "  else\n" +
-      "    echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
-      "    echo '" + failMarker + "' > /dev/ttyS0\n" +
-      "  fi\n" +
-      "else\n" +
+      "\n" +
+      "visibility_barrier() {\n" +
+      "  sync\n" +
       "  sleep 1\n" +
+      "  ls \"$1\" >/dev/null 2>&1\n" +
+      "}\n" +
+      "\n" +
+      "# Symlink drift check\n" +
+      "prov_link=$(readlink -f /root/.provision 2>/dev/null)\n" +
+      "if [ \"$prov_link\" != \"/mnt/9p/root/.provision\" ]; then\n" +
+      "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '/mnt/9p/root/.provision'\" > /dev/ttyS0\n" +
+      "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "  sync\n" +
+      "fi\n" +
+      "\n" +
+      "visibility_barrier \"" + fp + "\"\n" +
+      "# 1. verify parent directory first\n" +
+      "if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
+      "  # 2. verify inode existence second\n" +
       "  if [ -f '" + fp + "' ] && stat '" + fp + "' > /dev/null 2>&1; then\n" +
-      "    actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
-      "    if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
-      "      inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
-      "      echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
-      "    elif [ -z \"$actual_sha\" ]; then\n" +
-      "      inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}' || echo unknown)\n" +
-      "      echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "    inode=$(ls -i '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
+      "    if [ -n \"$inode\" ]; then\n" +
+      "      # 3. verify file size third\n" +
+      "      size=$(wc -c < \"" + fp + "\" 2>/dev/null)\n" +
+      "      if [ \"$size\" -eq " + scriptSize + " ]; then\n" +
+      "        # 4. verify checksum fourth\n" +
+      "        actual_sha=$(sha256sum '" + fp + "' 2>/dev/null | awk '{print $1}')\n" +
+      "        if [ -n \"$actual_sha\" ] && [ \"$actual_sha\" = \"" + sha256 + "\" ]; then\n" +
+      "          echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "        elif [ -z \"$actual_sha\" ]; then\n" +
+      "          echo '" + okMarkerPrefix + "':\"$inode\" > /dev/ttyS0\n" +
+      "        else\n" +
+      "          echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
+      "          echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "        fi\n" +
+      "      else\n" +
+      "        echo '[EXEC_DIAG:SIZE_MISMATCH] expected=" + scriptSize + " got='$size > /dev/ttyS0\n" +
+      "        echo '" + failMarker + "' > /dev/ttyS0\n" +
+      "      fi\n" +
       "    else\n" +
-      "      echo '[EXEC_DIAG:HASH_MISMATCH] expected=" + sha256 + " got='$actual_sha > /dev/ttyS0\n" +
       "      echo '" + failMarker + "' > /dev/ttyS0\n" +
       "    fi\n" +
       "  else\n" +
       "    echo '" + failMarker + "' > /dev/ttyS0\n" +
       "  fi\n" +
+      "else\n" +
+      "  echo '" + failMarker + "' > /dev/ttyS0\n" +
       "fi\n" +
       "trap - ERR\n";
 
@@ -1029,70 +1094,100 @@ var WorkerProvisioner = {
       "stty -echo > /dev/null 2>&1\n" +
       "trap 'echo \"[PROVISION_ERROR] line=$LINENO exit=$?\" > /dev/ttyS0' ERR\n" +
       "\n" +
+      "visibility_barrier() {\n" +
+      "  sync\n" +
+      "  sleep 1\n" +
+      "  ls \"$1\" >/dev/null 2>&1\n" +
+      "}\n" +
+      "\n" +
+      "# Symlink drift check\n" +
+      "prov_link=$(readlink -f /root/.provision 2>/dev/null)\n" +
+      "if [ \"$prov_link\" != \"/mnt/9p/root/.provision\" ]; then\n" +
+      "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '/mnt/9p/root/.provision'\" > /dev/ttyS0\n" +
+      "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "  sync\n" +
+      "fi\n" +
+      "\n" +
       "tmp_file=\"/root/.provision/runtime_exec.sh.tmp\"\n" +
       "exec_file=\"/root/.provision/runtime_exec.sh\"\n" +
       "\n" +
       "echo \"[EXEC_PREFLIGHT] Starting execute preflight checks... Expected size: " + scriptSize + ", chunks: " + totalChunks + "\" > /dev/ttyS0\n" +
       "\n" +
-      "if [ ! -f \"$tmp_file\" ]; then\n" +
-      "  echo \"[EXEC_PREFLIGHT] Error: Temporary script file $tmp_file not found\" > /dev/ttyS0\n" +
-      "  echo \"<<<PROTO:" + execId + ":7:FAIL:provision_file_missing>>>\" > /dev/ttyS0\n" +
-      "  exit 1\n" +
-      "fi\n" +
-      "\n" +
-      "# Validate header format and contents\n" +
-      "header=$(head -n 1 \"$tmp_file\" 2>/dev/null)\n" +
-      "case \"$header\" in\n" +
-      "  \"BEGIN_SCRIPT:" + scriptSize + ":" + sha256 + "\")\n" +
-      "    echo \"[EXEC_PREFLIGHT] Header validation passed\" > /dev/ttyS0\n" +
-      "    ;;\n" +
-      "  *)\n" +
-      "    echo \"[EXEC_PREFLIGHT] Error: Header mismatch. Got '$header', expected 'BEGIN_SCRIPT:" + scriptSize + ":" + sha256 + "'\" > /dev/ttyS0\n" +
-      "    echo \"<<<PROTO:" + execId + ":7:FAIL:header_invalid>>>\" > /dev/ttyS0\n" +
-      "    exit 1\n" +
-      "    ;;\n" +
-      "esac\n" +
-      "\n" +
-      "# Validate footer format and contents\n" +
-      "footer=$(tail -n 1 \"$tmp_file\" 2>/dev/null)\n" +
-      "case \"$footer\" in\n" +
-      "  \"END_SCRIPT\")\n" +
-      "    echo \"[EXEC_PREFLIGHT] Footer validation passed\" > /dev/ttyS0\n" +
-      "    ;;\n" +
-      "  *)\n" +
-      "    echo \"[EXEC_PREFLIGHT] Error: Footer mismatch. Got '$footer', expected 'END_SCRIPT'\" > /dev/ttyS0\n" +
-      "    echo \"<<<PROTO:" + execId + ":7:FAIL:footer_invalid>>>\" > /dev/ttyS0\n" +
-      "    exit 1\n" +
-      "    ;;\n" +
-      "esac\n" +
-      "\n" +
-      "# Strip header and footer to generate final executable script\n" +
-      "sed '1d;$d' \"$tmp_file\" > \"$exec_file\"\n" +
-      "\n" +
-      "# Validate size of unframed script\n" +
-      "actual_size=$(wc -c < \"$exec_file\" 2>/dev/null)\n" +
-      "if [ \"$actual_size\" -ne " + scriptSize + " ]; then\n" +
-      "  echo \"[EXEC_PREFLIGHT] Error: Size mismatch. Got $actual_size, expected " + scriptSize + "\" > /dev/ttyS0\n" +
-      "  echo \"<<<PROTO:" + execId + ":7:FAIL:size_mismatch>>>\" > /dev/ttyS0\n" +
-      "  exit 1\n" +
-      "fi\n" +
-      "\n" +
-      "# Validate SHA256 checksum if sha256sum command exists on guest\n" +
-      "actual_sha=$(sha256sum \"$exec_file\" 2>/dev/null | awk '{print $1}')\n" +
-      "if [ -n \"$actual_sha\" ]; then\n" +
-      "  if [ \"$actual_sha\" != \"" + sha256 + "\" ]; then\n" +
-      "    echo \"[EXEC_PREFLIGHT] Error: SHA256 checksum mismatch. Got '$actual_sha', expected '" + sha256 + "'\" > /dev/ttyS0\n" +
-      "    echo \"<<<PROTO:" + execId + ":7:FAIL:sha256_mismatch>>>\" > /dev/ttyS0\n" +
+      "visibility_barrier \"$tmp_file\"\n" +
+      "# 1. verify parent directory first\n" +
+      "if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
+      "  # 2. verify inode existence second\n" +
+      "  if [ ! -f \"$tmp_file\" ]; then\n" +
+      "    echo \"[EXEC_PREFLIGHT] Error: Temporary script file $tmp_file not found\" > /dev/ttyS0\n" +
+      "    echo \"<<<PROTO:" + execId + ":7:FAIL:provision_file_missing>>>\" > /dev/ttyS0\n" +
       "    exit 1\n" +
       "  fi\n" +
-      "fi\n" +
       "\n" +
-      "echo \"[EXEC_PREFLIGHT] Preflight checks passed. Launching script execution...\" > /dev/ttyS0\n" +
-      "chmod +x \"$exec_file\"\n" +
-      "sync\n" +
-      "trap - ERR\n" +
+      "  # Validate header format and contents\n" +
+      "  header=$(head -n 1 \"$tmp_file\" 2>/dev/null)\n" +
+      "  case \"$header\" in\n" +
+      "    \"BEGIN_SCRIPT:" + scriptSize + ":" + sha256 + "\")\n" +
+      "      echo \"[EXEC_PREFLIGHT] Header validation passed\" > /dev/ttyS0\n" +
+      "      ;;\n" +
+      "    *)\n" +
+      "      echo \"[EXEC_PREFLIGHT] Error: Header mismatch. Got '$header', expected 'BEGIN_SCRIPT:" + scriptSize + ":" + sha256 + "'\" > /dev/ttyS0\n" +
+      "      echo \"<<<PROTO:" + execId + ":7:FAIL:header_invalid>>>\" > /dev/ttyS0\n" +
+      "      exit 1\n" +
+      "      ;;\n" +
+      "  esac\n" +
       "\n" +
-      "sh \"$exec_file\"\n";
+      "  # Validate footer format and contents\n" +
+      "  footer=$(tail -n 1 \"$tmp_file\" 2>/dev/null)\n" +
+      "  case \"$footer\" in\n" +
+      "    \"END_SCRIPT\")\n" +
+      "      echo \"[EXEC_PREFLIGHT] Footer validation passed\" > /dev/ttyS0\n" +
+      "      ;;\n" +
+      "    *)\n" +
+      "      echo \"[EXEC_PREFLIGHT] Error: Footer mismatch. Got '$footer', expected 'END_SCRIPT'\" > /dev/ttyS0\n" +
+      "      echo \"<<<PROTO:" + execId + ":7:FAIL:footer_invalid>>>\" > /dev/ttyS0\n" +
+      "      exit 1\n" +
+      "      ;;\n" +
+      "  esac\n" +
+      "\n" +
+      "  # Strip header and footer to generate final executable script atomically\n" +
+      "  sed '1d;$d' \"$tmp_file\" > \"$exec_file.tmp\"\n" +
+      "  (fsync \"$exec_file.tmp\" || sync)\n" +
+      "  mv -f \"$exec_file.tmp\" \"$exec_file\"\n" +
+      "  sync\n" +
+      "  if [ ! -f \"$exec_file\" ]; then\n" +
+      "    echo \"[EXEC_PREFLIGHT] Error: Final executable $exec_file not visible after rename\" > /dev/ttyS0\n" +
+      "    echo \"<<<PROTO:" + execId + ":7:FAIL:rename_not_visible>>>\" > /dev/ttyS0\n" +
+      "    exit 1\n" +
+      "  fi\n" +
+      "\n" +
+      "  # 3. verify file size third\n" +
+      "  actual_size=$(wc -c < \"$exec_file\" 2>/dev/null)\n" +
+      "  if [ \"$actual_size\" -ne " + scriptSize + " ]; then\n" +
+      "    echo \"[EXEC_PREFLIGHT] Error: Size mismatch. Got $actual_size, expected " + scriptSize + "\" > /dev/ttyS0\n" +
+      "    echo \"<<<PROTO:" + execId + ":7:FAIL:size_mismatch>>>\" > /dev/ttyS0\n" +
+      "    exit 1\n" +
+      "  fi\n" +
+      "\n" +
+      "  # 4. verify checksum fourth\n" +
+      "  actual_sha=$(sha256sum \"$exec_file\" 2>/dev/null | awk '{print $1}')\n" +
+      "  if [ -n \"$actual_sha\" ]; then\n" +
+      "    if [ \"$actual_sha\" != \"" + sha256 + "\" ]; then\n" +
+      "      echo \"[EXEC_PREFLIGHT] Error: SHA256 checksum mismatch. Got '$actual_sha', expected '" + sha256 + "'\" > /dev/ttyS0\n" +
+      "      echo \"<<<PROTO:" + execId + ":7:FAIL:sha256_mismatch>>>\" > /dev/ttyS0\n" +
+      "      exit 1\n" +
+      "    fi\n" +
+      "  fi\n" +
+      "\n" +
+      "  echo \"[EXEC_PREFLIGHT] Preflight checks passed. Launching script execution...\" > /dev/ttyS0\n" +
+      "  chmod +x \"$exec_file\"\n" +
+      "  sync\n" +
+      "  trap - ERR\n" +
+      "\n" +
+      "  sh \"$exec_file\"\n" +
+      "else\n" +
+      "  echo \"[EXEC_PREFLIGHT] Error: Parent directory not visible\" > /dev/ttyS0\n" +
+      "  echo \"<<<PROTO:" + execId + ":7:FAIL:parent_dir_missing>>>\" > /dev/ttyS0\n" +
+      "fi\n";
 
     // Write all helper scripts via create_file() as .tmp files
     try {
@@ -1134,6 +1229,9 @@ var WorkerProvisioner = {
     var startTime = Date.now();
     var verifyAttempt = 0;
     var mountStartTime = 0;
+    var verificationStart = 0;
+    var fileVisibleTime = 0;
+    var checksumValidTime = 0;
     var finished = false;
     var rawBuffer = "";
     var parserState = "idle";
@@ -1151,6 +1249,7 @@ var WorkerProvisioner = {
     // Advanced mount telemetry
     var mountLatencyMs = -1;
     var visibilityLatencyMs = -1;
+    var checksumValidationLatencyMs = -1;
     var virtioReadiness = false;
     var readdirSuccess = false;
     var inodeReadiness = false;
@@ -1159,7 +1258,7 @@ var WorkerProvisioner = {
     // Helper script base path
     var base = "/root/.provision";
 
-    log("info", "[MountVisibilityFSM] Starting for path: " + filePath + " execId=" + execId);
+    log("info", "[FSM] [MOUNT] Starting verification for path: " + filePath + " execId=" + execId);
 
     return new Promise(function(resolve) {
       function done(visible, inode) {
@@ -1170,7 +1269,7 @@ var WorkerProvisioner = {
         var elapsed = Date.now() - startTime;
         if (visible) {
           propagationLatencyMs = elapsed;
-          visibilityLatencyMs = elapsed;
+          visibilityLatencyMs = fileVisibleTime > 0 ? (fileVisibleTime - verificationStart) : elapsed;
         }
         guestVisibilityTimingMs = elapsed;
 
@@ -1179,12 +1278,13 @@ var WorkerProvisioner = {
           inodeReadiness = true;
         }
 
-        log("info", "[MountVisibilityFSM TELEMETRY] Resolved visible=" + visible + 
+        log("info", "[FSM] [EXEC] Verification complete. resolved visible=" + visible + 
                    " | inode=" + resolvedInode +
                    " | mountSuccess=" + mountSuccess +
                    " | mountSettled=" + mountSettled +
                    " | mountLatency=" + mountLatencyMs + "ms" +
                    " | visibilityLatency=" + visibilityLatencyMs + "ms" +
+                   " | checksumValidationLatency=" + checksumValidationLatencyMs + "ms" +
                    " | virtioReadiness=" + virtioReadiness +
                    " | readdirSuccess=" + readdirSuccess +
                    " | inodeReadiness=" + inodeReadiness +
@@ -1206,6 +1306,7 @@ var WorkerProvisioner = {
             remountAttempts: remountAttemptsCount,
             mountLatencyMs: mountLatencyMs,
             visibilityLatencyMs: visibilityLatencyMs,
+            checksumValidationLatencyMs: checksumValidationLatencyMs,
             virtioReadiness: virtioReadiness,
             readdirSuccess: readdirSuccess,
             inodeReadiness: inodeReadiness
@@ -1216,7 +1317,7 @@ var WorkerProvisioner = {
       function armTimeout(ms) {
         if (cmdTimeout) clearTimeout(cmdTimeout);
         cmdTimeout = setTimeout(function() {
-          log("warn", "[MountVisibilityFSM] Command timeout after " + ms + "ms in state " + fsmState +
+          log("warn", "[FSM] Command timeout after " + ms + "ms in state " + fsmState +
                      ". Buffer: " + JSON.stringify(rawBuffer.slice(-512)));
           advance("TIMEOUT");
         }, ms);
@@ -1228,6 +1329,32 @@ var WorkerProvisioner = {
         rawBuffer += String.fromCharCode(byte);
         if (rawBuffer.length > 8192) rawBuffer = rawBuffer.slice(-8192);
         var buf = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
+
+        // Transition worker FSM based on guest tag prints (Requirement 7 and 10)
+        if (buf.indexOf("[FSM] [MOUNT] MOUNT_VISIBLE") !== -1 && fsmState === "MOUNTING") {
+          fsmState = "MOUNT_VISIBLE";
+          log("info", "[FSM] State transitioned to: " + fsmState);
+        }
+        if (buf.indexOf("[FSM] [VISIBILITY] DIRECTORY_VISIBLE") !== -1 && fsmState === "MOUNT_VISIBLE") {
+          fsmState = "DIRECTORY_VISIBLE";
+          log("info", "[FSM] State transitioned to: " + fsmState);
+        }
+        if (buf.indexOf("[FSM] [VISIBILITY] FILE_VISIBLE") !== -1 && (fsmState === "DIRECTORY_VISIBLE" || fsmState === "MOUNT_VISIBLE")) {
+          fsmState = "FILE_VISIBLE";
+          fileVisibleTime = Date.now();
+          var visLatency = verificationStart > 0 ? (fileVisibleTime - verificationStart) : 0;
+          log("info", "[FSM] State transitioned to: " + fsmState + " | [VISIBILITY] Guest visibility latency: " + visLatency + "ms");
+        }
+        if (buf.indexOf("[FSM] [CHECKSUM] CHECKSUM_VALID") !== -1 && fsmState === "FILE_VISIBLE") {
+          fsmState = "CHECKSUM_VALID";
+          checksumValidTime = Date.now();
+          checksumValidationLatencyMs = fileVisibleTime > 0 ? (checksumValidTime - fileVisibleTime) : 0;
+          log("info", "[FSM] State transitioned to: " + fsmState + " | [CHECKSUM] Checksum validation latency: " + checksumValidationLatencyMs + "ms");
+        }
+        if (buf.indexOf("[FSM] [EXEC] EXEC_READY") !== -1 && fsmState === "CHECKSUM_VALID") {
+          fsmState = "EXEC_READY";
+          log("info", "[FSM] State transitioned to: " + fsmState);
+        }
 
         // Parse <<<MOUNT_SETTLED>>> marker
         if (buf.indexOf("<<<MOUNT_SETTLED>>>") !== -1) {
@@ -1245,7 +1372,6 @@ var WorkerProvisioner = {
             var helperName = buf.slice(startRegIdx + "<<<HELPER_REGISTERED:".length, endRegIdx).replace(/[^A-Z]/g, "");
             WorkerProvisioner.registeredHelpers[helperName] = true;
             log("info", "[MountVisibilityFSM] Host confirmed helper registration for: " + helperName);
-            // Log full helper registry state (Requirement 1)
             log("info", "[MountVisibilityFSM TELEMETRY] Current FSM Registered Helpers: " + JSON.stringify(WorkerProvisioner.registeredHelpers));
           }
         }
@@ -1273,13 +1399,16 @@ var WorkerProvisioner = {
           return;
         }
 
-        var tag = "FSM:" + execId + ":" + fsmState;
-        var okMarker  = "<<<" + tag + ":OK>>>";
-        var errMarker = "<<<" + tag + ":ERR>>>";
+        // Explicit, decoupled tag parsing for reliable FSM progression
+        var mountingOkMarker  = "<<<FSM:" + execId + ":MOUNTING:OK>>>";
+        var mountingErrMarker = "<<<FSM:" + execId + ":MOUNTING:ERR>>>";
+        var remountOkMarker   = "<<<FSM:" + execId + ":REMOUNT:OK>>>";
+        var remountErrMarker  = "<<<FSM:" + execId + ":REMOUNT:ERR>>>";
+        var verifyVisPrefix   = "<<<FSM:" + execId + ":VERIFYING:VIS>>>";
+        var verifyNoVisMarker = "<<<FSM:" + execId + ":VERIFYING:NOVIS>>>";
+
         var fallbackOkMarker = "<<<FSM:" + execId + ":VERIFYING:FALLBACK_OK>>>";
         var fallbackFailMarker = "<<<FSM:" + execId + ":VERIFYING:FALLBACK_FAIL>>>";
-        var visMarkerPrefix = "<<<" + tag + ":VIS>>>";
-        var noVisMarker = "<<<" + tag + ":NOVIS>>>";
         var diagDoneMarker = "<<<FSM:" + execId + ":DIAGNOSTICS:DONE>>>";
 
         if (parserState === "waiting") {
@@ -1298,18 +1427,26 @@ var WorkerProvisioner = {
             parserState = "idle";
             rawBuffer = "";
             advance("NOVIS");
-          } else if (buf.indexOf(okMarker) !== -1) {
+          } else if (buf.indexOf(mountingOkMarker) !== -1) {
             parserState = "idle";
             rawBuffer = "";
             advance("OK");
-          } else if (buf.indexOf(errMarker) !== -1) {
+          } else if (buf.indexOf(mountingErrMarker) !== -1) {
             parserState = "idle";
             rawBuffer = "";
             advance("ERR");
-          } else if (buf.indexOf(visMarkerPrefix) !== -1) {
+          } else if (buf.indexOf(remountOkMarker) !== -1) {
+            parserState = "idle";
+            rawBuffer = "";
+            advance("OK");
+          } else if (buf.indexOf(remountErrMarker) !== -1) {
+            parserState = "idle";
+            rawBuffer = "";
+            advance("ERR");
+          } else if (buf.indexOf(verifyVisPrefix) !== -1) {
             // Extract the inode suffix after the marker
-            var idx = buf.indexOf(visMarkerPrefix);
-            var restOfBuf = buf.slice(idx + visMarkerPrefix.length);
+            var idx = buf.indexOf(verifyVisPrefix);
+            var restOfBuf = buf.slice(idx + verifyVisPrefix.length);
             var inode = "unknown";
             var endOfMarkerIdx = restOfBuf.indexOf("\n");
             if (endOfMarkerIdx !== -1) {
@@ -1323,7 +1460,7 @@ var WorkerProvisioner = {
             parserState = "idle";
             rawBuffer = "";
             advance("VIS", inode);
-          } else if (buf.indexOf(noVisMarker) !== -1) {
+          } else if (buf.indexOf(verifyNoVisMarker) !== -1) {
             parserState = "idle";
             rawBuffer = "";
             advance("NOVIS");
@@ -1357,10 +1494,10 @@ var WorkerProvisioner = {
       function doMount() {
         fsmState = "MOUNTING";
         mountStartTime = Date.now();
+        log("info", "[FSM] State transitioned to: MOUNTING");
         log("info", "[MountVisibilityFSM] MOUNTING: dispatching inline mount command");
         armTimeout(CMD_TIMEOUT_MS + 30000); // Mount can take up to ~30s extra for sleep loops
         
-        // Log telemetry: expected helpers, paths, state registry (Requirement 1)
         log("info", "[MountVisibilityFSM TELEMETRY] Expected helpers: prov_mount_" + execId + ".sh.tmp, prov_verify_" + execId + ".sh.tmp, prov_remount_" + execId + ".sh.tmp, prov_diag_" + execId + ".sh.tmp, prov_reval_" + execId + ".sh.tmp");
         log("info", "[MountVisibilityFSM TELEMETRY] Install base path: /root/.provision/ (mapped to /mnt/9p/root/.provision/)");
         log("info", "[MountVisibilityFSM TELEMETRY] Current FSM state: " + fsmState);
@@ -1370,10 +1507,9 @@ var WorkerProvisioner = {
           "mkdir -p /mnt/9p && " +
           "umount -f /mnt/9p >/dev/null 2>&1; umount /mnt/9p >/dev/null 2>&1; " +
           "echo '[INLINE_MOUNT] Attempting 9p mount'; " +
-          "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none host9p /mnt/9p 2>/dev/null || " +
-          " mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
-          " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
           "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
           "echo '[INLINE_MOUNT] Waiting for verify script visibility'; " +
@@ -1386,12 +1522,15 @@ var WorkerProvisioner = {
           "mkdir -p /mnt/9p/root/.provision && " +
           "ln -s /mnt/9p/root/.provision /root/.provision && " +
           "sync && " +
-          "echo '[INLINE_MOUNT] Renaming .tmp helpers to final'; " +
+          "echo '[INLINE_MOUNT] Renaming .tmp helpers to final atomically'; " +
           "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
           "  if [ -f \"$f\" ]; then " +
-          "    mv -f \"$f\" \"${f%.tmp}\" && " +
-          "    chmod +x \"${f%.tmp}\" && " +
-          "    ls -l \"${f%.tmp}\"; " +
+          "    target=\"/mnt/9p/root/.provision/$(basename \"$f\" .tmp)\"; " +
+          "    (fsync \"$f\" || sync) && " +
+          "    mv -f \"$f\" \"$target\" && " +
+          "    sync && " +
+          "    [ -f \"$target\" ] && " +
+          "    chmod +x \"$target\"; " +
           "  fi; " +
           "done && " +
           "echo '[INLINE_MOUNT] Validating helper executables'; " +
@@ -1427,24 +1566,25 @@ var WorkerProvisioner = {
       }
 
       function doVerify(isStabilityCheck) {
-        fsmState = "VERIFYING";
         if (!isStabilityCheck) {
           verifyAttempt++;
           retryCount = verifyAttempt;
         }
         
         var delay = isStabilityCheck ? 200 : Math.min(4000, 300 * Math.pow(2, verifyAttempt - 1));
-        log("info", "[MountVisibilityFSM] VERIFYING" + (isStabilityCheck ? " (stability check " + (stabilityCount + 1) + "/" + STABILITY_CHECKS + ")" : " attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES) + " for " + filePath + " after delay of " + delay + "ms");
+        log("info", "[MountVisibilityFSM] verifyGuestVisibility" + (isStabilityCheck ? " (stability check " + (stabilityCount + 1) + "/" + STABILITY_CHECKS + ")" : " attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES) + " for " + filePath + " after delay of " + delay + "ms");
         
         setTimeout(function() {
           if (finished) return;
           armTimeout(CMD_TIMEOUT_MS);
+          verificationStart = Date.now();
           sendCmd(base + "/prov_verify_" + execId + ".sh");
         }, delay);
       }
 
       function doRemount() {
         fsmState = "REMOUNT";
+        log("info", "[FSM] State transitioned to: REMOUNT");
         log("info", "[MountVisibilityFSM] REMOUNT: dispatching inline remount command (attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + ")");
         armTimeout(CMD_TIMEOUT_MS + 20000);
         
@@ -1453,10 +1593,9 @@ var WorkerProvisioner = {
           "umount -f /mnt/9p >/dev/null 2>&1; umount /mnt/9p >/dev/null 2>&1; " +
           "mkdir -p /mnt/9p >/dev/null 2>&1; " +
           "echo '[INLINE_REMOUNT] Attempting 9p remount'; " +
-          "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none host9p /mnt/9p 2>/dev/null || " +
-          " mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || " +
-          " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
-          " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
+          "(mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
+          " mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
           "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
           "echo '[INLINE_REMOUNT] Waiting for verify script visibility'; " +
@@ -1469,12 +1608,15 @@ var WorkerProvisioner = {
           "mkdir -p /mnt/9p/root/.provision && " +
           "ln -s /mnt/9p/root/.provision /root/.provision && " +
           "sync && " +
-          "echo '[INLINE_REMOUNT] Renaming .tmp helpers to final'; " +
+          "echo '[INLINE_REMOUNT] Renaming .tmp helpers to final atomically'; " +
           "for f in /mnt/9p/root/.provision/prov_*.sh.tmp; do " +
           "  if [ -f \"$f\" ]; then " +
-          "    mv -f \"$f\" \"${f%.tmp}\" && " +
-          "    chmod +x \"${f%.tmp}\" && " +
-          "    ls -l \"${f%.tmp}\"; " +
+          "    target=\"/mnt/9p/root/.provision/$(basename \"$f\" .tmp)\"; " +
+          "    (fsync \"$f\" || sync) && " +
+          "    mv -f \"$f\" \"$target\" && " +
+          "    sync && " +
+          "    [ -f \"$target\" ] && " +
+          "    chmod +x \"$target\"; " +
           "  fi; " +
           "done && " +
           "echo '[INLINE_REMOUNT] Validating helper executables'; " +
@@ -1529,6 +1671,7 @@ var WorkerProvisioner = {
 
       function doDiagnostics() {
         fsmState = "DIAGNOSTICS";
+        log("info", "[FSM] State transitioned to: DIAGNOSTICS");
         log("warn", "[MountVisibilityFSM] Verification exhausted. Dumping namespace diagnostics.");
         armTimeout(5000 + CMD_TIMEOUT_MS);
         sendCmd(base + "/prov_diag_" + execId + ".sh");
@@ -1538,7 +1681,7 @@ var WorkerProvisioner = {
         if (finished) return;
         log("info", "[MountVisibilityFSM] State=" + fsmState + " Event=" + event);
 
-        if (fsmState === "MOUNTING") {
+        if (fsmState === "MOUNTING" || fsmState === "MOUNT_VISIBLE") {
           if (event === "OK") {
             mountSuccess = true;
             virtioReadiness = true;
@@ -1550,30 +1693,8 @@ var WorkerProvisioner = {
               doVerify(false);
             }, 800);
           } else {
-            // Mount failed — schedule remount recovery
+            // Mount failed — schedule remount recovery if within budget
             scheduleRemount();
-          }
-        } else if (fsmState === "VERIFYING") {
-          if (event === "VIS") {
-            stabilityCount++;
-            if (stabilityCount >= STABILITY_CHECKS) {
-              log("info", "[MountVisibilityFSM] File VISIBLE and STABLE across " + STABILITY_CHECKS + " cycles. -> VERIFIED");
-              done(true, extra);
-            } else {
-              doVerify(true); // Run stability check
-            }
-          } else if (event === "NOVIS" || event === "TIMEOUT") {
-            stabilityCount = 0; // Reset stability counter since it failed!
-            if (verifyAttempt < MAX_VERIFY_RETRIES) {
-              log("warn", "[MountVisibilityFSM] Not visible yet (attempt " + verifyAttempt + "). Retrying verify loop.");
-              postToHost("PROVISION_RECOVERING", { msg: "Filesystem synchronization recovering..." });
-              doVerify(false);
-            } else {
-              log("warn", "[MountVisibilityFSM] " + MAX_VERIFY_RETRIES + " verify attempts exhausted. Scheduling remount.");
-              scheduleRemount();
-            }
-          } else {
-            done(false);
           }
         } else if (fsmState === "REMOUNT") {
           if (event === "OK") {
@@ -1588,12 +1709,53 @@ var WorkerProvisioner = {
               doVerify(false);
             }, 800);
           } else {
-            // Remount command itself failed or timed out — schedule another remount if budget remains
             scheduleRemount();
           }
         } else if (fsmState === "DIAGNOSTICS") {
           log("warn", "[MountVisibilityFSM DIAGNOSTICS] Guest dump:\n" + (extra || ""));
           done(false);
+        } else {
+          // In VERIFYING / visible FSM states
+          if (event === "VIS") {
+            stabilityCount++;
+            if (stabilityCount >= STABILITY_CHECKS) {
+              log("info", "[MountVisibilityFSM] File VISIBLE and STABLE across " + STABILITY_CHECKS + " cycles. -> VERIFIED");
+              done(true, extra);
+            } else {
+              doVerify(true); // Run stability check
+            }
+          } else if (event === "NOVIS" || event === "TIMEOUT") {
+            stabilityCount = 0; // Reset stability counter since it failed!
+            
+            // Smart recovery rule: only remount if mount disappears OR checksum mismatch occurs repeatedly
+            var bufSanitized = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
+            var mountDisappeared = bufSanitized.indexOf("MOUNT_DISAPPEARED") !== -1 || bufSanitized.indexOf("[FSM] [MOUNT] MOUNT_VISIBLE") === -1;
+            var checksumMismatchCount = (bufSanitized.match(/Checksum mismatch/g) || []).length;
+            var repeatedChecksumMismatch = checksumMismatchCount >= 2;
+
+            if (mountDisappeared || repeatedChecksumMismatch) {
+              log("warn", "[MountVisibilityFSM] Recovery triggered: mountDisappeared=" + mountDisappeared + ", repeatedChecksumMismatch=" + repeatedChecksumMismatch + " (count=" + checksumMismatchCount + ")");
+              if (remountAttemptsCount < 3) {
+                log("warn", "[MountVisibilityFSM] " + (verifyAttempt) + " verify attempts done. Scheduling remount recovery.");
+                scheduleRemount();
+              } else {
+                log("error", "[MountVisibilityFSM] Remount recovery budget (3) exhausted. Triggering diagnostics.");
+                doDiagnostics();
+              }
+            } else {
+              // Do NOT remount for simple propagation delay. Just retry verification loop if below verify retries.
+              if (verifyAttempt < MAX_VERIFY_RETRIES) {
+                log("warn", "[MountVisibilityFSM] Propagation delay (mount active). Retrying verify loop. Attempt " + verifyAttempt + "/" + MAX_VERIFY_RETRIES);
+                postToHost("PROVISION_RECOVERING", { msg: "Filesystem synchronization recovering..." });
+                doVerify(false);
+              } else {
+                log("error", "[MountVisibilityFSM] Maximum verification attempts (" + MAX_VERIFY_RETRIES + ") reached without visibility. Declaring failure.");
+                done(false);
+              }
+            }
+          } else {
+            done(false);
+          }
         }
       }
 

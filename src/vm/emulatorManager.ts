@@ -1105,7 +1105,12 @@ export class VMController {
 
       Logger.info("VM", "[PROVISIONING] Sending guest filesystem mount stabilization barrier...");
       const mountCommand = "mkdir -p /mnt/9p\n" +
-        "grep -q host9p /proc/mounts 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/9p 2>/dev/null || mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+        "grep -q host9p /proc/mounts 2>/dev/null || " +
+        "mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
+        "mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
+        "mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null || " +
+        "mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
+        "sync\n" +
         "mkdir -p /mnt/9p/root/.provision\n" +
         "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
         "sync\n" +
