@@ -843,6 +843,7 @@ var WorkerProvisioner = {
       "#!/bin/sh\n" +
       "stty -echo > /dev/null 2>&1\n" +
       "sync\n" +
+      "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "echo '[VERIFY:STAT]' > /dev/ttyS0; stat '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'stat-failed' > /dev/ttyS0\n" +
       "echo '[VERIFY:LS]' > /dev/ttyS0; ls -l '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'ls-failed' > /dev/ttyS0\n" +
       "echo '[VERIFY:MODE]' > /dev/ttyS0; stat -c %a '" + fp + "' > /dev/ttyS0 2>/dev/null || echo 'mode-failed' > /dev/ttyS0\n" +
@@ -890,6 +891,8 @@ var WorkerProvisioner = {
       "stty -echo > /dev/null 2>&1\n" +
       "echo '[DIAG:MOUNT]' > /dev/ttyS0\n" +
       "mount 2>/dev/null > /dev/ttyS0 || echo 'mount-failed' > /dev/ttyS0\n" +
+      "echo '[DIAG:MOUNTPATH]' > /dev/ttyS0\n" +
+      "grep host9p /proc/mounts > /dev/ttyS0 2>/dev/null || echo 'not-mounted' > /dev/ttyS0\n" +
       "echo '[DIAG:DF]' > /dev/ttyS0\n" +
       "df 2>/dev/null > /dev/ttyS0 || echo 'df-failed' > /dev/ttyS0\n" +
       "echo '[DIAG:LS]' > /dev/ttyS0\n" +
@@ -909,6 +912,7 @@ var WorkerProvisioner = {
       "#!/bin/sh\n" +
       "stty -echo > /dev/null 2>&1\n" +
       "sync\n" +
+      "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "echo '[EXEC_DIAG:PWD]' > /dev/ttyS0; pwd > /dev/ttyS0\n" +
       "echo '[EXEC_DIAG:MOUNTS]' > /dev/ttyS0\n" +
       "cat /proc/mounts > /dev/ttyS0 2>/dev/null || echo none > /dev/ttyS0\n" +
@@ -996,6 +1000,7 @@ var WorkerProvisioner = {
 
     // Telemetry fields
     var mountSuccess = false;
+    var mountSettled = false;
     var propagationLatencyMs = -1;
     var retryCount = 0;
     var guestVisibilityTimingMs = -1;
@@ -1035,6 +1040,7 @@ var WorkerProvisioner = {
         log("info", "[MountVisibilityFSM TELEMETRY] Resolved visible=" + visible + 
                    " | inode=" + resolvedInode +
                    " | mountSuccess=" + mountSuccess +
+                   " | mountSettled=" + mountSettled +
                    " | mountLatency=" + mountLatencyMs + "ms" +
                    " | visibilityLatency=" + visibilityLatencyMs + "ms" +
                    " | virtioReadiness=" + virtioReadiness +
@@ -1051,6 +1057,7 @@ var WorkerProvisioner = {
           inode: resolvedInode,
           telemetry: {
             mountSuccess: mountSuccess,
+            mountSettled: mountSettled,
             propagationLatencyMs: propagationLatencyMs,
             retryCount: retryCount,
             guestVisibilityTimingMs: guestVisibilityTimingMs,
@@ -1079,6 +1086,14 @@ var WorkerProvisioner = {
         rawBuffer += String.fromCharCode(byte);
         if (rawBuffer.length > 8192) rawBuffer = rawBuffer.slice(-8192);
         var buf = WorkerProvisioner.sanitizeSerialOutput(rawBuffer);
+
+        // Parse <<<MOUNT_SETTLED>>> marker
+        if (buf.indexOf("<<<MOUNT_SETTLED>>>") !== -1) {
+          if (!mountSettled) {
+            mountSettled = true;
+            log("info", "[MountVisibilityFSM] Host confirmed guest filesystem has settled (expected entries are accessible and readable).");
+          }
+        }
 
         // Telemetry tracking for registered helpers
         if (buf.indexOf("<<<HELPER_REGISTERED:") !== -1) {
@@ -1216,8 +1231,9 @@ var WorkerProvisioner = {
           " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
           "i=0; ok=0; while [ $i -lt 20 ]; do " +
-          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
+          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ] && [ -s /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
           "  sleep 0.5; i=$((i+1)); " +
           "done && [ $ok -eq 1 ] && " +
           "rm -rf /root/.provision && " +
@@ -1232,8 +1248,15 @@ var WorkerProvisioner = {
           "    stat -c %a \"${f%.tmp}\"; " +
           "  fi; " +
           "done && " +
+          "h_ok=1; for h in mount verify remount diag reval; do " +
+          "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "    h_ok=0; " +
+          "  fi; " +
+          "done && " +
+          "[ $h_ok -eq 1 ] && " +
+          "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
           "for h in mount verify remount diag reval; do " +
-          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] && [ -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    case \"$h\" in " +
           "      mount) name=\"MOUNTING\" ;; " +
           "      verify) name=\"VERIFYING\" ;; " +
@@ -1285,8 +1308,9 @@ var WorkerProvisioner = {
           " mount -t 9p -o trans=virtio,cache=none host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p -o trans=virtio host9p /mnt/9p 2>/dev/null || " +
           " mount -t 9p host9p /mnt/9p 2>/dev/null) && " +
+          "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && " +
           "i=0; ok=0; while [ $i -lt 20 ]; do " +
-          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
+          "  if [ -f /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ] && [ -s /mnt/9p/root/.provision/prov_verify_" + execId + ".sh.tmp ]; then ok=1; break; fi; " +
           "  sleep 0.5; i=$((i+1)); " +
           "done && [ $ok -eq 1 ] && " +
           "rm -rf /root/.provision && " +
@@ -1301,8 +1325,15 @@ var WorkerProvisioner = {
           "    stat -c %a \"${f%.tmp}\"; " +
           "  fi; " +
           "done && " +
+          "h_ok=1; for h in mount verify remount diag reval; do " +
+          "  if [ ! -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] || [ ! -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "    h_ok=0; " +
+          "  fi; " +
+          "done && " +
+          "[ $h_ok -eq 1 ] && " +
+          "echo '<<<MOUNT_SETTLED>>>' > /dev/ttyS0 && " +
           "for h in mount verify remount diag reval; do " +
-          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ] && [ -x \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
+          "  if [ -f \"/root/.provision/prov_${h}_" + execId + ".sh\" ]; then " +
           "    case \"$h\" in " +
           "      mount) name=\"MOUNTING\" ;; " +
           "      verify) name=\"VERIFYING\" ;; " +
@@ -1327,8 +1358,8 @@ var WorkerProvisioner = {
       function scheduleRemount() {
         if (remountAttemptsCount < MAX_MOUNT_RETRIES) {
           remountAttemptsCount++;
-          var delay = Math.min(6000, 500 * Math.pow(2, remountAttemptsCount - 1));
-          var jitter = Math.floor(Math.random() * 300);
+          var delay = Math.min(8000, 1000 * Math.pow(2, remountAttemptsCount - 1));
+          var jitter = Math.floor(Math.random() * 500);
           var finalDelay = delay + jitter;
           log("warn", "[MountVisibilityFSM] Scheduling remount attempt " + remountAttemptsCount + "/" + MAX_MOUNT_RETRIES + " in " + finalDelay + "ms (backoff=" + delay + "ms, jitter=" + jitter + "ms)");
           setTimeout(function() {
@@ -1358,8 +1389,11 @@ var WorkerProvisioner = {
             virtioReadiness = true;
             readdirSuccess = true;
             mountLatencyMs = Date.now() - mountStartTime;
-            log("info", "[MountVisibilityFSM] Mount OK. Latency: " + mountLatencyMs + "ms. -> VERIFYING");
-            doVerify(false);
+            log("info", "[MountVisibilityFSM] Mount OK. Latency: " + mountLatencyMs + "ms. Waiting 800ms for filesystem stabilization...");
+            setTimeout(function() {
+              if (finished) return;
+              doVerify(false);
+            }, 800);
           } else {
             // Mount failed — schedule remount recovery
             scheduleRemount();
@@ -1390,10 +1424,13 @@ var WorkerProvisioner = {
             mountSuccess = true;
             virtioReadiness = true;
             readdirSuccess = true;
-            log("info", "[MountVisibilityFSM] Remount OK. Resetting verify counter -> VERIFYING");
+            log("info", "[MountVisibilityFSM] Remount OK. Resetting verify counter. Waiting 800ms for filesystem stabilization...");
             verifyAttempt = 0;
             stabilityCount = 0;
-            doVerify(false);
+            setTimeout(function() {
+              if (finished) return;
+              doVerify(false);
+            }, 800);
           } else {
             // Remount command itself failed or timed out — schedule another remount if budget remains
             scheduleRemount();
