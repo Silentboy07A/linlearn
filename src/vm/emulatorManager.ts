@@ -588,6 +588,11 @@ export class VMController {
     this.verifiedInodeSize = null;
     this.verifiedInodeReadability = null;
     this.provisionExecutionInFlight = false;
+    this._guestExistsMarker = null;
+    this._guestExistsCallback = null;
+    this._guestMissingCallback = null;
+    this._guestPollAttempt = 0;
+    this._guestPollMaxRetries = 0;
 
     // Reset shell readiness preconditions for new session
     this.receivedSerialReady = false;
@@ -905,10 +910,13 @@ export class VMController {
 
           case "FILE_MATERIALIZATION_VERIFIED": {
             // Worker confirmed host-side 9p filesystem write success.
-            // The file exists in the inode table with verified attributes.
-            const matPayload = payload as { path: string; inodeId: number; size: number; mtime?: number; readability?: boolean; isReinject?: boolean; skipped?: boolean };
+            // NOTE: This only confirms the HOST 9p inode table — NOT guest VFS visibility.
+            const matPayload = payload as { path: string; inodeId: number; size: number; mtime?: number; readability?: boolean; isReinject?: boolean; skipped?: boolean; verifiedNamespace?: string; guestVerified?: boolean };
             
-            Logger.info("VM", `[GUEST_FS_VISIBLE] FILE_MATERIALIZATION_VERIFIED: path=${matPayload.path}, inode=${matPayload.inodeId}, size=${matPayload.size}, mtime=${matPayload.mtime || "unknown"}, readability=${matPayload.readability !== false}, isReinject=${matPayload.isReinject || false}, skipped=${matPayload.skipped || false}`);
+            Logger.info("VM", `[VERIFY_PATH] FILE_MATERIALIZATION_VERIFIED: path=${matPayload.path}, inode=${matPayload.inodeId}, size=${matPayload.size}, mtime=${matPayload.mtime || "unknown"}, readability=${matPayload.readability !== false}, isReinject=${matPayload.isReinject || false}, skipped=${matPayload.skipped || false}`);
+            Logger.info("VM", `[VERIFY_NAMESPACE] Verification namespace: ${matPayload.verifiedNamespace || "host_9p_inode_table"}, guestVerified: ${matPayload.guestVerified || false}`);
+            Logger.info("VM", `[FS9P_PATH] Host 9p export path: ${matPayload.path}`);
+            Logger.info("VM", `[GUEST_PATH] Guest execution path: ${matPayload.path}`);
             
             this.verifiedInodeId = matPayload.inodeId;
             this.verifiedInodeMtime = matPayload.mtime || null;
@@ -1036,6 +1044,24 @@ export class VMController {
     if (this.provisioningSearchBuffer.includes("<<<PRE_EXEC_FILE_MISSING>>>")) {
       Logger.error("VM", "[TELEMETRY] PRE_EXEC_FILE_MISSING: mount_prepare.sh not found inside guest VFS!");
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<PRE_EXEC_FILE_MISSING>>>", "");
+    }
+
+    // Guest-side existence check markers (from _pollGuestFileExists)
+    if (this._guestExistsMarker && this.provisioningSearchBuffer.includes(this._guestExistsMarker)) {
+      Logger.info("VM", "[GUEST_FILE_EXISTS] Guest-side existence check confirmed file is visible.");
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace(this._guestExistsMarker, "");
+      this.timeouts.cancel("guest_file_poll");
+      const cb = this._guestExistsCallback;
+      this._guestExistsMarker = null;
+      this._guestExistsCallback = null;
+      this._guestMissingCallback = null;
+      if (cb) cb();
+      return;
+    }
+    if (this._guestExistsMarker && this.provisioningSearchBuffer.includes("<<<GUEST_FILE_MISSING>>>")) {
+      Logger.warn("VM", "[GUEST_FILE_MISSING] Guest-side existence check reports file NOT found.");
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GUEST_FILE_MISSING>>>", "");
+      // Don't act immediately — the retry timer in _pollGuestFileExists will handle it
     }
 
     if (this.isVerifyingVisibility && this.provisioningSearchBuffer.includes("<<<PROVISION_FILES_VISIBLE>>>")) {
@@ -2128,25 +2154,138 @@ export class VMController {
     this.healthMonitor.start();
   }
 
+  // ─── Guest-side file existence polling state ────────────────────────────
+  private _guestExistsMarker: string | null = null;
+  private _guestExistsCallback: (() => void) | null = null;
+  private _guestMissingCallback: (() => void) | null = null;
+  private _guestPollAttempt = 0;
+  private _guestPollMaxRetries = 0;
+
   /**
-   * Wait for FILE_MATERIALIZATION_VERIFIED from the worker, then execute mount_prepare.sh.
+   * Wait for FILE_MATERIALIZATION_VERIFIED from the worker, then verify
+   * guest-side visibility before executing mount_prepare.sh.
    *
-   * Replaces the old serial-echo visibility poll (startFileVisibilityVerification).
+   * FIX: The old implementation trusted host-side 9p inode metadata and
+   * immediately ran `sh /root/.provision/mount_prepare.sh`. This caused
+   * ENOENT because the guest kernel hadn't seen the file yet (or
+   * /root/.provision was a local dir, not the 9p mount).
    *
-   * Flow:
-   *   1. If FILE_MATERIALIZATION_VERIFIED already arrived (mountPrepareVerified), proceed immediately.
-   *   2. Otherwise register a pending callback fired by the message handler.
-   *   3. A 10-second timeout guard triggers PROVISIONING_REINJECTION on failure.
+   * New flow:
+   *   1. Log diagnostic namespace info ([VERIFY_PATH], [VERIFY_INODE])
+   *   2. Run guest-side `ls` + `stat` for diagnostics ([VERIFY_STAT])
+   *   3. Poll guest: `test -f /root/.provision/mount_prepare.sh`
+   *   4. If exists → [GUEST_FILE_EXISTS] → execute normally
+   *   5. If missing → [GUEST_FILE_MISSING] → inline 9p mount + exec via /mnt/9p fallback
    */
   private verifyAndExecuteMountScript(): void {
     const inodeIdStr = this.verifiedInodeId !== null ? this.verifiedInodeId.toString() : "";
-    Logger.info("VM", `[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Verified inode ID: ${inodeIdStr}. Executing mount prepare script directly.`);
+    Logger.info("VM", `[VERIFY_PATH] FILE_MATERIALIZATION_VERIFIED received. host_9p inode=${inodeIdStr}`);
+    Logger.info("VM", `[VERIFY_INODE] Host-side inode: id=${inodeIdStr}, size=${this.verifiedInodeSize}, mtime=${this.verifiedInodeMtime}, readable=${this.verifiedInodeReadability}`);
 
     this.provisioningExecutionStarted = true;
     this.provisionExecutionInFlight = true;
 
-    // Execute mount_prepare.sh directly using a short command (completely avoiding any transport limits)
-    void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+    // PHASE 1: Run guest-side diagnostics before execution
+    Logger.info("VM", "[VERIFY_STAT] Running guest-side ls + stat before execution...");
+    void this.sendProgrammaticInput(0,
+      "ls -la /root/.provision 2>&1 | head -5 > /dev/ttyS0\n"
+    );
+    void this.sendProgrammaticInput(0,
+      "stat /root/.provision/mount_prepare.sh > /dev/ttyS0 2>&1\n"
+    );
+
+    // PHASE 2: Guest-side existence check with retry
+    Logger.info("VM", "[VERIFY_INODE] Starting guest-side existence check (replacing metadata-only verification)...");
+    this._pollGuestFileExists(
+      "/root/.provision/mount_prepare.sh",
+      5,    // max retries
+      300,  // initial delay ms
+      () => {
+        // File exists on guest side — execute
+        Logger.info("VM", "[GUEST_FILE_EXISTS] Guest confirmed file exists. Executing mount_prepare.sh.");
+        void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+      },
+      () => {
+        // File missing on guest side — try 9p mount path fallback
+        Logger.warn("VM", "[GUEST_FILE_MISSING] File NOT visible at /root/.provision on guest after all retries. Trying /mnt/9p fallback...");
+        this._tryDirectMountFallback();
+      }
+    );
+  }
+
+  /**
+   * Poll the guest filesystem to confirm a file actually exists before executing it.
+   * Uses dcache flush + `test -f` via serial, with a unique marker per poll session.
+   * Detected in handleSerialLifecycle() via the _guestExistsMarker field.
+   */
+  private _pollGuestFileExists(
+    path: string,
+    maxRetries: number,
+    delayMs: number,
+    onExists: () => void,
+    onMissing: () => void
+  ): void {
+    this._guestPollAttempt = 0;
+    this._guestPollMaxRetries = maxRetries;
+    this._guestExistsMarker = `<<<GUEST_EXISTS_OK_${Date.now()}>>>`;
+    this._guestExistsCallback = onExists;
+    this._guestMissingCallback = onMissing;
+
+    const probe = () => {
+      this._guestPollAttempt++;
+      if (this._guestPollAttempt > this._guestPollMaxRetries) {
+        Logger.error("VM", `[GUEST_FILE_MISSING] Guest existence check failed after ${this._guestPollMaxRetries} attempts for ${path}`);
+        this.timeouts.cancel("guest_file_poll");
+        const cb = this._guestMissingCallback;
+        this._guestExistsMarker = null;
+        this._guestExistsCallback = null;
+        this._guestMissingCallback = null;
+        if (cb) cb();
+        return;
+      }
+
+      Logger.info("VM", `[VERIFY_INODE] Guest file poll attempt ${this._guestPollAttempt}/${this._guestPollMaxRetries} for ${path}`);
+
+      // Flush guest dcache before probing
+      void this.sendProgrammaticInput(0,
+        `sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; ` +
+        `test -f ${path} && echo '${this._guestExistsMarker}' > /dev/ttyS0 || ` +
+        `echo '<<<GUEST_FILE_MISSING>>>' > /dev/ttyS0\n`
+      );
+
+      // Schedule retry — marker detection in handleSerialLifecycle() cancels this
+      const retryDelay = delayMs * this._guestPollAttempt;
+      this.timeouts.register("guest_file_poll", retryDelay, () => {
+        // Timer fired without marker → retry
+        probe();
+      });
+    };
+
+    probe();
+  }
+
+  /**
+   * Fallback when the file is not visible at /root/.provision on the guest.
+   * This handles the bootstrap paradox: mount_prepare.sh creates the symlink
+   * from /root/.provision → /mnt/9p/root/.provision, but before it runs,
+   * /root/.provision is a local dir (or doesn't exist). So we mount 9p inline
+   * and run the script from its 9p-native path.
+   */
+  private _tryDirectMountFallback(): void {
+    Logger.info("VM", "[GUEST_FILE_MISSING] Attempting direct 9p mount + inline execution fallback...");
+    Logger.info("VM", "[FS9P_PATH] Trying /mnt/9p/root/.provision/mount_prepare.sh (9p-native path)");
+
+    // Send individual short commands to stay within transport limits
+    void this.sendProgrammaticInput(0, "mkdir -p /mnt/9p 2>/dev/null\n");
+    void this.sendProgrammaticInput(0,
+      "mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null\n"
+    );
+    void this.sendProgrammaticInput(0, "sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n");
+    void this.sendProgrammaticInput(0,
+      "test -f /mnt/9p/root/.provision/mount_prepare.sh && " +
+      "sh /mnt/9p/root/.provision/mount_prepare.sh || " +
+      "echo '<<<STAGE:MOUNT_FAIL>>>' > /dev/ttyS0\n"
+    );
   }
 
   /**

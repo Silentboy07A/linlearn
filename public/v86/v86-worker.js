@@ -1693,7 +1693,9 @@ self.onmessage = async function (e) {
               mtime: oldInode.mtime,
               readability: true,
               isReinject: true,
-              skipped: true
+              skipped: true,
+              verifiedNamespace: "host_9p_inode_table",
+              guestVerified: false
             });
             break;
           }
@@ -1830,7 +1832,9 @@ self.onmessage = async function (e) {
           size: riInode.size,
           mtime: riInode.mtime,
           readability: (riInode.mode & 292) !== 0,
-          isReinject: true
+          isReinject: true,
+          verifiedNamespace: "host_9p_inode_table",
+          guestVerified: false
         });
       } catch (riErr) {
         log("error", "[CREATE_FILE_FAILURE] REINJECT failed for " + reinjectPath + ": " + (riErr.stack || riErr));
@@ -2244,7 +2248,9 @@ async function checkAndInitializeFs9p() {
       inodeId: mpSearch.id,
       size: mpInode.size,
       mtime: mpInode.mtime,
-      readability: (mpInode.mode & 292) !== 0
+      readability: (mpInode.mode & 292) !== 0,
+      verifiedNamespace: "host_9p_inode_table",
+      guestVerified: false
     });
 
   } catch (mpErr) {
