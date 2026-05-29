@@ -1025,6 +1025,19 @@ export class VMController {
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.substring(this.provisioningSearchBuffer.length - 512);
     }
 
+    if (this.provisioningSearchBuffer.includes("<<<PRE_EXEC_FILE_CHECK>>>")) {
+      Logger.info("VM", "[TELEMETRY] PRE_EXEC_FILE_CHECK: Starting guest-side filesystem checks before execution.");
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<PRE_EXEC_FILE_CHECK>>>", "");
+    }
+    if (this.provisioningSearchBuffer.includes("<<<PRE_EXEC_FILE_EXISTS>>>")) {
+      Logger.info("VM", "[TELEMETRY] PRE_EXEC_FILE_EXISTS: Verified guest-side readability/existence of mount_prepare.sh.");
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<PRE_EXEC_FILE_EXISTS>>>", "");
+    }
+    if (this.provisioningSearchBuffer.includes("<<<PRE_EXEC_FILE_MISSING>>>")) {
+      Logger.error("VM", "[TELEMETRY] PRE_EXEC_FILE_MISSING: mount_prepare.sh not found inside guest VFS!");
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<PRE_EXEC_FILE_MISSING>>>", "");
+    }
+
     if (this.isVerifyingVisibility && this.provisioningSearchBuffer.includes("<<<PROVISION_FILES_VISIBLE>>>")) {
       Logger.info("VM", `[PROVISIONING WATCHDOG] Visibility confirmed for ${this.verifyingFilePath} (STAGE:PROVISION_FILES_VISIBLE).`);
       this.isVerifyingVisibility = false;
@@ -2040,6 +2053,14 @@ export class VMController {
       
       this.provisioningExecutionStarted = true;
       this.provisionExecutionInFlight = true;
+
+      // Guest-side existence checks and telemetry before execution
+      void this.sendProgrammaticInput(0, "echo '<<<PRE_EXEC_FILE_CHECK>>>'\n");
+      void this.sendProgrammaticInput(0, "ls -l /root/.provision\n");
+      void this.sendProgrammaticInput(0, "ls -l /root/.provision/mount_prepare.sh\n");
+      void this.sendProgrammaticInput(0, "pwd\n");
+      void this.sendProgrammaticInput(0, "mount\n");
+      void this.sendProgrammaticInput(0, "[ -f /root/.provision/mount_prepare.sh ] && echo '<<<PRE_EXEC_FILE_EXISTS>>>' || echo '<<<PRE_EXEC_FILE_MISSING>>>'\n");
 
       // Executing the mounting prepare script directly, trusting FILE_MATERIALIZATION_VERIFIED.
       // All guest-side mounting validation has been moved inside mount_prepare.sh.
