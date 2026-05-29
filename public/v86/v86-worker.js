@@ -910,15 +910,11 @@ var WorkerProvisioner = {
       "\n" +
       "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "\n" +
-      "# Discover mountpoint dynamically\n" +
-      "m=\$(mount | grep host9p | head -n 1 | cut -d' ' -f3)\n" +
-      "if [ -z \"\$m\" ]; then m=\"/mnt\"; fi\n" +
-      "\n" +
       "# Symlink drift check\n" +
-      "prov_link=\$(readlink -f /root/.provision 2>/dev/null)\n" +
-      "if [ \"\$prov_link\" != \"\$m/root/.provision\" ]; then\n" +
-      "  echo \"[VISIBILITY] Stale symlink drift detected: got '\$prov_link', expected '\$m/root/.provision'\" > /dev/ttyS0\n" +
-      "  rm -rf /root/.provision && ln -s \"\$m/root/.provision\" /root/.provision\n" +
+      "prov_link=$(readlink -f /root/.provision 2>/dev/null)\n" +
+      "if [ \"$prov_link\" != \"/mnt/9p/root/.provision\" ]; then\n" +
+      "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '/mnt/9p/root/.provision'\" > /dev/ttyS0\n" +
+      "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
       "  sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "fi\n" +
       "\n" +
@@ -929,16 +925,16 @@ var WorkerProvisioner = {
       "\n" +
       "# Retry loop (up to 5 attempts, 100ms delay) to wait for tmp_file to be visible on guest\n" +
       "attempts=0\n" +
-      "while [ ! -f \"\$tmp_file\" ] && [ \$attempts -lt 5 ]; do\n" +
-      "  echo \"[EXEC_PREFLIGHT] Waiting for \$tmp_file to appear...\" > /dev/ttyS0\n" +
+      "while [ ! -f \"$tmp_file\" ] && [ $attempts -lt 5 ]; do\n" +
+      "  echo \"[EXEC_PREFLIGHT] Waiting for $tmp_file to appear...\" > /dev/ttyS0\n" +
       "  sync\n" +
       "  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "  sleep 1 2>/dev/null || sleep 1\n" +
-      "  attempts=\$((attempts + 1))\n" +
+      "  attempts=$((attempts + 1))\n" +
       "done\n" +
       "\n" +
       "# 1. verify parent directory first\n" +
-      "if [ -d /root/.provision ] && [ -d \"\$m/root/.provision\" ]; then\n" +
+      "if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
       "  # 2. verify inode existence second using stat & ls -li\n" +
       "  if ! stat \"$tmp_file\" >/dev/null 2>&1; then\n" +
       "    echo \"[EXEC_PREFLIGHT] Error: Temporary script file $tmp_file not found via stat\" > /dev/ttyS0\n" +
@@ -1653,21 +1649,16 @@ self.onmessage = async function (e) {
           "stty -echo\n" +
           "echo '<<<STAGE:BOOT_OK>>>' > /dev/ttyS0\n" +
           "echo '<<<STAGE:MOUNT_START>>>' > /dev/ttyS0\n" +
-          "m=\$(mount | grep host9p | head -n 1 | cut -d' ' -f3)\n" +
-          "if [ -z \"\$m\" ]; then\n" +
-          "  mkdir -p /mnt/9p >/dev/null 2>&1\n" +
-          "  if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-          "     mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-          "     mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-          "     mount -t 9p host9p /mnt/9p 2>/dev/null; then\n" +
-          "    m=\"/mnt/9p\"\n" +
-          "  fi\n" +
+          "mkdir -p /mnt/9p >/dev/null 2>&1\n" +
+          "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
+          "  mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+          "  mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+          "  mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+          "  mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
           "fi\n" +
           "sync\n" +
           "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
-          "if [ -n \"\$m\" ]; then\n" +
-          "  rm -rf /root/.provision && ln -s \"\$m/root/.provision\" /root/.provision\n" +
-          "fi\n" +
+          "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
           "sync\n" +
           "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
           "if [ -d /root/.provision ]; then\n" +
@@ -1761,10 +1752,9 @@ self.onmessage = async function (e) {
           "echo '=== GUEST DIAGNOSTICS ==='\n" +
           "pwd\n" +
           "mount\n" +
-          "m=\$(mount | grep host9p | head -n 1 | cut -d' ' -f3)\n" +
-          "if [ -z \"\$m\" ]; then m=\"/mnt/9p\"; fi\n" +
-          "ls \"\$m\" 2>/dev/null\n" +
-          "ls \"\$m/root\" 2>/dev/null\n" +
+          "ls /mnt\n" +
+          "ls /mnt/9p 2>/dev/null\n" +
+          "ls /mnt/9p/root 2>/dev/null\n" +
           "ls -l /root/.provision 2>/dev/null\n" +
           "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
           "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
@@ -2157,10 +2147,9 @@ async function checkAndInitializeFs9p() {
       "echo '=== GUEST DIAGNOSTICS ==='\n" +
       "pwd\n" +
       "mount\n" +
-      "m=\$(mount | grep host9p | head -n 1 | cut -d' ' -f3)\n" +
-      "if [ -z \"\$m\" ]; then m=\"/mnt/9p\"; fi\n" +
-      "ls \"\$m\" 2>/dev/null\n" +
-      "ls \"\$m/root\" 2>/dev/null\n" +
+      "ls /mnt\n" +
+      "ls /mnt/9p 2>/dev/null\n" +
+      "ls /mnt/9p/root 2>/dev/null\n" +
       "ls -l /root/.provision 2>/dev/null\n" +
       "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
       "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
@@ -2243,21 +2232,16 @@ async function checkAndInitializeFs9p() {
       "stty -echo\n" +
       "echo '<<<STAGE:BOOT_OK>>>' > /dev/ttyS0\n" +
       "echo '<<<STAGE:MOUNT_START>>>' > /dev/ttyS0\n" +
-      "m=\$(mount | grep host9p | head -n 1 | cut -d' ' -f3)\n" +
-      "if [ -z \"\$m\" ]; then\n" +
-      "  mkdir -p /mnt/9p >/dev/null 2>&1\n" +
-      "  if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-      "     mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-      "     mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
-      "     mount -t 9p host9p /mnt/9p 2>/dev/null; then\n" +
-      "    m=\"/mnt/9p\"\n" +
-      "  fi\n" +
+      "mkdir -p /mnt/9p >/dev/null 2>&1\n" +
+      "if ! grep -q host9p /proc/mounts 2>/dev/null; then\n" +
+      "  mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p -o trans=virtio,cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p -o cache=none,msize=1048576,access=any host9p /mnt/9p 2>/dev/null ||\n" +
+      "  mount -t 9p host9p /mnt/9p 2>/dev/null\n" +
       "fi\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
-      "if [ -n \"\$m\" ]; then\n" +
-      "  rm -rf /root/.provision && ln -s \"\$m/root/.provision\" /root/.provision\n" +
-      "fi\n" +
+      "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "if [ -d /root/.provision ]; then\n" +
