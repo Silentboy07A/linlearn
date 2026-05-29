@@ -203,6 +203,7 @@ export class VMController {
   private receivedSerialReady = false;
   private hasSeenPrompt = false;
   private pendingInitStage = false;
+  private rawLineBuffer = "";
 
   // ─── Deferred Input Queue ─────────────────────────────────────────────────
   // Programmatic serial inputs arriving before FSM reaches "interactive" are
@@ -1028,26 +1029,37 @@ export class VMController {
   private handleSerialLifecycle(char: string): void {
     if (this.provisioning.getState() === "completed") return;
 
+    // Buffer and log raw serial chunks line by line
+    this.rawLineBuffer += char;
+    if (char === "\n" || this.rawLineBuffer.length > 256) {
+      Logger.debug("VM", `[SERIAL_RAW_CHUNK] Raw chunk: ${JSON.stringify(this.rawLineBuffer)}`);
+      this.rawLineBuffer = "";
+    }
+
     this.provisioningSearchBuffer += char;
     if (this.provisioningSearchBuffer.length > 512) {
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.substring(this.provisioningSearchBuffer.length - 512);
     }
 
     if (this.provisioningSearchBuffer.includes("<<<PRE_EXEC_FILE_CHECK>>>")) {
+      Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches PRE_EXEC_FILE_CHECK");
       Logger.info("VM", "[TELEMETRY] PRE_EXEC_FILE_CHECK: Starting guest-side filesystem checks before execution.");
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<PRE_EXEC_FILE_CHECK>>>", "");
     }
     if (this.provisioningSearchBuffer.includes("<<<PRE_EXEC_FILE_EXISTS>>>")) {
+      Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches PRE_EXEC_FILE_EXISTS");
       Logger.info("VM", "[TELEMETRY] PRE_EXEC_FILE_EXISTS: Verified guest-side readability/existence of mount_prepare.sh.");
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<PRE_EXEC_FILE_EXISTS>>>", "");
     }
     if (this.provisioningSearchBuffer.includes("<<<PRE_EXEC_FILE_MISSING>>>")) {
+      Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches PRE_EXEC_FILE_MISSING");
       Logger.error("VM", "[TELEMETRY] PRE_EXEC_FILE_MISSING: mount_prepare.sh not found inside guest VFS!");
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<PRE_EXEC_FILE_MISSING>>>", "");
     }
 
     // Guest-side existence check markers (from _pollGuestFileExists)
     if (this._guestExistsMarker && this.provisioningSearchBuffer.includes(this._guestExistsMarker)) {
+      Logger.info("VM", `[SERIAL_PARSED_MATCH] Matches guestExistsMarker: ${this._guestExistsMarker}`);
       Logger.info("VM", "[GUEST_FILE_EXISTS] Guest-side existence check confirmed file is visible.");
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace(this._guestExistsMarker, "");
       this.timeouts.cancel("guest_file_poll");
@@ -1059,12 +1071,14 @@ export class VMController {
       return;
     }
     if (this._guestExistsMarker && (this.provisioningSearchBuffer.includes("<<<GF_MISS>>>") || this.provisioningSearchBuffer.includes("GF_MISS"))) {
+      Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches GF_MISS");
       Logger.warn("VM", "[GUEST_FILE_MISSING] Guest-side existence check reports file NOT found.");
       this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GF_MISS>>>", "").replace("GF_MISS", "");
       // Don't act immediately — the retry timer in _pollGuestFileExists will handle it
     }
 
-    if (this.isVerifyingVisibility && (this.provisioningSearchBuffer.includes("<<<PROVISION_FILES_VISIBLE>>>") || this.provisioningSearchBuffer.includes("PROVISION_FILES_VISIBLE"))) {
+    if (this.isVerifyingVisibility && (this.provisioningSearchBuffer.includes("<<<PROVISION_FILES_VISIBLE>>>") || this.provisioningSearchBuffer.includes("PROV_FILES_VISIBLE"))) {
+      Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches PROV_FILES_VISIBLE");
       Logger.info("VM", `[PROVISIONING WATCHDOG] Visibility confirmed for ${this.verifyingFilePath} (STAGE:PROVISION_FILES_VISIBLE).`);
       this.isVerifyingVisibility = false;
       if (this.fileVisibilityTimer) {
@@ -1124,6 +1138,7 @@ export class VMController {
     if (this.lifecycle.getState().state === "interactive") {
       if (this.provisioningSearchBuffer.includes("<<<V_OK>>>")) {
         this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<V_OK>>>", "");
+        Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches V_OK");
         Logger.info("VM", "[VERIFY_SCRIPT_VISIBLE] verify_mount.sh is confirmed visible and readable on guest.");
         
         // Execute verify_mount.sh using a single short, atomic command (35 bytes, well under 128 transport limit)
@@ -1133,6 +1148,7 @@ export class VMController {
 
       if (this.provisioningSearchBuffer.includes("<<<V_ERR>>>")) {
         this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<V_ERR>>>", "");
+        Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches V_ERR");
         Logger.error("VM", "[VERIFY_SCRIPT_CREATE_FAILURE] verify_mount.sh visibility check failed on guest (missing, empty, or unreadable)!");
         
         this.timeouts.cancel("mount_stabilization_watchdog");
@@ -1143,6 +1159,7 @@ export class VMController {
 
       if (this.provisioningSearchBuffer.includes("<<<GUEST_MOUNT_PREPARE_VERIFIED>>>")) {
         this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GUEST_MOUNT_PREPARE_VERIFIED>>>", "");
+        Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches GUEST_MOUNT_PREPARE_VERIFIED");
 
         // Guest confirmed mount_prepare.sh is visible and readable
         Logger.info("VM", `[GUEST_FILE_EXISTS] Guest verified mount_prepare.sh is present and readable.`);
@@ -1159,6 +1176,7 @@ export class VMController {
 
       if (this.provisioningSearchBuffer.includes("<<<GUEST_MOUNT_PREPARE_FAILED>>>")) {
         this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GUEST_MOUNT_PREPARE_FAILED>>>", "");
+        Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches GUEST_MOUNT_PREPARE_FAILED");
 
         Logger.error("VM", `[GUEST_FILE_MISSING] Guest reports mount_prepare.sh is NOT visible or NOT readable.`);
         console.log(`[PROVISIONING_VERIFICATION] Actual file existence: false`);
@@ -1170,6 +1188,7 @@ export class VMController {
       }
 
       if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_OK>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
+        Logger.info("VM", "[SERIAL_PARSED_MATCH] Matches STAGE:MOUNT_OK or MOUNT_STABILIZED");
         this.timeouts.cancel("mount_stabilization_watchdog");
         Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
         this.provisioningExecutionCompleted = true;
@@ -1212,6 +1231,7 @@ export class VMController {
         this.provisioningSearchBuffer.includes("[EXECUTION FAILURE]") ||
         this.provisioningSearchBuffer.includes("[GUEST_STALE_DENTRY_RECOVER_FAIL]")
       ) {
+        Logger.info("VM", `[SERIAL_PARSED_MATCH] Matches STAGE:MOUNT_FAIL, MOUNT_FAILED, EXECUTION FAILURE, or GUEST_STALE_DENTRY_RECOVER_FAIL`);
         this.timeouts.cancel("mount_stabilization_watchdog");
         this.provisionExecutionInFlight = false; // Release lock!
         Logger.error("VM", `[PROVISIONING] Guest filesystem mount or wrapper execution failed. Buffer: ${this.provisioningSearchBuffer}`);
@@ -2232,7 +2252,8 @@ export class VMController {
     this._guestPollMaxRetries = maxRetries;
     // Short marker — keep total probe command under 100 bytes and avoid "<<<" to satisfy transport constraints
     const ts = Date.now() % 100000; // 5 digits max
-    this._guestExistsMarker = `GF_OK_${ts}`;
+    const marker = `GF_OK_${ts}`;
+    this._guestExistsMarker = marker;
     this._guestExistsCallback = onExists;
     this._guestMissingCallback = onMissing;
 
@@ -2253,8 +2274,10 @@ export class VMController {
 
       // Probe: test -f PATH && echo MARKER > /dev/ttyS0
       // Split into two commands to stay under limit
-      const testCmd = `test -f ${path} && echo '${this._guestExistsMarker}'>/dev/ttyS0\n`;
-      const missCmd = `test -f ${path} || echo 'GF_MISS'>/dev/ttyS0\n`;
+      // Quote-split the marker command to bypass shell command echo false positives
+      const splitMarker = marker.substring(0, 2) + "'" + marker.substring(2, 3) + "'" + marker.substring(3);
+      const testCmd = `test -f ${path} && echo ${splitMarker}>/dev/ttyS0\n`;
+      const missCmd = `test -f ${path} || echo GF'_'MISS>/dev/ttyS0\n`;
 
       if (testCmd.length > VMController.SERIAL_CMD_LIMIT || missCmd.length > VMController.SERIAL_CMD_LIMIT) {
         Logger.error("VM", `[TRANSPORT_LIMIT_EXCEEDED] probe cmd too long: test=${testCmd.length}, miss=${missCmd.length}`);
@@ -2297,15 +2320,16 @@ export class VMController {
 
     // Check if file exists at 9p native path, then execute or fail
     // Split into two separate commands for clarity and limit safety
+    // Quote-split to bypass command echo false positives
     const mp = "/mnt/9p/root/.provision/mount_prepare.sh";
     this._sendChecked(
       `test -f ${mp} && sh ${mp}\n`,
       "fb_test_exec"
     );  // 73 bytes
     this._sendChecked(
-      `test -f ${mp} || echo 'STAGE:MOUNT_FAIL'>/dev/ttyS0\n`,
+      `test -f ${mp} || echo STAGE':'MOUNT'_'FAIL>/dev/ttyS0\n`,
       "fb_test_fail"
-    );  // 68 bytes
+    );  // 63 bytes
   }
 
   /**
@@ -2469,7 +2493,8 @@ export class VMController {
     }
     Logger.info("VM", `[PROVISIONING WATCHDOG] Polling guest visibility for ${this.verifyingFilePath} (attempt ${this.fileVisibilityRetries})...`);
     void this.sendProgrammaticInput(0, "sync\n");
-    const checkCmd = `[ -f "${this.verifyingFilePath}" ] && echo 'PROVISION_FILES_VISIBLE'\n`;
+    // Quote-split to bypass command echo false positives
+    const checkCmd = `[ -f "${this.verifyingFilePath}" ] && echo PROV'_'FILES'_'VISIBLE\n`;
     void this.sendProgrammaticInput(0, checkCmd);
     const delay = Math.min(1000 + (this.fileVisibilityRetries * 250), 3000);
     this.fileVisibilityTimer = setTimeout(() => {
