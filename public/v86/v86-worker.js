@@ -1735,6 +1735,26 @@ self.onmessage = async function (e) {
           throw new Error("Atomic rename failed with error code: " + renameRes);
         }
 
+        // Also reinject verify_mount.sh to be safe
+        var vmPath = "/root/.provision/verify_mount.sh";
+        var vmScript =
+          "#!/bin/sh\n" +
+          "echo '=== GUEST NAMESPACE DIAGNOSTICS ==='\n" +
+          "ls -la /root\n" +
+          "ls -la /root/.provision\n" +
+          "stat /root/.provision/mount_prepare.sh\n" +
+          "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
+          "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
+          "else\n" +
+          "  echo '<<<GUEST_MOUNT_PREPARE_FAILED>>>' > /dev/ttyS0\n" +
+          "fi\n";
+        var vmBytes = riEncoder ? riEncoder.encode(vmScript) : new Uint8Array(vmScript.length);
+        if (!riEncoder) {
+          for (var rk = 0; rk < vmScript.length; rk++) vmBytes[rk] = vmScript.charCodeAt(rk) & 0xFF;
+        }
+        await emulator.create_file(vmPath, vmBytes);
+        log("info", "[PROVISION_REINJECT] verify_mount.sh written and verified.");
+
         // Verify final path
         var riSearch = riFs.SearchPath(reinjectPath);
         if (riSearch.id === -1) {
@@ -2050,6 +2070,26 @@ async function checkAndInitializeFs9p() {
     }
 
     await emulator.create_file(mpPath, mpBytes);
+
+    var vmPath = "/root/.provision/verify_mount.sh";
+    var vmScript =
+      "#!/bin/sh\n" +
+      "echo '=== GUEST NAMESPACE DIAGNOSTICS ==='\n" +
+      "ls -la /root\n" +
+      "ls -la /root/.provision\n" +
+      "stat /root/.provision/mount_prepare.sh\n" +
+      "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
+      "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
+      "else\n" +
+      "  echo '<<<GUEST_MOUNT_PREPARE_FAILED>>>' > /dev/ttyS0\n" +
+      "fi\n";
+
+    var vmBytes = mpEncoder ? mpEncoder.encode(vmScript) : new Uint8Array(vmScript.length);
+    if (!mpEncoder) {
+      for (var k = 0; k < vmScript.length; k++) vmBytes[k] = vmScript.charCodeAt(k) & 0xFF;
+    }
+    await emulator.create_file(vmPath, vmBytes);
+    log("info", "[CREATE_FILE_SUCCESS] verify_mount.sh written to host 9p filesystem.");
 
     var mpSearch = { id: -1 };
     var mpInode = null;

@@ -1871,13 +1871,20 @@ export class VMController {
     const cleanTrimmed = trimmed.endsWith("\r") ? trimmed.slice(0, -1) : trimmed;
 
     if (data.length > MAX_SERIAL_PAYLOAD) {
+      const payload_length = data.length;
+      const max_allowed_length = MAX_SERIAL_PAYLOAD;
+      const overflow_amount = payload_length - max_allowed_length;
       const payloadBytes = new TextEncoder().encode(data).length;
-      Logger.error("VM", `[TRANSPORT REJECTION] Command too large. command length: ${data.length}, max allowed length: ${MAX_SERIAL_PAYLOAD}, rejected payload size: ${payloadBytes}`);
-      console.log(`[TRANSPORT REJECTION] Command too large. command length: ${data.length}, max allowed length: ${MAX_SERIAL_PAYLOAD}, rejected payload size: ${payloadBytes}`);
+      
+      Logger.error("VM", `[TRANSPORT GUARD] Oversized command aborted! payload_length: ${payload_length}, max_allowed_length: ${max_allowed_length}, overflow_amount: ${overflow_amount}, rejected payload size: ${payloadBytes} bytes`);
+      console.error(`[TRANSPORT GUARD] Oversized command aborted! payload_length: ${payload_length}, max_allowed_length: ${max_allowed_length}, overflow_amount: ${overflow_amount}, rejected payload size: ${payloadBytes} bytes`);
+      console.error(`[TRANSPORT GUARD] Call stack:\n${SERIAL_PROVISIONING_COMMAND_TOO_LARGE.stack}`);
+      console.error(`[TRANSPORT GUARD] Offending payload: ${JSON.stringify(data)}`);
+      
       this.transport.post("SERIAL_FRAGMENTATION_DETECTED", {
         reason: "SERIAL_PROVISIONING_COMMAND_TOO_LARGE",
-        length: data.length,
-        payload: data.slice(0, MAX_SERIAL_PAYLOAD)
+        length: payload_length,
+        payload: data.slice(0, max_allowed_length)
       });
       throw SERIAL_PROVISIONING_COMMAND_TOO_LARGE;
     }
@@ -2114,14 +2121,8 @@ export class VMController {
     this.provisioningExecutionStarted = true;
     this.provisionExecutionInFlight = true;
 
-    // Log the file structures immediately before verification/execution
-    void this.sendProgrammaticInput(0, "ls -la /root\n");
-    void this.sendProgrammaticInput(0, "ls -la /root/.provision\n");
-
-    // Perform guest-side namespace and file visibility verification under 128-byte limit
-    void this.sendProgrammaticInput(0, "p=/root/.provision/mount_prepare.sh\n");
-    void this.sendProgrammaticInput(0, "stat $p\n");
-    void this.sendProgrammaticInput(0, "test -f $p && test -r $p && stat $p && echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' || echo '<<<GUEST_MOUNT_PREPARE_FAILED>>>'\n");
+    // Execute verify_mount.sh using a single short, atomic command (completely avoiding any transport limits)
+    void this.sendProgrammaticInput(0, "sh /root/.provision/verify_mount.sh\n");
   }
 
   /**
