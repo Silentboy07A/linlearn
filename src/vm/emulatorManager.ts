@@ -1096,6 +1096,56 @@ export class VMController {
 
     // Check for mount stabilization markers during interactive state
     if (this.lifecycle.getState().state === "interactive") {
+      if (this.provisioningSearchBuffer.includes("<<<GUEST_MOUNT_PREPARE_VERIFIED>>>")) {
+        this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GUEST_MOUNT_PREPARE_VERIFIED>>>", "");
+
+        const statIndex = this.serialHistory.lastIndexOf("stat ");
+        let statOutput = "unknown";
+        if (statIndex !== -1) {
+          const afterStat = this.serialHistory.substring(statIndex);
+          statOutput = afterStat.split("\n").slice(1, 6).join("\n").trim();
+        }
+
+        console.log(`[PROVISIONING_VERIFICATION] Verified path: /root/.provision/mount_prepare.sh`);
+        console.log(`[PROVISIONING_VERIFICATION] Execution path: /root/.provision/mount_prepare.sh`);
+        console.log(`[PROVISIONING_VERIFICATION] Actual file existence: true`);
+        console.log(`[PROVISIONING_VERIFICATION] Actual stat output:\n${statOutput}`);
+
+        Logger.info("VM", `[PROVISIONING_VERIFICATION] Path verified: /root/.provision/mount_prepare.sh | Execution path: /root/.provision/mount_prepare.sh | Existence: true | Stat:\n${statOutput}`);
+
+        // Now run the actual script execution!
+        const wrapperCmd = `sh /root/.provision/mount_prepare.sh\n`;
+        const payloadBytes = new TextEncoder().encode(wrapperCmd).length;
+        console.log(`[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
+        Logger.info("VM", `[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
+
+        void this.sendProgrammaticInput(0, wrapperCmd);
+        return;
+      }
+
+      if (this.provisioningSearchBuffer.includes("<<<GUEST_MOUNT_PREPARE_FAILED>>>")) {
+        this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GUEST_MOUNT_PREPARE_FAILED>>>", "");
+
+        const statIndex = this.serialHistory.lastIndexOf("stat ");
+        let statOutput = "unknown";
+        if (statIndex !== -1) {
+          const afterStat = this.serialHistory.substring(statIndex);
+          statOutput = afterStat.split("\n").slice(1, 6).join("\n").trim();
+        }
+
+        console.log(`[PROVISIONING_VERIFICATION] Verified path: /root/.provision/mount_prepare.sh`);
+        console.log(`[PROVISIONING_VERIFICATION] Execution path: /root/.provision/mount_prepare.sh`);
+        console.log(`[PROVISIONING_VERIFICATION] Actual file existence: false`);
+        console.log(`[PROVISIONING_VERIFICATION] Actual stat output:\n${statOutput}`);
+
+        Logger.error("VM", `[PROVISIONING_VERIFICATION] Namespace check failed. Path: /root/.provision/mount_prepare.sh | Existence: false | Stat:\n${statOutput}`);
+
+        this.timeouts.cancel("mount_stabilization_watchdog");
+        this.provisionExecutionInFlight = false;
+        this.orchestrator.triggerRecovery("mount_prepare.sh visibility check failed on guest");
+        return;
+      }
+
       if (this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_OK>>>") || this.provisioningSearchBuffer.includes("<<<MOUNT_STABILIZED>>>")) {
         this.timeouts.cancel("mount_stabilization_watchdog");
         Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
@@ -2057,6 +2107,33 @@ export class VMController {
    *   2. Otherwise register a pending callback fired by the message handler.
    *   3. A 10-second timeout guard triggers PROVISIONING_REINJECTION on failure.
    */
+  private verifyAndExecuteMountScript(): void {
+    const inodeIdStr = this.verifiedInodeId !== null ? this.verifiedInodeId.toString() : "";
+    Logger.info("VM", `[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Verified inode ID: ${inodeIdStr}. Initiating guest-side namespace verification.`);
+
+    this.provisioningExecutionStarted = true;
+    this.provisionExecutionInFlight = true;
+
+    // Log the file structures immediately before verification/execution
+    void this.sendProgrammaticInput(0, "ls -la /root\n");
+    void this.sendProgrammaticInput(0, "ls -la /root/.provision\n");
+
+    // Perform guest-side namespace and file visibility verification under 128-byte limit
+    void this.sendProgrammaticInput(0, "p=/root/.provision/mount_prepare.sh\n");
+    void this.sendProgrammaticInput(0, "stat $p\n");
+    void this.sendProgrammaticInput(0, "test -f $p && test -r $p && stat $p && echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' || echo '<<<GUEST_MOUNT_PREPARE_FAILED>>>'\n");
+  }
+
+  /**
+   * Wait for FILE_MATERIALIZATION_VERIFIED from the worker, then execute mount_prepare.sh.
+   *
+   * Replaces the old serial-echo visibility poll (startFileVisibilityVerification).
+   *
+   * Flow:
+   *   1. If FILE_MATERIALIZATION_VERIFIED already arrived (mountPrepareVerified), proceed immediately.
+   *   2. Otherwise register a pending callback fired by the message handler.
+   *   3. A 10-second timeout guard triggers PROVISIONING_REINJECTION on failure.
+   */
   private _waitForMaterializationThenMount(): void {
     if (this.isProvisioningAttemptStarted) {
       Logger.warn("VM", "[PROVISIONING] Provisioning attempt already in progress. Ignoring duplicate trigger.");
@@ -2065,20 +2142,7 @@ export class VMController {
     this.isProvisioningAttemptStarted = true;
 
     const executeMountScript = () => {
-      const inodeIdStr = this.verifiedInodeId !== null ? this.verifiedInodeId.toString() : "";
-      Logger.info("VM", `[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Verified inode ID: ${inodeIdStr}. Executing mount_prepare.sh in guest.`);
-      
-      this.provisioningExecutionStarted = true;
-      this.provisionExecutionInFlight = true;
-
-      // Executing the mounting prepare script directly, trusting FILE_MATERIALIZATION_VERIFIED.
-      // All guest-side mounting validation has been moved inside mount_prepare.sh.
-      const wrapperCmd = `sh /root/.provision/mount_prepare.sh\n`;
-      const payloadBytes = new TextEncoder().encode(wrapperCmd).length;
-      console.log(`[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
-      Logger.info("VM", `[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
-
-      void this.sendProgrammaticInput(0, wrapperCmd);
+      this.verifyAndExecuteMountScript();
 
       this.timeouts.register("mount_stabilization_watchdog", 15000, () => {
         if (!this.provisioningExecutionStarted) {
@@ -2174,12 +2238,8 @@ export class VMController {
     this.transport.post("PROVISION_REINJECT", { path: "/root/.provision/mount_prepare.sh" });
 
     this.pendingMaterializationVerified = () => {
-      Logger.info("VM", "[PROVISIONING] File reinjection confirmed. Re-executing mount_prepare.sh.");
-      const wrapperCmd = "sh /root/.provision/mount_prepare.sh\n";
-      const payloadBytes = new TextEncoder().encode(wrapperCmd).length;
-      console.log(`[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
-      Logger.info("VM", `[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
-      void this.sendProgrammaticInput(0, wrapperCmd);
+      Logger.info("VM", "[PROVISIONING] File reinjection confirmed. Verifying mount_prepare.sh visibility on guest.");
+      this.verifyAndExecuteMountScript();
       this.timeouts.register("mount_stabilization_watchdog", 20000, () => {
         Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired after reinject. Escalating to generic recovery.");
         this.orchestrator.triggerRecovery("file reinject mount stabilization timeout");
