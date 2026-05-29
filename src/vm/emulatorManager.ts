@@ -1096,6 +1096,25 @@ export class VMController {
 
     // Check for mount stabilization markers during interactive state
     if (this.lifecycle.getState().state === "interactive") {
+      if (this.provisioningSearchBuffer.includes("<<<V_OK>>>")) {
+        this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<V_OK>>>", "");
+        Logger.info("VM", "[VERIFY_SCRIPT_VISIBLE] verify_mount.sh is confirmed visible and readable on guest.");
+        
+        // Execute verify_mount.sh using a single short, atomic command (35 bytes, well under 128 transport limit)
+        void this.sendProgrammaticInput(0, "sh /root/.provision/verify_mount.sh\n");
+        return;
+      }
+
+      if (this.provisioningSearchBuffer.includes("<<<V_ERR>>>")) {
+        this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<V_ERR>>>", "");
+        Logger.error("VM", "[VERIFY_SCRIPT_CREATE_FAILURE] verify_mount.sh visibility check failed on guest (missing, empty, or unreadable)!");
+        
+        this.timeouts.cancel("mount_stabilization_watchdog");
+        this.provisionExecutionInFlight = false;
+        this.orchestrator.triggerRecovery("verify_mount.sh visibility check failed on guest");
+        return;
+      }
+
       if (this.provisioningSearchBuffer.includes("<<<GUEST_MOUNT_PREPARE_VERIFIED>>>")) {
         this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GUEST_MOUNT_PREPARE_VERIFIED>>>", "");
 
@@ -2121,8 +2140,14 @@ export class VMController {
     this.provisioningExecutionStarted = true;
     this.provisionExecutionInFlight = true;
 
-    // Execute verify_mount.sh using a single short, atomic command (completely avoiding any transport limits)
-    void this.sendProgrammaticInput(0, "sh /root/.provision/verify_mount.sh\n");
+    // Log the file structures of /root/.provision immediately before verification
+    void this.sendProgrammaticInput(0, "ls -la /root/.provision\n");
+
+    // Force guest OS kernel to drop caches to avoid stale dentry cache reading
+    void this.sendProgrammaticInput(0, "sync; echo 3 > /proc/sys/vm/drop_caches\n");
+
+    // Perform guest-side visibility check for verify_mount.sh (under 128-byte limit)
+    void this.sendProgrammaticInput(0, "v=/root/.provision/verify_mount.sh; [ -s $v ] && [ -r $v ] && echo '<<<V_OK>>>' || echo '<<<V_ERR>>>'\n");
   }
 
   /**

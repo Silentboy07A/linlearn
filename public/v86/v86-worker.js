@@ -1752,8 +1752,34 @@ self.onmessage = async function (e) {
         if (!riEncoder) {
           for (var rk = 0; rk < vmScript.length; rk++) vmBytes[rk] = vmScript.charCodeAt(rk) & 0xFF;
         }
-        await emulator.create_file(vmPath, vmBytes);
-        log("info", "[PROVISION_REINJECT] verify_mount.sh written and verified.");
+        
+        log("info", "[VERIFY_SCRIPT_CREATE_BEGIN] REINJECT writing verify_mount.sh. path=" + vmPath);
+        try {
+          await emulator.create_file(vmPath, vmBytes);
+
+          // Verification loop
+          var vmSearch = { id: -1 };
+          var vmInode = null;
+          for (var vmAttempt = 1; vmAttempt <= 8; vmAttempt++) {
+            vmSearch = riFs.SearchPath(vmPath);
+            if (vmSearch.id !== -1) {
+              vmInode = riFs.GetInode(vmSearch.id);
+              if (vmInode && vmInode.size === vmBytes.length) break;
+            }
+            if (vmAttempt < 8) {
+              await new Promise(function(res) { setTimeout(res, 50); });
+            }
+          }
+
+          if (vmSearch.id === -1 || !vmInode || vmInode.size !== vmBytes.length) {
+            throw new Error("verify_mount.sh verification failed");
+          }
+
+          log("info", "[VERIFY_SCRIPT_CREATE_SUCCESS] REINJECT verify_mount.sh written and verified. inode=" + vmSearch.id);
+        } catch (vmErr) {
+          log("error", "[VERIFY_SCRIPT_CREATE_FAILURE] REINJECT failed for verify_mount.sh: " + vmErr);
+          throw vmErr;
+        }
 
         // Verify final path
         var riSearch = riFs.SearchPath(reinjectPath);
@@ -2088,8 +2114,35 @@ async function checkAndInitializeFs9p() {
     if (!mpEncoder) {
       for (var k = 0; k < vmScript.length; k++) vmBytes[k] = vmScript.charCodeAt(k) & 0xFF;
     }
-    await emulator.create_file(vmPath, vmBytes);
-    log("info", "[CREATE_FILE_SUCCESS] verify_mount.sh written to host 9p filesystem.");
+
+    log("info", "[VERIFY_SCRIPT_CREATE_BEGIN] Writing verify_mount.sh to host 9p filesystem. path=" + vmPath);
+    try {
+      await emulator.create_file(vmPath, vmBytes);
+      
+      // Verification loop
+      var vmSearch = { id: -1 };
+      var vmInode = null;
+      for (var vmAttempt = 1; vmAttempt <= mpMaxRetries; vmAttempt++) {
+        vmSearch = mpFs.SearchPath(vmPath);
+        if (vmSearch.id !== -1) {
+          vmInode = mpFs.GetInode(vmSearch.id);
+          if (vmInode && vmInode.size === vmBytes.length) break;
+        }
+        log("warn", "[VERIFY_SCRIPT_CREATE_BEGIN] Inode not yet stable for " + vmPath + " on attempt " + vmAttempt + ". Retrying...");
+        if (vmAttempt < mpMaxRetries) {
+          await new Promise(function(res) { setTimeout(res, mpRetryDelay); });
+        }
+      }
+
+      if (vmSearch.id === -1 || !vmInode || vmInode.size !== vmBytes.length) {
+        throw new Error("verify_mount.sh verification failed");
+      }
+
+      log("info", "[VERIFY_SCRIPT_CREATE_SUCCESS] verify_mount.sh written and verified. inode=" + vmSearch.id + ", size=" + vmInode.size);
+    } catch (vmErr) {
+      log("error", "[VERIFY_SCRIPT_CREATE_FAILURE] Failed to write verify_mount.sh: " + vmErr);
+      throw vmErr;
+    }
 
     var mpSearch = { id: -1 };
     var mpInode = null;
