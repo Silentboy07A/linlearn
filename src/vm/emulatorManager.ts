@@ -1813,21 +1813,38 @@ export class VMController {
    *   - No if/then/fi blocks
    */
   private assertSerialPayload(data: string): void {
+    const MAX_SERIAL_PAYLOAD = 128;
+    const SERIAL_PROVISIONING_COMMAND_TOO_LARGE = new Error("SERIAL_PROVISIONING_COMMAND_TOO_LARGE");
+
     // Strip trailing newlines/carriage returns for multiline checks
     const trimmed = data.endsWith("\n") ? data.slice(0, -1) : data;
     const cleanTrimmed = trimmed.endsWith("\r") ? trimmed.slice(0, -1) : trimmed;
 
-    if (
-      cleanTrimmed.includes('\n') ||
-      cleanTrimmed.includes('\r') ||
-      data.length > 128
-    ) {
+    if (data.length > MAX_SERIAL_PAYLOAD) {
+      const payloadBytes = new TextEncoder().encode(data).length;
+      Logger.error("VM", `[TRANSPORT REJECTION] Command too large. command length: ${data.length}, max allowed length: ${MAX_SERIAL_PAYLOAD}, rejected payload size: ${payloadBytes}`);
+      console.log(`[TRANSPORT REJECTION] Command too large. command length: ${data.length}, max allowed length: ${MAX_SERIAL_PAYLOAD}, rejected payload size: ${payloadBytes}`);
       this.transport.post("SERIAL_FRAGMENTATION_DETECTED", {
         reason: "SERIAL_PROVISIONING_COMMAND_TOO_LARGE",
         length: data.length,
-        payload: data.slice(0, 128)
+        payload: data.slice(0, MAX_SERIAL_PAYLOAD)
       });
-      throw new Error('SERIAL_PROVISIONING_COMMAND_TOO_LARGE');
+      throw SERIAL_PROVISIONING_COMMAND_TOO_LARGE;
+    }
+
+    if (
+      cleanTrimmed.includes('\n') ||
+      cleanTrimmed.includes('\r')
+    ) {
+      const payloadBytes = new TextEncoder().encode(data).length;
+      Logger.error("VM", `[TRANSPORT REJECTION] Command contains internal newlines/carriage returns. command length: ${data.length}, max allowed length: ${MAX_SERIAL_PAYLOAD}, rejected payload size: ${payloadBytes}`);
+      console.log(`[TRANSPORT REJECTION] Command contains internal newlines/carriage returns. command length: ${data.length}, max allowed length: ${MAX_SERIAL_PAYLOAD}, rejected payload size: ${payloadBytes}`);
+      this.transport.post("SERIAL_FRAGMENTATION_DETECTED", {
+        reason: "SERIAL_PROVISIONING_COMMAND_TOO_LARGE",
+        length: data.length,
+        payload: data.slice(0, MAX_SERIAL_PAYLOAD)
+      });
+      throw SERIAL_PROVISIONING_COMMAND_TOO_LARGE;
     }
 
     // 2. Additional Interactive Security Checks
@@ -2054,17 +2071,12 @@ export class VMController {
       this.provisioningExecutionStarted = true;
       this.provisionExecutionInFlight = true;
 
-      // Guest-side existence checks and telemetry before execution
-      void this.sendProgrammaticInput(0, "echo '<<<PRE_EXEC_FILE_CHECK>>>'\n");
-      void this.sendProgrammaticInput(0, "ls -l /root/.provision\n");
-      void this.sendProgrammaticInput(0, "ls -l /root/.provision/mount_prepare.sh\n");
-      void this.sendProgrammaticInput(0, "pwd\n");
-      void this.sendProgrammaticInput(0, "mount\n");
-      void this.sendProgrammaticInput(0, "[ -f /root/.provision/mount_prepare.sh ] && echo '<<<PRE_EXEC_FILE_EXISTS>>>' || echo '<<<PRE_EXEC_FILE_MISSING>>>'\n");
-
       // Executing the mounting prepare script directly, trusting FILE_MATERIALIZATION_VERIFIED.
       // All guest-side mounting validation has been moved inside mount_prepare.sh.
       const wrapperCmd = `sh /root/.provision/mount_prepare.sh\n`;
+      const payloadBytes = new TextEncoder().encode(wrapperCmd).length;
+      console.log(`[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
+      Logger.info("VM", `[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
 
       void this.sendProgrammaticInput(0, wrapperCmd);
 
@@ -2163,7 +2175,11 @@ export class VMController {
 
     this.pendingMaterializationVerified = () => {
       Logger.info("VM", "[PROVISIONING] File reinjection confirmed. Re-executing mount_prepare.sh.");
-      void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
+      const wrapperCmd = "sh /root/.provision/mount_prepare.sh\n";
+      const payloadBytes = new TextEncoder().encode(wrapperCmd).length;
+      console.log(`[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
+      Logger.info("VM", `[PROVISIONING_EXECUTION_PATH] command length: ${wrapperCmd.length}, payload bytes: ${payloadBytes}, transport limit: 128, execution path selected: ${wrapperCmd.trim()}`);
+      void this.sendProgrammaticInput(0, wrapperCmd);
       this.timeouts.register("mount_stabilization_watchdog", 20000, () => {
         Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired after reinject. Escalating to generic recovery.");
         this.orchestrator.triggerRecovery("file reinject mount stabilization timeout");
@@ -2208,7 +2224,8 @@ export class VMController {
       return;
     }
     Logger.info("VM", `[PROVISIONING WATCHDOG] Polling guest visibility for ${this.verifyingFilePath} (attempt ${this.fileVisibilityRetries})...`);
-    const checkCmd = `sync; echo 3 > /proc/sys/vm/drop_caches; [ -f "${this.verifyingFilePath}" ] && [ -s "${this.verifyingFilePath}" ] && [ -x "${this.verifyingFilePath}" ] && echo '<<<PROVISION_FILES_VISIBLE>>>'\n`;
+    void this.sendProgrammaticInput(0, "sync; echo 3 > /proc/sys/vm/drop_caches\n");
+    const checkCmd = `[ -f "${this.verifyingFilePath}" ] && echo '<<<PROVISION_FILES_VISIBLE>>>'\n`;
     void this.sendProgrammaticInput(0, checkCmd);
     const delay = Math.min(1000 + (this.fileVisibilityRetries * 250), 3000);
     this.fileVisibilityTimer = setTimeout(() => {
