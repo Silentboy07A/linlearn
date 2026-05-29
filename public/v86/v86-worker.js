@@ -1741,10 +1741,13 @@ self.onmessage = async function (e) {
         var vmPath = "/root/.provision/verify_mount.sh";
         var vmScript =
           "#!/bin/sh\n" +
-          "echo '=== GUEST NAMESPACE DIAGNOSTICS ==='\n" +
-          "ls -la /root\n" +
-          "ls -la /root/.provision\n" +
-          "stat /root/.provision/mount_prepare.sh\n" +
+          "echo '=== GUEST DIAGNOSTICS ==='\n" +
+          "pwd\n" +
+          "mount\n" +
+          "ls /mnt\n" +
+          "ls /mnt/9p 2>/dev/null\n" +
+          "ls /mnt/9p/root 2>/dev/null\n" +
+          "ls -l /root/.provision 2>/dev/null\n" +
           "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
           "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
           "else\n" +
@@ -2100,10 +2103,13 @@ async function checkAndInitializeFs9p() {
     var vmPath = "/root/.provision/verify_mount.sh";
     var vmScript =
       "#!/bin/sh\n" +
-      "echo '=== GUEST NAMESPACE DIAGNOSTICS ==='\n" +
-      "ls -la /root\n" +
-      "ls -la /root/.provision\n" +
-      "stat /root/.provision/mount_prepare.sh\n" +
+      "echo '=== GUEST DIAGNOSTICS ==='\n" +
+      "pwd\n" +
+      "mount\n" +
+      "ls /mnt\n" +
+      "ls /mnt/9p 2>/dev/null\n" +
+      "ls /mnt/9p/root 2>/dev/null\n" +
+      "ls -l /root/.provision 2>/dev/null\n" +
       "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
       "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
       "else\n" +
