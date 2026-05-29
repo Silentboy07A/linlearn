@@ -1686,6 +1686,7 @@ self.onmessage = async function (e) {
           var oldInode = riFs.GetInode(oldSearch.id);
           if (oldInode && oldInode.size === riBytes.length && (oldInode.mode & 292) !== 0) {
             log("info", "[PROVISION_REINJECT] file already verified with stable inode=" + oldSearch.id + ". Skipping reinjection.");
+            log("info", "[HOST_9P_TREE_DUMP]\n" + dumpHost9pTree(riFs));
             postToHost("FILE_MATERIALIZATION_VERIFIED", {
               path: reinjectPath,
               inodeId: oldSearch.id,
@@ -1829,6 +1830,7 @@ self.onmessage = async function (e) {
         }
 
         log("info", "[CREATE_FILE_SUCCESS] REINJECT " + reinjectPath + " verified via atomic mv. inode=" + riSearch.id + ", size=" + riInode.size + ", mtime=" + riInode.mtime);
+        log("info", "[HOST_9P_TREE_DUMP]\n" + dumpHost9pTree(riFs));
         postToHost("FILE_MATERIALIZATION_VERIFIED", {
           path: reinjectPath,
           inodeId: riSearch.id,
@@ -2061,6 +2063,38 @@ function teardownTimersAndCallbacks(emuInstance) {
   serialSendBuffer = [];
 }
 
+function dumpHost9pTree(fs) {
+  var results = [];
+  function walk(id, path) {
+    var inode = fs.GetInode(id);
+    if (!inode) return;
+    var modeStr = "mode=" + inode.mode.toString(8) + " ";
+    var typeStr = (inode.mode & 16384) ? "DIR" : (((inode.mode & 61440) === 40960) ? "SYMLINK" : "FILE");
+    var sizeStr = "size=" + inode.size + " ";
+    var symStr = inode.symlink ? ("-> " + inode.symlink) : "";
+    results.push(path + " (" + typeStr + ", " + modeStr + sizeStr + symStr + ")");
+    if (inode.direntries && (inode.mode & 16384)) {
+      var keys = [];
+      inode.direntries.forEach(function(val, key) {
+        keys.push(key);
+      });
+      for (var i = 0; i < keys.length; i++) {
+        var entry = keys[i];
+        if (entry !== "." && entry !== "..") {
+          var childId = inode.direntries.get(entry);
+          walk(childId, path + (path === "/" ? "" : "/") + entry);
+        }
+      }
+    }
+  }
+  try {
+    walk(0, "/");
+  } catch (err) {
+    results.push("Error walking tree: " + err.message);
+  }
+  return results.join("\n");
+}
+
 async function checkAndInitializeFs9p() {
   log("info", "[FS9P] Starting fs9p subsystem validation...");
   var retries = 5;
@@ -2248,6 +2282,7 @@ async function checkAndInitializeFs9p() {
 
     log("info", "[CREATE_FILE_SUCCESS] mount_prepare.sh written and verified. inode=" + mpSearch.id + ", size=" + mpInode.size + " bytes, mtime=" + mpInode.mtime + ", mode=" + mpInode.mode);
     log("info", "[HOST_FS_SYNC] mount_prepare.sh materialized in 9p inode table. Notifying host.");
+    log("info", "[HOST_9P_TREE_DUMP]\n" + dumpHost9pTree(mpFs));
 
     postToHost("FILE_MATERIALIZATION_VERIFIED", {
       path: mpPath,

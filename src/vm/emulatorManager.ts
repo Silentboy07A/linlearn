@@ -169,6 +169,7 @@ export class VMController {
   // visibility poll and fire this callback directly.
   private pendingMaterializationVerified: (() => void) | null = null;
   private pendingMaterializationFailed: (() => void) | null = null;
+  private hostMaterialized = false;
   private mountPrepareVerified = false;
   private isProvisioningAttemptStarted = false;
   private provisioningExecutionStarted = false;
@@ -580,6 +581,7 @@ export class VMController {
 
     this.provisioning.reset();
     this.provisioningSearchBuffer = "";
+    this.hostMaterialized = false;
     this.mountPrepareVerified = false;
     this.isProvisioningAttemptStarted = false;
     this.provisioningExecutionStarted = false;
@@ -924,7 +926,15 @@ export class VMController {
             this.verifiedInodeSize = matPayload.size;
             this.verifiedInodeReadability = matPayload.readability !== false;
 
-            this.mountPrepareVerified = true;
+            // Telemetry: HOST_* (Task 9)
+            Logger.info("VM", `[HOST_FILE_EXISTS] true`);
+            Logger.info("VM", `[HOST_FILE_SIZE] ${matPayload.size}`);
+            Logger.info("VM", `[HOST_FILE_PATH] ${matPayload.path}`);
+
+            this.hostMaterialized = true;
+            // Task 11: Remove FILE_MATERIALIZATION_VERIFIED success if guestVerified=false
+            this.mountPrepareVerified = matPayload.guestVerified || false;
+
             if (this.pendingMaterializationVerified) {
               const cb = this.pendingMaterializationVerified;
               this.pendingMaterializationVerified = null;
@@ -1193,6 +1203,7 @@ export class VMController {
         Logger.info("VM", "[PROVISIONING] Guest filesystem mount stabilized (STAGE:MOUNT_OK). Transitioning to provisioning state.");
         this.provisioningExecutionCompleted = true;
         this.provisionExecutionInFlight = false; // Release lock!
+        this.mountPrepareVerified = true;
         this.transitionState("provisioning", "handleSerialLifecycle");
         this.lifecycle.transitionTerminalTo("recovering", "handleSerialLifecycle");
 
@@ -2212,6 +2223,10 @@ export class VMController {
     this._sendChecked("ls /mnt/9p 2>/dev/null\n", "diag_ls_9p");         // 22 bytes
     this._sendChecked("ls /mnt/9p/root 2>/dev/null\n", "diag_ls_9p_root"); // 28 bytes
     this._sendChecked("ls -l /root/.provision 2>/dev/null\n", "diag_ls_prov"); // 34 bytes
+    // Tasks 5, 6, 7: Recursive directory lists under 100 bytes
+    this._sendChecked("ls -R /mnt/9p 2>/dev/null\n", "diag_ls_9p_r");         // 26 bytes
+    this._sendChecked("ls -R /mnt/9p/root 2>/dev/null\n", "diag_ls_9p_root_r"); // 31 bytes
+    this._sendChecked("ls -R /mnt/9p/root/.provision 2>/dev/null\n", "diag_ls_9p_prov_r"); // 42 bytes
 
     // PHASE 2: Guest-side existence check — try 9p native path first
     // /mnt/9p/root/.provision is the 9p-native path that doesn't need the symlink
@@ -2222,6 +2237,11 @@ export class VMController {
       300,  // initial delay ms
       () => {
         // File found at 9p-native path — run from there
+        Logger.info("VM", `[GUEST_FILE_EXISTS] true`);
+        Logger.info("VM", `[GUEST_FILE_SIZE] ${this.verifiedInodeSize}`);
+        Logger.info("VM", `[GUEST_FILE_PATH] /mnt/9p/root/.provision/mount_prepare.sh`);
+        this.mountPrepareVerified = true;
+
         Logger.info("VM", "[GUEST_FILE_EXISTS] Found at /mnt/9p path. Executing.");
         this._sendChecked(
           "sh /mnt/9p/root/.provision/mount_prepare.sh\n",
@@ -2230,6 +2250,10 @@ export class VMController {
       },
       () => {
         // Not at 9p path — try mounting 9p first, then execute
+        Logger.info("VM", `[GUEST_FILE_EXISTS] false`);
+        Logger.info("VM", `[GUEST_FILE_SIZE] unknown`);
+        Logger.info("VM", `[GUEST_FILE_PATH] /mnt/9p/root/.provision/mount_prepare.sh`);
+
         Logger.warn("VM", "[GUEST_FILE_MISSING] Not at /mnt/9p. Trying mount fallback.");
         this._tryDirectMountFallback();
       }
@@ -2271,6 +2295,12 @@ export class VMController {
       }
 
       Logger.info("VM", `[VERIFY_INODE] Guest poll ${this._guestPollAttempt}/${this._guestPollMaxRetries}`);
+
+      // Task 9 Telemetry on Guest side (each command under 100 bytes)
+      this._sendChecked(`p=${path}\n`, "p_assign");
+      this._sendChecked(`test -f $p && echo "GUEST_FILE_EXISTS: true" || echo "GUEST_FILE_EXISTS: false"\n`, "g_exists");
+      this._sendChecked(`test -f $p && echo "GUEST_FILE_SIZE: $(wc -c <$p)"\n`, "g_size");
+      this._sendChecked(`test -f $p && echo "GUEST_FILE_PATH: $p"\n`, "g_path");
 
       // Probe: test -f PATH && echo MARKER > /dev/ttyS0
       // Split into two commands to stay under limit
@@ -2318,10 +2348,16 @@ export class VMController {
     );  // 65 bytes
     this._sendChecked("ls /mnt/9p/root 2>/dev/null\n", "fb_ls_verify");    // 28 bytes
 
+    // Guest side telemetry fallback
+    const mp = "/mnt/9p/root/.provision/mount_prepare.sh";
+    this._sendChecked(`p=${mp}\n`, "fb_p_assign");
+    this._sendChecked(`test -f $p && echo "GUEST_FILE_EXISTS: true" || echo "GUEST_FILE_EXISTS: false"\n`, "fb_g_exists");
+    this._sendChecked(`test -f $p && echo "GUEST_FILE_SIZE: $(wc -c <$p)"\n`, "fb_g_size");
+    this._sendChecked(`test -f $p && echo "GUEST_FILE_PATH: $p"\n`, "fb_g_path");
+
     // Check if file exists at 9p native path, then execute or fail
     // Split into two separate commands for clarity and limit safety
     // Quote-split to bypass command echo false positives
-    const mp = "/mnt/9p/root/.provision/mount_prepare.sh";
     this._sendChecked(
       `test -f ${mp} && sh ${mp}\n`,
       "fb_test_exec"
@@ -2365,7 +2401,7 @@ export class VMController {
       });
     };
 
-    if (this.mountPrepareVerified) {
+    if (this.hostMaterialized || this.mountPrepareVerified) {
       Logger.info("VM", "[PROVISIONING] mount_prepare.sh already materialized (fast path). Executing immediately.");
       executeMountScript();
       return;
