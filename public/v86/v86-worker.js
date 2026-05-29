@@ -1735,7 +1735,7 @@ self.onmessage = async function (e) {
           throw new Error("Atomic rename failed with error code: " + renameRes);
         }
 
-        // Also reinject verify_mount.sh to be safe
+        // Phase 1: create & verify verify_mount.sh during reinject
         var vmPath = "/root/.provision/verify_mount.sh";
         var vmScript =
           "#!/bin/sh\n" +
@@ -1756,29 +1756,61 @@ self.onmessage = async function (e) {
         log("info", "[VERIFY_SCRIPT_CREATE_BEGIN] REINJECT writing verify_mount.sh. path=" + vmPath);
         try {
           await emulator.create_file(vmPath, vmBytes);
+          log("info", "[VERIFY_SCRIPT_CREATE_SUCCESS] REINJECT verify_mount.sh written. Contents: " + JSON.stringify(vmScript));
 
-          // Verification loop
+          log("info", "[VERIFY_SCRIPT_VERIFY_BEGIN] REINJECT starting host-side verification loop for verify_mount.sh. Criteria: 1. Existence check (SearchPath.id !== -1); 2. Size check (inode.size === " + vmBytes.length + "); 3. Readback check (read back contents === expected contents)");
+          
           var vmSearch = { id: -1 };
           var vmInode = null;
-          for (var vmAttempt = 1; vmAttempt <= 8; vmAttempt++) {
+          var readbackMatch = false;
+
+          for (var vmAttempt = 1; vmAttempt <= 5; vmAttempt++) {
             vmSearch = riFs.SearchPath(vmPath);
             if (vmSearch.id !== -1) {
               vmInode = riFs.GetInode(vmSearch.id);
-              if (vmInode && vmInode.size === vmBytes.length) break;
+              if (vmInode && vmInode.size === vmBytes.length) {
+                // Readback check
+                var readbackData = await riFs.Read(vmSearch.id, 0, vmInode.size);
+                var readbackStr = "";
+                if (readbackData) {
+                  readbackStr = typeof TextDecoder !== "undefined"
+                    ? new TextDecoder().decode(readbackData)
+                    : String.fromCharCode.apply(null, readbackData);
+                }
+                if (readbackStr === vmScript) {
+                  readbackMatch = true;
+                  break;
+                }
+              }
             }
-            if (vmAttempt < 8) {
-              await new Promise(function(res) { setTimeout(res, 50); });
+            log("warn", "[VERIFY_SCRIPT_VERIFY_BEGIN] REINJECT Inode or content not yet stable for " + vmPath + " on attempt " + vmAttempt + ". Retrying...");
+            if (vmAttempt < 5) {
+              await new Promise(function(res) { setTimeout(res, 500); });
             }
           }
 
-          if (vmSearch.id === -1 || !vmInode || vmInode.size !== vmBytes.length) {
-            throw new Error("verify_mount.sh verification failed");
+          if (vmSearch.id === -1 || !vmInode || vmInode.size !== vmBytes.length || !readbackMatch) {
+            log("error", "[VERIFY_SCRIPT_VERIFY_FAILURE] REINJECT verify_mount.sh verification failed. Expected size: " + vmBytes.length + ", actual size: " + (vmInode ? vmInode.size : "null"));
+            
+            // Dump full file metadata if exists
+            if (vmSearch.id !== -1) {
+              var debugInode = riFs.GetInode(vmSearch.id);
+              var fileData = await riFs.Read(vmSearch.id, 0, debugInode.size);
+              var fileStr = "";
+              if (fileData) {
+                fileStr = typeof TextDecoder !== "undefined"
+                  ? new TextDecoder().decode(fileData)
+                  : String.fromCharCode.apply(null, fileData);
+              }
+              log("error", "[VERIFY_SCRIPT_VERIFY_FAILURE] REINJECT Metadata: path=" + vmPath + ", inode=" + vmSearch.id + ", size=" + debugInode.size + ", contents=" + JSON.stringify(fileStr));
+            } else {
+              log("error", "[VERIFY_SCRIPT_VERIFY_FAILURE] REINJECT File not found in 9p filesystem for path=" + vmPath);
+            }
+          } else {
+            log("info", "[VERIFY_SCRIPT_VERIFY_SUCCESS] REINJECT verify_mount.sh verified successfully. inode=" + vmSearch.id);
           }
-
-          log("info", "[VERIFY_SCRIPT_CREATE_SUCCESS] REINJECT verify_mount.sh written and verified. inode=" + vmSearch.id);
         } catch (vmErr) {
           log("error", "[VERIFY_SCRIPT_CREATE_FAILURE] REINJECT failed for verify_mount.sh: " + vmErr);
-          throw vmErr;
         }
 
         // Verify final path
@@ -2049,16 +2081,99 @@ async function checkAndInitializeFs9p() {
 
   var mpPath = "/root/.provision/mount_prepare.sh";
   try {
-    log("info", "[CREATE_FILE_BEGIN] Writing mount_prepare.sh to host 9p filesystem. path=" + mpPath);
+    var mpFs = emulator.fs9p;
     WorkerProvisioner.ensureParentDirectories(emulator, mpPath);
 
-    var mpFs = emulator.fs9p;
     var mpParentSearch = mpFs.SearchPath("/root/.provision");
     if (mpParentSearch.id === -1) {
       throw new Error("Parent directory /root/.provision not found in 9p filesystem after ensureParentDirectories");
     }
     log("info", "[HOST_FS_SYNC] Parent directory /root/.provision confirmed in 9p inode table. inode=" + mpParentSearch.id);
 
+    var mpEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+
+    // Phase 1: create & verify verify_mount.sh
+    var vmPath = "/root/.provision/verify_mount.sh";
+    var vmScript =
+      "#!/bin/sh\n" +
+      "echo '=== GUEST NAMESPACE DIAGNOSTICS ==='\n" +
+      "ls -la /root\n" +
+      "ls -la /root/.provision\n" +
+      "stat /root/.provision/mount_prepare.sh\n" +
+      "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
+      "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
+      "else\n" +
+      "  echo '<<<GUEST_MOUNT_PREPARE_FAILED>>>' > /dev/ttyS0\n" +
+      "fi\n";
+
+    var vmBytes = mpEncoder ? mpEncoder.encode(vmScript) : new Uint8Array(vmScript.length);
+    if (!mpEncoder) {
+      for (var k = 0; k < vmScript.length; k++) vmBytes[k] = vmScript.charCodeAt(k) & 0xFF;
+    }
+
+    log("info", "[VERIFY_SCRIPT_CREATE_BEGIN] Writing verify_mount.sh to host 9p filesystem. path=" + vmPath);
+    try {
+      await emulator.create_file(vmPath, vmBytes);
+      log("info", "[VERIFY_SCRIPT_CREATE_SUCCESS] verify_mount.sh written. Contents: " + JSON.stringify(vmScript));
+
+      log("info", "[VERIFY_SCRIPT_VERIFY_BEGIN] Starting host-side verification loop for verify_mount.sh. Criteria: 1. Existence check (SearchPath.id !== -1); 2. Size check (inode.size === " + vmBytes.length + "); 3. Readback check (read back contents === expected contents)");
+      
+      var vmSearch = { id: -1 };
+      var vmInode = null;
+      var vmMaxRetries = 5;
+      var vmRetryDelay = 500;
+      var readbackMatch = false;
+
+      for (var vmAttempt = 1; vmAttempt <= vmMaxRetries; vmAttempt++) {
+        vmSearch = mpFs.SearchPath(vmPath);
+        if (vmSearch.id !== -1) {
+          vmInode = mpFs.GetInode(vmSearch.id);
+          if (vmInode && vmInode.size === vmBytes.length) {
+            // Readback check
+            var readbackData = await mpFs.Read(vmSearch.id, 0, vmInode.size);
+            var readbackStr = "";
+            if (readbackData) {
+              readbackStr = typeof TextDecoder !== "undefined"
+                ? new TextDecoder().decode(readbackData)
+                : String.fromCharCode.apply(null, readbackData);
+            }
+            if (readbackStr === vmScript) {
+              readbackMatch = true;
+              break;
+            }
+          }
+        }
+        log("warn", "[VERIFY_SCRIPT_VERIFY_BEGIN] Inode or content not yet stable for " + vmPath + " on attempt " + vmAttempt + ". Retrying...");
+        if (vmAttempt < vmMaxRetries) {
+          await new Promise(function(res) { setTimeout(res, vmRetryDelay); });
+        }
+      }
+
+      if (vmSearch.id === -1 || !vmInode || vmInode.size !== vmBytes.length || !readbackMatch) {
+        log("error", "[VERIFY_SCRIPT_VERIFY_FAILURE] verify_mount.sh verification failed. Expected size: " + vmBytes.length + ", actual size: " + (vmInode ? vmInode.size : "null"));
+        
+        // Dump full file metadata if exists
+        if (vmSearch.id !== -1) {
+          var debugInode = mpFs.GetInode(vmSearch.id);
+          var fileData = await mpFs.Read(vmSearch.id, 0, debugInode.size);
+          var fileStr = "";
+          if (fileData) {
+            fileStr = typeof TextDecoder !== "undefined"
+              ? new TextDecoder().decode(fileData)
+              : String.fromCharCode.apply(null, fileData);
+          }
+          log("error", "[VERIFY_SCRIPT_VERIFY_FAILURE] Metadata: path=" + vmPath + ", inode=" + vmSearch.id + ", size=" + debugInode.size + ", contents=" + JSON.stringify(fileStr));
+        } else {
+          log("error", "[VERIFY_SCRIPT_VERIFY_FAILURE] File not found in 9p filesystem for path=" + vmPath);
+        }
+      } else {
+        log("info", "[VERIFY_SCRIPT_VERIFY_SUCCESS] verify_mount.sh verified successfully on host 9p. inode=" + vmSearch.id + ", size=" + vmInode.size);
+      }
+    } catch (vmErr) {
+      log("error", "[VERIFY_SCRIPT_CREATE_FAILURE] Failed to write/verify verify_mount.sh: " + vmErr);
+    }
+
+    // Phase 2: create & verify mount_prepare.sh
     var mpScript =
       "#!/bin/sh\n" +
       "export PS1=''\n" +
@@ -2089,60 +2204,13 @@ async function checkAndInitializeFs9p() {
       "  echo '<<<STAGE:MOUNT_FAIL>>>' > /dev/ttyS0\n" +
       "fi\n";
 
-    var mpEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
     var mpBytes = mpEncoder ? mpEncoder.encode(mpScript) : new Uint8Array(mpScript.length);
     if (!mpEncoder) {
       for (var j = 0; j < mpScript.length; j++) mpBytes[j] = mpScript.charCodeAt(j) & 0xFF;
     }
 
+    log("info", "[CREATE_FILE_BEGIN] Writing mount_prepare.sh to host 9p filesystem. path=" + mpPath);
     await emulator.create_file(mpPath, mpBytes);
-
-    var vmPath = "/root/.provision/verify_mount.sh";
-    var vmScript =
-      "#!/bin/sh\n" +
-      "echo '=== GUEST NAMESPACE DIAGNOSTICS ==='\n" +
-      "ls -la /root\n" +
-      "ls -la /root/.provision\n" +
-      "stat /root/.provision/mount_prepare.sh\n" +
-      "if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
-      "  echo '<<<GUEST_MOUNT_PREPARE_VERIFIED>>>' > /dev/ttyS0\n" +
-      "else\n" +
-      "  echo '<<<GUEST_MOUNT_PREPARE_FAILED>>>' > /dev/ttyS0\n" +
-      "fi\n";
-
-    var vmBytes = mpEncoder ? mpEncoder.encode(vmScript) : new Uint8Array(vmScript.length);
-    if (!mpEncoder) {
-      for (var k = 0; k < vmScript.length; k++) vmBytes[k] = vmScript.charCodeAt(k) & 0xFF;
-    }
-
-    log("info", "[VERIFY_SCRIPT_CREATE_BEGIN] Writing verify_mount.sh to host 9p filesystem. path=" + vmPath);
-    try {
-      await emulator.create_file(vmPath, vmBytes);
-      
-      // Verification loop
-      var vmSearch = { id: -1 };
-      var vmInode = null;
-      for (var vmAttempt = 1; vmAttempt <= mpMaxRetries; vmAttempt++) {
-        vmSearch = mpFs.SearchPath(vmPath);
-        if (vmSearch.id !== -1) {
-          vmInode = mpFs.GetInode(vmSearch.id);
-          if (vmInode && vmInode.size === vmBytes.length) break;
-        }
-        log("warn", "[VERIFY_SCRIPT_CREATE_BEGIN] Inode not yet stable for " + vmPath + " on attempt " + vmAttempt + ". Retrying...");
-        if (vmAttempt < mpMaxRetries) {
-          await new Promise(function(res) { setTimeout(res, mpRetryDelay); });
-        }
-      }
-
-      if (vmSearch.id === -1 || !vmInode || vmInode.size !== vmBytes.length) {
-        throw new Error("verify_mount.sh verification failed");
-      }
-
-      log("info", "[VERIFY_SCRIPT_CREATE_SUCCESS] verify_mount.sh written and verified. inode=" + vmSearch.id + ", size=" + vmInode.size);
-    } catch (vmErr) {
-      log("error", "[VERIFY_SCRIPT_CREATE_FAILURE] Failed to write verify_mount.sh: " + vmErr);
-      throw vmErr;
-    }
 
     var mpSearch = { id: -1 };
     var mpInode = null;
