@@ -1895,8 +1895,13 @@ export class VMController {
       const overflow_amount = payload_length - max_allowed_length;
       const payloadBytes = new TextEncoder().encode(data).length;
       
-      Logger.error("VM", `[TRANSPORT GUARD] Oversized command aborted! payload_length: ${payload_length}, max_allowed_length: ${max_allowed_length}, overflow_amount: ${overflow_amount}, rejected payload size: ${payloadBytes} bytes`);
-      console.error(`[TRANSPORT GUARD] Oversized command aborted! payload_length: ${payload_length}, max_allowed_length: ${max_allowed_length}, overflow_amount: ${overflow_amount}, rejected payload size: ${payloadBytes} bytes`);
+      Logger.error("VM", `[SERIAL_PAYLOAD_SIZE] payload_length: ${payload_length}`);
+      Logger.error("VM", `[SERIAL_PAYLOAD_LIMIT] max_allowed_length: ${max_allowed_length}`);
+      Logger.error("VM", `[SERIAL_PAYLOAD_REJECTED] Rejected payload size: ${payloadBytes} bytes`);
+      Logger.error("VM", `[TRANSPORT GUARD] Oversized command aborted! payload_length: ${payload_length}, max_allowed_length: ${max_allowed_length}, overflow_amount: ${overflow_amount}`);
+      console.error(`[SERIAL_PAYLOAD_SIZE] payload_length: ${payload_length}`);
+      console.error(`[SERIAL_PAYLOAD_LIMIT] max_allowed_length: ${max_allowed_length}`);
+      console.error(`[SERIAL_PAYLOAD_REJECTED] Rejected payload size: ${payloadBytes} bytes`);
       console.error(`[TRANSPORT GUARD] Call stack:\n${SERIAL_PROVISIONING_COMMAND_TOO_LARGE.stack}`);
       console.error(`[TRANSPORT GUARD] Offending payload: ${JSON.stringify(data)}`);
       
@@ -2135,19 +2140,13 @@ export class VMController {
    */
   private verifyAndExecuteMountScript(): void {
     const inodeIdStr = this.verifiedInodeId !== null ? this.verifiedInodeId.toString() : "";
-    Logger.info("VM", `[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Verified inode ID: ${inodeIdStr}. Initiating guest-side namespace verification.`);
+    Logger.info("VM", `[PROVISIONING] FILE_MATERIALIZATION_VERIFIED received. Verified inode ID: ${inodeIdStr}. Executing mount prepare script directly.`);
 
     this.provisioningExecutionStarted = true;
     this.provisionExecutionInFlight = true;
 
-    // Log the file structures of /root/.provision immediately before verification
-    void this.sendProgrammaticInput(0, "ls -la /root/.provision\n");
-
-    // Force guest OS kernel to drop caches to avoid stale dentry cache reading
-    void this.sendProgrammaticInput(0, "sync; echo 3 > /proc/sys/vm/drop_caches\n");
-
-    // Perform guest-side visibility check for verify_mount.sh (under 128-byte limit)
-    void this.sendProgrammaticInput(0, "v=/root/.provision/verify_mount.sh; [ -s $v ] && [ -r $v ] && echo '<<<V_OK>>>' || echo '<<<V_ERR>>>'\n");
+    // Execute mount_prepare.sh directly using a short command (completely avoiding any transport limits)
+    void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
   }
 
   /**
