@@ -910,14 +910,6 @@ export class VMController {
             
             Logger.info("VM", `[GUEST_FS_VISIBLE] FILE_MATERIALIZATION_VERIFIED: path=${matPayload.path}, inode=${matPayload.inodeId}, size=${matPayload.size}, mtime=${matPayload.mtime || "unknown"}, readability=${matPayload.readability !== false}, isReinject=${matPayload.isReinject || false}, skipped=${matPayload.skipped || false}`);
             
-            // Invariant guard: once verified, the inode identity must remain stable until execution completes.
-            if (this.provisioningExecutionStarted || this.provisionExecutionInFlight) {
-              if (this.verifiedInodeId !== null && this.verifiedInodeId !== matPayload.inodeId) {
-                Logger.error("VM", `[INVARIANT_VIOLATION] Inode changed from ${this.verifiedInodeId} to ${matPayload.inodeId} after verification while execution is in flight! Ignoring message to maintain VFS stability.`);
-                break;
-              }
-            }
-
             this.verifiedInodeId = matPayload.inodeId;
             this.verifiedInodeMtime = matPayload.mtime || null;
             this.verifiedInodeSize = matPayload.size;
@@ -930,6 +922,12 @@ export class VMController {
               this.pendingMaterializationFailed = null;
               cb();
             }
+            break;
+          }
+
+          case "SERIAL_FRAGMENTATION_DETECTED": {
+            const fragPayload = payload as { reason: string; length?: number; violations?: string[]; payload?: string };
+            Logger.error("VM", `[TELEMETRY] SERIAL_FRAGMENTATION_DETECTED received from worker: reason=${fragPayload.reason}, violations=${fragPayload.violations ? fragPayload.violations.join(",") : "none"}, length=${fragPayload.length || "unknown"}, payload=${JSON.stringify(fragPayload.payload)}`);
             break;
           }
         }
@@ -1061,7 +1059,8 @@ export class VMController {
       Logger.warn("VM", `[PROVISIONING WATCHDOG] Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
       
       void this.sendProgrammaticInput(0, "\x03\n");
-      void this.sendProgrammaticInput(0, "stty sane\nreset\n");
+      void this.sendProgrammaticInput(0, "stty sane\n");
+      void this.sendProgrammaticInput(0, "reset\n");
       
       const execId = this.provisioning.getExecutionId();
       Logger.info("VM", `[PROVISIONING WATCHDOG] Clean restart: sending execute command for helper prov_execute_${execId}.sh`);
@@ -1202,7 +1201,8 @@ export class VMController {
       Logger.warn("VM", "[PROVISIONING] PS2 continuation prompt detected (shell awaiting more input). Aborting with Ctrl+C and running stty sane/reset...");
       Logger.warn("VM", `[PROVISIONING] Buffer tail: ${JSON.stringify(this.provisioningSearchBuffer.slice(-64))}`);
       void this.sendProgrammaticInput(0, "\x03\n");
-      void this.sendProgrammaticInput(0, "stty sane\nreset\n");
+      void this.sendProgrammaticInput(0, "stty sane\n");
+      void this.sendProgrammaticInput(0, "reset\n");
       
       const execId = this.provisioning.getExecutionId();
       if (this.provisioning.getState() === "executing" || this.provisioning.getState() === "waiting_completion") {
@@ -1565,7 +1565,7 @@ export class VMController {
     if (this.onSerialOutput && this.onStateChange) {
       this._dispatchReattach(this.onSerialOutput, this.onStateChange);
     }
-    const queryCmd = `\nstty -echo; [ -f /root/.provision/runtime_exec.sh ] && (ps | grep -v grep | grep -q "runtime_exec.sh" && echo "<<<PROTO:${execId}:5:HEARTBEAT>>>" || ([ -f /root/.provision/provision_complete ] && echo "<<<PROTO:${execId}:6:EXEC_COMPLETE>>>" || echo "<<<PROTO:${execId}:7:FAIL:recovery_script_terminated>>>")) || echo "<<<PROTO:${execId}:7:FAIL:recovery_script_not_found>>>"\n`;
+    const queryCmd = `sh /root/.provision/status_query.sh\n`;
     
     // Send the query on serial0
     void this.sendProgrammaticInput(0, queryCmd);
@@ -1586,8 +1586,10 @@ export class VMController {
         }
       }, 1000);
 
-      // Send both probe commands
-      void this.sendProgrammaticInput(0, "\necho '**PONG**'\necho '**SHELL_READY**'\n");
+      // Send both probe commands separately to obey serial transport guards
+      void this.sendProgrammaticInput(0, "\n");
+      void this.sendProgrammaticInput(0, "echo '**PONG**'\n");
+      void this.sendProgrammaticInput(0, "echo '**SHELL_READY**'\n");
     });
   }
 
@@ -1789,6 +1791,45 @@ export class VMController {
     });
   }
 
+  /**
+   * Asserts that a serial payload does not violate transport rules:
+   *   - Maximum length: <= 128 bytes
+   *   - No newline inside (excluding a trailing newline)
+   *   - No carriage return inside (excluding a trailing carriage return)
+   *   - No heredocs (<<)
+   *   - No if/then/fi blocks
+   */
+  private assertSerialPayload(data: string): void {
+    // Strip trailing newlines/carriage returns for multiline checks
+    const trimmed = data.endsWith("\n") ? data.slice(0, -1) : data;
+    const cleanTrimmed = trimmed.endsWith("\r") ? trimmed.slice(0, -1) : trimmed;
+
+    if (
+      cleanTrimmed.includes('\n') ||
+      cleanTrimmed.includes('\r') ||
+      data.length > 128
+    ) {
+      this.transport.post("SERIAL_FRAGMENTATION_DETECTED", {
+        reason: "SERIAL_PROVISIONING_COMMAND_TOO_LARGE",
+        length: data.length,
+        payload: data.slice(0, 128)
+      });
+      throw new Error('SERIAL_PROVISIONING_COMMAND_TOO_LARGE');
+    }
+
+    // 2. Additional Interactive Security Checks
+    const hasHeredoc = cleanTrimmed.includes("<<");
+    const hasIfThenFi = /\b(if|then|fi)\b/i.test(cleanTrimmed);
+
+    if (hasHeredoc || hasIfThenFi) {
+      this.transport.post("SERIAL_FRAGMENTATION_DETECTED", {
+        reason: "FORBIDDEN_CONSTRUCTS",
+        payload: data.slice(0, 128)
+      });
+      throw new Error('SERIAL_PROVISIONING_COMMAND_TOO_LARGE');
+    }
+  }
+
   public sendInput(data: string): void {
     // Interactivity is decoupled: keyboard input allowed when VM is booting/provisioning/running
     // sendInput does NOT mutate lifecycle — no dispatch() needed.
@@ -1797,6 +1838,15 @@ export class VMController {
       Logger.warn("VM", `Refusing input: VM in state: ${status}`);
       return;
     }
+
+    // Assert data size and safety constructs before sending
+    try {
+      this.assertSerialPayload(data);
+    } catch (err) {
+      Logger.error("VM", `[TRANSPORT ASSERTION] sendInput rejected payload: ${err}`);
+      return;
+    }
+
     this.lastInputTimestamp = Date.now();
     try {
       this.transport.post("INPUT", data);
@@ -1841,6 +1891,16 @@ export class VMController {
    */
   public sendProgrammaticInput(port: number, data: string): Promise<void> {
     const stateName = this.lifecycle.getState().state;
+
+    // Assert data size and safety constructs before sending on port 0
+    if (port === 0) {
+      try {
+        this.assertSerialPayload(data);
+      } catch (err) {
+        Logger.error("VM", `[TRANSPORT ASSERTION] sendProgrammaticInput rejected payload: ${err}`);
+        return Promise.reject(err);
+      }
+    }
 
     // Allowed states — FSM-derived, single source of truth
     if (
@@ -1981,34 +2041,9 @@ export class VMController {
       this.provisioningExecutionStarted = true;
       this.provisionExecutionInFlight = true;
 
-      // Construct a robust guest-side execution wrapper to prevent stale dentries and enforce inode checks
-      const wrapperCmd = 
-        `sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; sleep 1; ` +
-        `GUEST_INODE=\$(stat -c %i /root/.provision/mount_prepare.sh 2>/dev/null || stat -i /root/.provision/mount_prepare.sh 2>/dev/null); ` +
-        `echo "[GUEST_STAT] verified_inode=${inodeIdStr} execution_inode=\$GUEST_INODE"; ` +
-        `stat /root/.provision/mount_prepare.sh 2>/dev/null; ` +
-        `if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then ` +
-        `echo "[GUEST_VERIFY] readability=OK first_line=\$(head -n 1 /root/.provision/mount_prepare.sh)"; ` +
-        `if [ "\$GUEST_INODE" = "${inodeIdStr}" ] || [ -z "${inodeIdStr}" ]; then ` +
-        `sync; sleep 1; exec sh /root/.provision/mount_prepare.sh; ` +
-        `else ` +
-        `echo "[EXECUTION FAILURE] inode mismatch: expected ${inodeIdStr}, got \$GUEST_INODE"; ` +
-        `fi; ` +
-        `else ` +
-        `echo "[EXECUTION FAILURE] file disappeared or not readable before execution"; ` +
-        `if [ ! -z "\$GUEST_INODE" ]; then ` +
-        `echo "[GUEST_STALE_DENTRY] Detected stale dentry. Attempting recovery..."; ` +
-        `cd /; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; sleep 1; ` +
-        `NEW_INODE=\$(stat -c %i /root/.provision/mount_prepare.sh 2>/dev/null || stat -i /root/.provision/mount_prepare.sh 2>/dev/null); ` +
-        `echo "[GUEST_STALE_DENTRY_RECOVER] new_inode=\$NEW_INODE"; ` +
-        `if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then ` +
-        `echo "[GUEST_STALE_DENTRY_RECOVER_SUCCESS] File is now accessible!"; ` +
-        `exec sh /root/.provision/mount_prepare.sh; ` +
-        `else ` +
-        `echo "[GUEST_STALE_DENTRY_RECOVER_FAIL] File still inaccessible after VFS clear."; ` +
-        `fi; ` +
-        `fi; ` +
-        `fi\n`;
+      // Executing the mounting prepare script directly, trusting FILE_MATERIALIZATION_VERIFIED.
+      // All guest-side mounting validation has been moved inside mount_prepare.sh.
+      const wrapperCmd = `sh /root/.provision/mount_prepare.sh\n`;
 
       void this.sendProgrammaticInput(0, wrapperCmd);
 
@@ -2107,7 +2142,6 @@ export class VMController {
 
     this.pendingMaterializationVerified = () => {
       Logger.info("VM", "[PROVISIONING] File reinjection confirmed. Re-executing mount_prepare.sh.");
-      void this.sendProgrammaticInput(0, "sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n");
       void this.sendProgrammaticInput(0, "sh /root/.provision/mount_prepare.sh\n");
       this.timeouts.register("mount_stabilization_watchdog", 20000, () => {
         Logger.error("VM", "[PROVISIONING] mount_stabilization_watchdog fired after reinject. Escalating to generic recovery.");

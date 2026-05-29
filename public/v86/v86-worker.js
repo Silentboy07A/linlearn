@@ -1026,6 +1026,23 @@ var WorkerProvisioner = {
     try {
       await emu.create_file(base + "/prov_execute_" + execId + ".sh", encode(executeScript));
       log("info", "[WorkerProvisioner] Helper: prov_execute_" + execId + ".sh written (" + executeScript.length + " bytes)");
+
+      var statusQueryScript =
+        "#!/bin/sh\n" +
+        "stty -echo\n" +
+        "if [ -f /root/.provision/runtime_exec.sh ]; then\n" +
+        "  if ps | grep -v grep | grep -q \"runtime_exec.sh\"; then\n" +
+        "    echo \"<<<PROTO:" + execId + ":5:HEARTBEAT>>>\" > /dev/ttyS0\n" +
+        "  elif [ -f /root/.provision/provision_complete ]; then\n" +
+        "    echo \"<<<PROTO:" + execId + ":6:EXEC_COMPLETE>>>\" > /dev/ttyS0\n" +
+        "  else\n" +
+        "    echo \"<<<PROTO:" + execId + ":7:FAIL:recovery_script_terminated>>>\" > /dev/ttyS0\n" +
+        "  fi\n" +
+        "else\n" +
+        "  echo \"<<<PROTO:" + execId + ":7:FAIL:recovery_script_not_found>>>\" > /dev/ttyS0\n" +
+        "fi\n";
+      await emu.create_file(base + "/status_query.sh", encode(statusQueryScript));
+      log("info", "[WorkerProvisioner] Helper: status_query.sh written");
     } catch (e) {
       log("error", "[WorkerProvisioner] Failed to write helper scripts. Stack: " + (e.stack || e));
       throw e;
@@ -1331,6 +1348,40 @@ self.onmessage = async function (e) {
         log("warn", "Ignored serial input in non-interactive state: " + lifecycleState);
         break;
       }
+
+      // Assert payload rules: length <= 128, no internal newline/carriage-return, no heredoc, no if/then/fi blocks
+      if (payload.length > 128) {
+        log("error", "[SERIAL_GUARD] Assertion failed: Serial payload length (" + payload.length + ") exceeds 128 bytes limit. Rejecting payload.");
+        postToHost("SERIAL_FRAGMENTATION_DETECTED", {
+          reason: "length_exceeded",
+          length: payload.length,
+          payload: payload.slice(0, 128)
+        });
+        break;
+      }
+
+      var trimmed = payload.endsWith("\n") ? payload.slice(0, -1) : payload;
+      var cleanTrimmed = trimmed.endsWith("\r") ? trimmed.slice(0, -1) : trimmed;
+
+      var hasNewline = cleanTrimmed.indexOf("\n") !== -1 || cleanTrimmed.indexOf("\r") !== -1;
+      var hasHeredoc = cleanTrimmed.indexOf("<<") !== -1;
+      var hasIfThenFi = /\b(if|then|fi)\b/i.test(cleanTrimmed);
+
+      if (hasNewline || hasHeredoc || hasIfThenFi) {
+        var violations = [];
+        if (hasNewline) violations.push("newline");
+        if (hasHeredoc) violations.push("heredoc");
+        if (hasIfThenFi) violations.push("if/then/fi");
+
+        log("error", "[SERIAL_GUARD] Assertion failed: Serial payload contains forbidden constructs (" + violations.join(", ") + "). Rejecting payload.");
+        postToHost("SERIAL_FRAGMENTATION_DETECTED", {
+          reason: "forbidden_constructs",
+          violations: violations,
+          payload: payload.slice(0, 128)
+        });
+        break;
+      }
+
       if (lifecycleState === "interactive" || lifecycleState === "fs9p_ready" || lifecycleState === "provisioning") {
         inputBuffer += payload;
         if (inputBuffer.indexOf("\n") !== -1) {
@@ -1612,6 +1663,11 @@ self.onmessage = async function (e) {
           "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
           "if [ -d /root/.provision ]; then\n" +
           "  echo '<<<STAGE:MOUNT_OK>>>' > /dev/ttyS0\n" +
+          "  if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
+          "    echo \"[GUEST_VERIFY] readability=OK first_line=\$(head -n 1 /root/.provision/mount_prepare.sh 2>/dev/null)\" > /dev/ttyS0\n" +
+          "  else\n" +
+          "    echo \"[GUEST_VERIFY] readability=FAIL\" > /dev/ttyS0\n" +
+          "  fi\n" +
           "else\n" +
           "  echo '<<<STAGE:MOUNT_FAIL>>>' > /dev/ttyS0\n" +
           "fi\n";
@@ -1978,6 +2034,11 @@ async function checkAndInitializeFs9p() {
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "if [ -d /root/.provision ]; then\n" +
       "  echo '<<<STAGE:MOUNT_OK>>>' > /dev/ttyS0\n" +
+      "  if [ -f /root/.provision/mount_prepare.sh ] && [ -r /root/.provision/mount_prepare.sh ]; then\n" +
+      "    echo \"[GUEST_VERIFY] readability=OK first_line=\$(head -n 1 /root/.provision/mount_prepare.sh 2>/dev/null)\" > /dev/ttyS0\n" +
+      "  else\n" +
+      "    echo \"[GUEST_VERIFY] readability=FAIL\" > /dev/ttyS0\n" +
+      "  fi\n" +
       "else\n" +
       "  echo '<<<STAGE:MOUNT_FAIL>>>' > /dev/ttyS0\n" +
       "fi\n";
