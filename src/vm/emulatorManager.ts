@@ -1058,13 +1058,13 @@ export class VMController {
       if (cb) cb();
       return;
     }
-    if (this._guestExistsMarker && this.provisioningSearchBuffer.includes("<<<GF_MISS>>>")) {
+    if (this._guestExistsMarker && (this.provisioningSearchBuffer.includes("<<<GF_MISS>>>") || this.provisioningSearchBuffer.includes("GF_MISS"))) {
       Logger.warn("VM", "[GUEST_FILE_MISSING] Guest-side existence check reports file NOT found.");
-      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GF_MISS>>>", "");
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace("<<<GF_MISS>>>", "").replace("GF_MISS", "");
       // Don't act immediately — the retry timer in _pollGuestFileExists will handle it
     }
 
-    if (this.isVerifyingVisibility && this.provisioningSearchBuffer.includes("<<<PROVISION_FILES_VISIBLE>>>")) {
+    if (this.isVerifyingVisibility && (this.provisioningSearchBuffer.includes("<<<PROVISION_FILES_VISIBLE>>>") || this.provisioningSearchBuffer.includes("PROVISION_FILES_VISIBLE"))) {
       Logger.info("VM", `[PROVISIONING WATCHDOG] Visibility confirmed for ${this.verifyingFilePath} (STAGE:PROVISION_FILES_VISIBLE).`);
       this.isVerifyingVisibility = false;
       if (this.fileVisibilityTimer) {
@@ -1207,6 +1207,7 @@ export class VMController {
         return;
       } else if (
         this.provisioningSearchBuffer.includes("<<<STAGE:MOUNT_FAIL>>>") || 
+        this.provisioningSearchBuffer.includes("STAGE:MOUNT_FAIL") || 
         this.provisioningSearchBuffer.includes("<<<MOUNT_FAILED>>>") ||
         this.provisioningSearchBuffer.includes("[EXECUTION FAILURE]") ||
         this.provisioningSearchBuffer.includes("[GUEST_STALE_DENTRY_RECOVER_FAIL]")
@@ -2229,9 +2230,9 @@ export class VMController {
   ): void {
     this._guestPollAttempt = 0;
     this._guestPollMaxRetries = maxRetries;
-    // Short marker — keep total probe command under 100 bytes
+    // Short marker — keep total probe command under 100 bytes and avoid "<<<" to satisfy transport constraints
     const ts = Date.now() % 100000; // 5 digits max
-    this._guestExistsMarker = `<<<GF_OK_${ts}>>>`;
+    this._guestExistsMarker = `GF_OK_${ts}`;
     this._guestExistsCallback = onExists;
     this._guestMissingCallback = onMissing;
 
@@ -2253,7 +2254,7 @@ export class VMController {
       // Probe: test -f PATH && echo MARKER > /dev/ttyS0
       // Split into two commands to stay under limit
       const testCmd = `test -f ${path} && echo '${this._guestExistsMarker}'>/dev/ttyS0\n`;
-      const missCmd = `test -f ${path} || echo '<<<GF_MISS>>>'>/dev/ttyS0\n`;
+      const missCmd = `test -f ${path} || echo 'GF_MISS'>/dev/ttyS0\n`;
 
       if (testCmd.length > VMController.SERIAL_CMD_LIMIT || missCmd.length > VMController.SERIAL_CMD_LIMIT) {
         Logger.error("VM", `[TRANSPORT_LIMIT_EXCEEDED] probe cmd too long: test=${testCmd.length}, miss=${missCmd.length}`);
@@ -2289,9 +2290,9 @@ export class VMController {
     // Each command individually under 100 bytes:
     this._sendChecked("mkdir -p /mnt/9p\n", "fb_mkdir");                  // 18 bytes
     this._sendChecked(
-      "mount -t 9p -o trans=virtio host9p /mnt/9p\n",
+      "mount|grep -q /mnt/9p||mount -t 9p -o trans=virtio host9p /mnt/9p\n",
       "fb_mount_simple"
-    );  // 43 bytes
+    );  // 65 bytes
     this._sendChecked("ls /mnt/9p/root 2>/dev/null\n", "fb_ls_verify");    // 28 bytes
 
     // Check if file exists at 9p native path, then execute or fail
@@ -2302,9 +2303,9 @@ export class VMController {
       "fb_test_exec"
     );  // 73 bytes
     this._sendChecked(
-      `test -f ${mp} || echo '<<<STAGE:MOUNT_FAIL>>>'>/dev/ttyS0\n`,
+      `test -f ${mp} || echo 'STAGE:MOUNT_FAIL'>/dev/ttyS0\n`,
       "fb_test_fail"
-    );  // 72 bytes
+    );  // 68 bytes
   }
 
   /**
@@ -2468,7 +2469,7 @@ export class VMController {
     }
     Logger.info("VM", `[PROVISIONING WATCHDOG] Polling guest visibility for ${this.verifyingFilePath} (attempt ${this.fileVisibilityRetries})...`);
     void this.sendProgrammaticInput(0, "sync\n");
-    const checkCmd = `[ -f "${this.verifyingFilePath}" ] && echo '<<<PROVISION_FILES_VISIBLE>>>'\n`;
+    const checkCmd = `[ -f "${this.verifyingFilePath}" ] && echo 'PROVISION_FILES_VISIBLE'\n`;
     void this.sendProgrammaticInput(0, checkCmd);
     const delay = Math.min(1000 + (this.fileVisibilityRetries * 250), 3000);
     this.fileVisibilityTimer = setTimeout(() => {
