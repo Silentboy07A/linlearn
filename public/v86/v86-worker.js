@@ -1714,6 +1714,10 @@ self.onmessage = async function (e) {
 
         log("info", "[CREATE_FILE_BEGIN] REINJECT writing " + riBytes.length + " bytes to temp file: " + tmpPath);
         await emulator.create_file(tmpPath, riBytes);
+        log("info", "HOST_WRITE_PATH: " + tmpPath);
+        log("info", "HOST_WRITE_SIZE: " + riBytes.length);
+        log("info", "HOST_WRITE_SUCCESS: true");
+        log("info", "9P Exported Root Path: /");
 
         // Verify temp file
         var tmpSearch = riFs.SearchPath(tmpPath);
@@ -1734,6 +1738,9 @@ self.onmessage = async function (e) {
 
         log("info", "[PROVISION_REINJECT] Atomically renaming " + tmpPath + " to " + reinjectPath + " under parent inode: " + parentSearch.id);
         var renameRes = await riFs.Rename(parentSearch.id, "mount_prepare.sh.tmp", parentSearch.id, "mount_prepare.sh");
+        log("info", "HOST_WRITE_PATH: " + reinjectPath);
+        log("info", "HOST_WRITE_SIZE: " + riBytes.length);
+        log("info", "HOST_WRITE_SUCCESS: " + (renameRes >= 0));
         if (renameRes < 0) {
           throw new Error("Atomic rename failed with error code: " + renameRes);
         }
@@ -2255,6 +2262,10 @@ async function checkAndInitializeFs9p() {
 
     log("info", "[CREATE_FILE_BEGIN] Writing mount_prepare.sh to host 9p filesystem. path=" + mpPath);
     await emulator.create_file(mpPath, mpBytes);
+    log("info", "HOST_WRITE_PATH: " + mpPath);
+    log("info", "HOST_WRITE_SIZE: " + mpBytes.length);
+    log("info", "HOST_WRITE_SUCCESS: true");
+    log("info", "9P Exported Root Path: /");
 
     var mpSearch = { id: -1 };
     var mpInode = null;

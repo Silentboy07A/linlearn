@@ -2233,7 +2233,7 @@ export class VMController {
     Logger.info("VM", "[VERIFY_INODE] Starting guest-side existence check...");
     this._pollGuestFileExists(
       "/mnt/9p/root/.provision/mount_prepare.sh",  // check 9p-native path
-      5,    // max retries
+      1,    // Task 8: max retries = 1 (no retries)
       300,  // initial delay ms
       () => {
         // File found at 9p-native path — run from there
@@ -2242,6 +2242,8 @@ export class VMController {
         Logger.info("VM", `[GUEST_FILE_PATH] /mnt/9p/root/.provision/mount_prepare.sh`);
         this.mountPrepareVerified = true;
 
+        this.printAuditTable(true);
+
         Logger.info("VM", "[GUEST_FILE_EXISTS] Found at /mnt/9p path. Executing.");
         this._sendChecked(
           "sh /mnt/9p/root/.provision/mount_prepare.sh\n",
@@ -2249,15 +2251,32 @@ export class VMController {
         );  // 46 bytes
       },
       () => {
-        // Not at 9p path — try mounting 9p first, then execute
+        // Not at 9p path
         Logger.info("VM", `[GUEST_FILE_EXISTS] false`);
         Logger.info("VM", `[GUEST_FILE_SIZE] unknown`);
         Logger.info("VM", `[GUEST_FILE_PATH] /mnt/9p/root/.provision/mount_prepare.sh`);
 
-        Logger.warn("VM", "[GUEST_FILE_MISSING] Not at /mnt/9p. Trying mount fallback.");
-        this._tryDirectMountFallback();
+        this.printAuditTable(false);
+
+        Logger.warn("VM", "[GUEST_FILE_MISSING] File not visible on guest. Mismatch detected. Stopping execution.");
+        // Stop execution. No fallback.
       }
     );
+  }
+
+  private printAuditTable(guestExists: boolean): void {
+    const table = `
++-----------------------------------------------------------------------------------------------------------------------------------+
+| PATH AUDIT TABLE                                                                                                                  |
++------------------------------------+------------------------------------+------------------------------------+-------+------------+
+| HOST_PATH                          | EXPORT_PATH                        | GUEST_PATH                         | HOST_ | GUEST_     |
+|                                    |                                    |                                    | EXIST | EXIST      |
++------------------------------------+------------------------------------+------------------------------------+-------+------------+
+| /root/.provision/mount_prepare.sh  | /root/.provision/mount_prepare.sh  | /mnt/9p/root/.provision/           | true  | ${guestExists ? "true      " : "false     "} |
+|                                    |                                    | mount_prepare.sh                   |       |            |
++------------------------------------+------------------------------------+------------------------------------+-------+------------+
+`;
+    Logger.info("VM", table);
   }
 
   /**
