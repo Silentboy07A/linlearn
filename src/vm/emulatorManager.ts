@@ -121,6 +121,9 @@ export class VMController {
 
   public static setActiveInstance(instance: VMController | null): void {
     VMController.activeInstance = instance;
+    if (typeof window !== "undefined") {
+      (window as any).emulator = instance;
+    }
   }
 
   private transport: TransportCoordinator;
@@ -131,6 +134,9 @@ export class VMController {
 
   private saveStateResolver: ((buffer: ArrayBuffer) => void) | null = null;
   private saveStateRejecter: ((err: Error) => void) | null = null;
+  private writeGuestFileResolve: (() => void) | null = null;
+  private writeGuestFileReject: ((err: Error) => void) | null = null;
+  private writeGuestFilePath: string | null = null;
   private serialHistory: string = "";
 
   private wasRestoredFromSnapshot = false;
@@ -836,6 +842,30 @@ export class VMController {
             break;
           }
 
+          case "WRITE_GUEST_FILE_OK": {
+            const okTyped = payload as { filePath: string };
+            if (this.writeGuestFilePath === okTyped.filePath && this.writeGuestFileResolve) {
+              const res = this.writeGuestFileResolve;
+              this.writeGuestFileResolve = null;
+              this.writeGuestFileReject = null;
+              this.writeGuestFilePath = null;
+              res();
+            }
+            break;
+          }
+
+          case "WRITE_GUEST_FILE_FAIL": {
+            const failTyped = payload as { filePath: string; error: string };
+            if (this.writeGuestFilePath === failTyped.filePath && this.writeGuestFileReject) {
+              const rej = this.writeGuestFileReject;
+              this.writeGuestFileResolve = null;
+              this.writeGuestFileReject = null;
+              this.writeGuestFilePath = null;
+              rej(new Error(failTyped.error));
+            }
+            break;
+          }
+
           case "SAVE_STATE_SUCCESS":
             if (this.saveStateResolver) {
               const res = this.saveStateResolver;
@@ -1070,14 +1100,27 @@ export class VMController {
     // Guest-side existence check markers (from _pollGuestFileExists)
     if (this._guestExistsMarker && this.provisioningSearchBuffer.includes(this._guestExistsMarker)) {
       Logger.info("VM", `[SERIAL_PARSED_MATCH] Matches guestExistsMarker: ${this._guestExistsMarker}`);
-      Logger.info("VM", "[GUEST_FILE_EXISTS] Guest-side existence check confirmed file is visible.");
-      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace(this._guestExistsMarker, "");
+      
+      let resolvedPath = "/mnt"; // default fallback
+      let matchedString = this._guestExistsMarker;
+      const markerIndex = this.provisioningSearchBuffer.indexOf(this._guestExistsMarker);
+      if (markerIndex !== -1) {
+        const remainder = this.provisioningSearchBuffer.slice(markerIndex + this._guestExistsMarker.length);
+        const match = remainder.match(/^:([^\s]+)/);
+        if (match) {
+          resolvedPath = match[1];
+          matchedString += ":" + resolvedPath;
+        }
+      }
+      
+      Logger.info("VM", `[GUEST_FILE_EXISTS] Guest-side existence check confirmed file is visible at ${resolvedPath}.`);
+      this.provisioningSearchBuffer = this.provisioningSearchBuffer.replace(matchedString, "");
       this.timeouts.cancel("guest_file_poll");
       const cb = this._guestExistsCallback;
       this._guestExistsMarker = null;
       this._guestExistsCallback = null;
       this._guestMissingCallback = null;
-      if (cb) cb();
+      if (cb) cb(resolvedPath);
       return;
     }
     if (this._guestExistsMarker && (this.provisioningSearchBuffer.includes("<<<GF_MISS>>>") || this.provisioningSearchBuffer.includes("GF_MISS"))) {
@@ -2171,7 +2214,7 @@ export class VMController {
 
   // ─── Guest-side file existence polling state ────────────────────────────
   private _guestExistsMarker: string | null = null;
-  private _guestExistsCallback: (() => void) | null = null;
+  private _guestExistsCallback: ((resolvedPath: string) => void) | null = null;
   private _guestMissingCallback: (() => void) | null = null;
   private _guestPollAttempt = 0;
   private _guestPollMaxRetries = 0;
@@ -2182,6 +2225,15 @@ export class VMController {
    * Allowed: test -f, test -r, ls, pwd, mount, echo, mkdir.
    */
   private static readonly SERIAL_CMD_LIMIT = 100;
+
+  private writeGuestFile(filePath: string, content: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.writeGuestFilePath = filePath;
+      this.writeGuestFileResolve = resolve;
+      this.writeGuestFileReject = reject;
+      this.transport.post("WRITE_GUEST_FILE", { filePath, content });
+    });
+  }
 
   /**
    * Assert a serial command string is under the transport limit.
@@ -2220,62 +2272,74 @@ export class VMController {
     this.provisioningExecutionStarted = true;
     this.provisionExecutionInFlight = true;
 
-    // PHASE 1: Write helper verification script
-    Logger.info("VM", "[VERIFY_STAT] Writing guest_verify.sh helper...");
-    this._sendChecked("echo 'm=$(mount | grep host9p | head -n 1 | cut -d\" \" -f3)' > /tmp/guest_verify.sh\n", "w1");
-    this._sendChecked("echo '[ -z \"$m\" ] && m=\"/mnt/9p\"' >> /tmp/guest_verify.sh\n", "w2");
-    this._sendChecked("echo 'p=\"$m/root/.provision/mount_prepare.sh\"' >> /tmp/guest_verify.sh\n", "w3");
-    this._sendChecked("echo 'echo \"mountpoint m: $m\"' >> /tmp/guest_verify.sh\n", "w4");
-    this._sendChecked("echo 'echo \"path p: $p\"' >> /tmp/guest_verify.sh\n", "w5");
-    this._sendChecked("echo 'echo \"ls -la m:\"' >> /tmp/guest_verify.sh\n", "w6");
-    this._sendChecked("echo 'ls -la \"$m\"' >> /tmp/guest_verify.sh\n", "w7");
-    this._sendChecked("echo 'echo \"ls -la m/root:\"' >> /tmp/guest_verify.sh\n", "w8");
-    this._sendChecked("echo 'ls -la \"$m/root\"' >> /tmp/guest_verify.sh\n", "w9");
-    this._sendChecked("echo 'echo \"ls -la m/root/.provision:\"' >> /tmp/guest_verify.sh\n", "w10");
-    this._sendChecked("echo 'ls -la \"$m/root/.provision\"' >> /tmp/guest_verify.sh\n", "w11");
-    this._sendChecked("echo 'echo \"test -f p:\"' >> /tmp/guest_verify.sh\n", "w12");
-    this._sendChecked("echo 'test -f \"$p\" && echo GF_OK || echo GF_MISS' >> /tmp/guest_verify.sh\n", "w13");
-    this._sendChecked("echo 'echo \"wc -c p:\"' >> /tmp/guest_verify.sh\n", "w14");
-    this._sendChecked("echo 'wc -c \"$p\"' >> /tmp/guest_verify.sh\n", "w15");
-    this._sendChecked("echo 'test -f \"$p\" && echo \"$1\" >/dev/ttyS0 || echo GF_MISS >/dev/ttyS0' >> /tmp/guest_verify.sh\n", "w16");
+    // PHASE 1: Write helper verification script programmatically via Worker Message Channel
+    Logger.info("VM", "[VERIFY_STAT] Programmatically writing guest_verify.sh helper...");
 
-    // PHASE 2: Guest-side existence check — try 9p native path first
-    // /mnt/9p/root/.provision is the 9p-native path that doesn't need the symlink
-    Logger.info("VM", "[VERIFY_INODE] Starting guest-side existence check...");
-    this._pollGuestFileExists(
-      "/mnt/9p/root/.provision/mount_prepare.sh",  // check 9p-native path
-      15,   // Set to 15 retries to wait for VFS visibility stabilization
-      500,  // delay ms
-      () => {
-        // File found at 9p-native path — run from there
-        Logger.info("VM", `[GUEST_FILE_EXISTS] true`);
-        Logger.info("VM", `[GUEST_FILE_SIZE] ${this.verifiedInodeSize}`);
-        Logger.info("VM", `[GUEST_FILE_PATH] /mnt/9p/root/.provision/mount_prepare.sh`);
-        this.mountPrepareVerified = true;
+    const verifyScriptContent = 
+      "m=\"\"\n" +
+      "[ -f /mnt/root/.provision/mount_prepare.sh ] && m=\"/mnt\"\n" +
+      "[ -z \"$m\" ] && [ -f /mnt/9p/root/.provision/mount_prepare.sh ] && m=\"/mnt/9p\"\n" +
+      "[ -z \"$m\" ] && m=$(mount | grep host9p | head -n 1 | cut -d' ' -f3)\n" +
+      "[ -z \"$m\" ] && m=\"/mnt\"\n" +
+      "p=\"$m/root/.provision/mount_prepare.sh\"\n" +
+      "echo \"mountpoint m: $m\"\n" +
+      "echo \"path p: $p\"\n" +
+      "echo \"ls -la m:\"\n" +
+      "ls -la \"$m\"\n" +
+      "echo \"ls -la m/root:\"\n" +
+      "ls -la \"$m/root\"\n" +
+      "echo \"ls -la m/root/.provision:\"\n" +
+      "ls -la \"$m/root/.provision\"\n" +
+      "echo \"test -f p:\"\n" +
+      "test -f \"$p\" && echo GF_OK || echo GF_MISS\n" +
+      "echo \"wc -c p:\"\n" +
+      "wc -c \"$p\"\n" +
+      "test -f \"$p\" && echo \"$1:$m\" >/dev/ttyS0 || echo GF_MISS >/dev/ttyS0\n";
 
-        this.printAuditTable(true);
+    this.writeGuestFile("/guest_verify.sh", verifyScriptContent)
+      .then(() => {
+        Logger.info("VM", "[VERIFY_STAT] Programmatically wrote guest_verify.sh successfully!");
 
-        Logger.info("VM", "[GUEST_FILE_EXISTS] Found at /mnt/9p path. Executing.");
-        this._sendChecked(
-          "sh /mnt/9p/root/.provision/mount_prepare.sh\n",
-          "exec_9p_native"
-        );  // 46 bytes
-      },
-      () => {
-        // Not at 9p path
-        Logger.info("VM", `[GUEST_FILE_EXISTS] false`);
-        Logger.info("VM", `[GUEST_FILE_SIZE] unknown`);
-        Logger.info("VM", `[GUEST_FILE_PATH] /mnt/9p/root/.provision/mount_prepare.sh`);
+        // PHASE 2: Guest-side existence check
+        Logger.info("VM", "[VERIFY_INODE] Starting guest-side existence check...");
+        this._pollGuestFileExists(
+          15,   // Set to 15 retries to wait for VFS visibility stabilization
+          500,  // delay ms
+          (resolvedPath: string) => {
+            // File found — run from there
+            Logger.info("VM", `[GUEST_FILE_EXISTS] true`);
+            Logger.info("VM", `[GUEST_FILE_SIZE] ${this.verifiedInodeSize}`);
+            Logger.info("VM", `[GUEST_FILE_PATH] ${resolvedPath}/root/.provision/mount_prepare.sh`);
+            this.mountPrepareVerified = true;
 
-        this.printAuditTable(false);
+            this.printAuditTable(true, resolvedPath);
 
-        Logger.warn("VM", "[GUEST_FILE_MISSING] File not visible on guest. Mismatch detected. Stopping execution.");
-        // Stop execution. No fallback.
-      }
-    );
+            Logger.info("VM", "[GUEST_FILE_EXISTS] Executing mount script via dynamic path resolver.");
+            this._sendChecked(
+              `sh ${resolvedPath}/root/.provision/mount_prepare.sh\n`,
+              "exec_native"
+            );
+          },
+          () => {
+            // Not found
+            Logger.info("VM", `[GUEST_FILE_EXISTS] false`);
+            Logger.info("VM", `[GUEST_FILE_SIZE] unknown`);
+            Logger.info("VM", `[GUEST_FILE_PATH] unknown`);
+
+            this.printAuditTable(false, "unknown");
+
+            Logger.warn("VM", "[GUEST_FILE_MISSING] File not visible on guest. Mismatch detected. Stopping execution.");
+            // Stop execution. No fallback.
+          }
+        );
+      })
+      .catch((err) => {
+        Logger.error("VM", `[VERIFY_STAT] Failed to write verification helper: ${err.message}. Aborting.`);
+      });
   }
 
-  private printAuditTable(guestExists: boolean): void {
+  private printAuditTable(guestExists: boolean, guestMountPath: string = "/mnt"): void {
+    const guestPath = `${guestMountPath}/root/.provision/`;
     const table = `
 +-----------------------------------------------------------------------------------------------------------------------------------+
 | PATH AUDIT TABLE                                                                                                                  |
@@ -2283,7 +2347,7 @@ export class VMController {
 | HOST_PATH                          | EXPORT_PATH                        | GUEST_PATH                         | HOST_ | GUEST_     |
 |                                    |                                    |                                    | EXIST | EXIST      |
 +------------------------------------+------------------------------------+------------------------------------+-------+------------+
-| /root/.provision/mount_prepare.sh  | /root/.provision/mount_prepare.sh  | /mnt/9p/root/.provision/           | true  | ${guestExists ? "true      " : "false     "} |
+| /root/.provision/mount_prepare.sh  | /root/.provision/mount_prepare.sh  | ${guestPath.padEnd(34)} | true  | ${guestExists ? "true      " : "false     "} |
 |                                    |                                    | mount_prepare.sh                   |       |            |
 +------------------------------------+------------------------------------+------------------------------------+-------+------------+
 `;
@@ -2296,10 +2360,9 @@ export class VMController {
    * Every probe command is under 100 bytes.
    */
   private _pollGuestFileExists(
-    path: string,
     maxRetries: number,
     delayMs: number,
-    onExists: () => void,
+    onExists: (resolvedPath: string) => void,
     onMissing: () => void
   ): void {
     this._guestPollAttempt = 0;
@@ -2314,7 +2377,7 @@ export class VMController {
     const probe = () => {
       this._guestPollAttempt++;
       if (this._guestPollAttempt > this._guestPollMaxRetries) {
-        Logger.error("VM", `[GUEST_FILE_MISSING] Failed after ${this._guestPollMaxRetries} attempts for ${path}`);
+        Logger.error("VM", `[GUEST_FILE_MISSING] Failed after ${this._guestPollMaxRetries} attempts for dynamically discovered path`);
         this.timeouts.cancel("guest_file_poll");
         const cb = this._guestMissingCallback;
         this._guestExistsMarker = null;
@@ -2326,8 +2389,8 @@ export class VMController {
 
       Logger.info("VM", `[VERIFY_INODE] Guest poll ${this._guestPollAttempt}/${this._guestPollMaxRetries}`);
 
-      // Probe: execute `/tmp/guest_verify.sh` and pass the marker
-      this._sendChecked(`sh /tmp/guest_verify.sh ${marker}\n`, "fb_verify_run");
+      // Probe: execute `/guest_verify.sh` under resolved mountpoint and pass the marker
+      this._sendChecked(`sh /mnt/guest_verify.sh ${marker} || sh /mnt/9p/guest_verify.sh ${marker}\n`, "fb_verify_run");
 
       // Schedule retry
       const retryDelay = delayMs * this._guestPollAttempt;
@@ -2340,38 +2403,39 @@ export class VMController {
   }
 
   /**
-   * Fallback: mount 9p and run mount_prepare.sh from native 9p path.
+   * Fallback: dynamically discover or mount 9p, then run mount_prepare.sh.
    * Every command is under 100 bytes. BusyBox compatible only.
    */
   private _tryDirectMountFallback(): void {
     Logger.info("VM", "[GUEST_FILE_MISSING] Direct 9p mount fallback.");
 
-    // Each command individually under 100 bytes:
-    this._sendChecked("mkdir -p /mnt/9p\n", "fb_mkdir");                  // 18 bytes
+    // Try to dynamically figure out mount
+    this._sendChecked("m=\"\"\n", "fb_m_init");
+    this._sendChecked("[ -d /mnt/9p ] && m=\"/mnt/9p\" || m=\"/mnt\"\n", "fb_m_assign");
+    this._sendChecked("mkdir -p $m\n", "fb_mkdir");
     this._sendChecked(
-      "mount|grep -q /mnt/9p||mount -t 9p -o trans=virtio host9p /mnt/9p\n",
+      "mount|grep -q host9p||mount -t 9p -o trans=virtio host9p $m\n",
       "fb_mount_simple"
-    );  // 65 bytes
-    this._sendChecked("ls /mnt/9p/root 2>/dev/null\n", "fb_ls_verify");    // 28 bytes
+    );
+    this._sendChecked("ls $m/root 2>/dev/null\n", "fb_ls_verify");
 
     // Guest side telemetry fallback
-    const mp = "/mnt/9p/root/.provision/mount_prepare.sh";
-    this._sendChecked(`p=${mp}\n`, "fb_p_assign");
+    this._sendChecked(`p=\"$m/root/.provision/mount_prepare.sh\"\n`, "fb_p_assign");
     this._sendChecked(`test -f $p && echo "GUEST_FILE_EXISTS: true" || echo "GUEST_FILE_EXISTS: false"\n`, "fb_g_exists");
     this._sendChecked(`test -f $p && echo "GUEST_FILE_SIZE: $(wc -c <$p)"\n`, "fb_g_size");
     this._sendChecked(`test -f $p && echo "GUEST_FILE_PATH: $p"\n`, "fb_g_path");
 
-    // Check if file exists at 9p native path, then execute or fail
+    // Check if file exists at dynamic native path, then execute or fail
     // Split into two separate commands for clarity and limit safety
     // Quote-split to bypass command echo false positives
     this._sendChecked(
-      `test -f ${mp} && sh ${mp}\n`,
+      `test -f $p && sh $p\n`,
       "fb_test_exec"
-    );  // 73 bytes
+    );  // 21 bytes
     this._sendChecked(
-      `test -f ${mp} || echo STAGE':'MOUNT'_'FAIL>/dev/ttyS0\n`,
+      `test -f $p || echo STAGE':'MOUNT'_'FAIL>/dev/ttyS0\n`,
       "fb_test_fail"
-    );  // 63 bytes
+    );  // 51 bytes
   }
 
   /**

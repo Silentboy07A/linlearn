@@ -912,9 +912,15 @@ var WorkerProvisioner = {
       "\n" +
       "# Symlink drift check\n" +
       "prov_link=$(readlink -f /root/.provision 2>/dev/null)\n" +
-      "if [ \"$prov_link\" != \"/mnt/9p/root/.provision\" ]; then\n" +
-      "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '/mnt/9p/root/.provision'\" > /dev/ttyS0\n" +
-      "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "expected_link=\"\"\n" +
+      "if [ -d /mnt/9p/root/.provision ]; then\n" +
+      "  expected_link=\"/mnt/9p/root/.provision\"\n" +
+      "elif [ -d /mnt/root/.provision ]; then\n" +
+      "  expected_link=\"/mnt/root/.provision\"\n" +
+      "fi\n" +
+      "if [ -n \"$expected_link\" ] && [ \"$prov_link\" != \"$expected_link\" ]; then\n" +
+      "  echo \"[VISIBILITY] Stale symlink drift detected: got '$prov_link', expected '$expected_link'\" > /dev/ttyS0\n" +
+      "  rm -rf /root/.provision && ln -s \"$expected_link\" /root/.provision\n" +
       "  sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "fi\n" +
       "\n" +
@@ -934,7 +940,7 @@ var WorkerProvisioner = {
       "done\n" +
       "\n" +
       "# 1. verify parent directory first\n" +
-      "if [ -d /root/.provision ] && [ -d /mnt/9p/root/.provision ]; then\n" +
+      "if [ -d /root/.provision ] && [ -n \"$expected_link\" ] && [ -d \"$expected_link\" ]; then\n" +
       "  # 2. verify inode existence second using stat & ls -li\n" +
       "  if ! stat \"$tmp_file\" >/dev/null 2>&1; then\n" +
       "    echo \"[EXEC_PREFLIGHT] Error: Temporary script file $tmp_file not found via stat\" > /dev/ttyS0\n" +
@@ -1624,6 +1630,28 @@ self.onmessage = async function (e) {
       postToHost("PROVISION_ACK", { type: "cancel", execId: payload ? payload.execId : 0 });
       break;
 
+    case "WRITE_GUEST_FILE": {
+      var filePath = payload.filePath;
+      var content = payload.content;
+      try {
+        if (!emulator || !emulator.fs9p || typeof emulator.create_file !== "function") {
+          throw new Error("emulator or fs9p not ready");
+        }
+        var encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+        var bytes = encoder ? encoder.encode(content) : new Uint8Array(content.length);
+        if (!encoder) {
+          for (var i = 0; i < content.length; i++) bytes[i] = content.charCodeAt(i) & 0xFF;
+        }
+        await emulator.create_file(filePath, bytes);
+        log("info", "[WRITE_GUEST_FILE] Programmatically wrote " + bytes.length + " bytes to " + filePath);
+        postToHost("WRITE_GUEST_FILE_OK", { filePath: filePath });
+      } catch (err) {
+        log("error", "[WRITE_GUEST_FILE] Failed to write " + filePath + ": " + err.message);
+        postToHost("WRITE_GUEST_FILE_FAIL", { filePath: filePath, error: err.message });
+      }
+      break;
+    }
+
     // ── Targeted file reinjection (PROVISIONING_REINJECTION recovery stage) ─
     // Reruns create_file() for mount_prepare.sh without destroying the emulator.
     // Called by the host when guest-side mount visibility fails after initial write.
@@ -1658,7 +1686,11 @@ self.onmessage = async function (e) {
           "fi\n" +
           "sync\n" +
           "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
-          "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+          "if [ -d /mnt/9p/root/.provision ]; then\n" +
+          "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+          "elif [ -d /mnt/root/.provision ]; then\n" +
+          "  rm -rf /root/.provision && ln -s /mnt/root/.provision /root/.provision\n" +
+          "fi\n" +
           "sync\n" +
           "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
           "if [ -d /root/.provision ]; then\n" +
@@ -2241,7 +2273,11 @@ async function checkAndInitializeFs9p() {
       "fi\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
-      "rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "if [ -d /mnt/9p/root/.provision ]; then\n" +
+      "  rm -rf /root/.provision && ln -s /mnt/9p/root/.provision /root/.provision\n" +
+      "elif [ -d /mnt/root/.provision ]; then\n" +
+      "  rm -rf /root/.provision && ln -s /mnt/root/.provision /root/.provision\n" +
+      "fi\n" +
       "sync\n" +
       "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null\n" +
       "if [ -d /root/.provision ]; then\n" +

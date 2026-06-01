@@ -843,6 +843,8 @@ export function TerminalSimulator({
           VMController.setActiveInstance(emulator);
         }
         v86EmulatorRef.current = emulator;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).emulator = emulator;
 
         // Frame-batched serial output rendering for butter smooth performance
         let serialBuffer = "";
