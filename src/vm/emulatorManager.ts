@@ -122,7 +122,7 @@ export class VMController {
   public static setActiveInstance(instance: VMController | null): void {
     VMController.activeInstance = instance;
     if (typeof window !== "undefined") {
-      (window as any).emulator = instance;
+      (window as Window & typeof globalThis & { emulator?: VMController | null }).emulator = instance;
     }
   }
 

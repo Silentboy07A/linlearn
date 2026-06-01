@@ -1,5 +1,4 @@
 // src/api/executeCommand.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { PromptFirewall } from "../security/promptFirewall";
 import { CommandRiskEngine } from "../security/commandRiskEngine";
 import { RateLimiter } from "../security/rateLimiter";
@@ -11,7 +10,7 @@ import { PromptInjectionError, CommandBlockedError } from "../lib/errors";
 
 export async function executeCommandService(
   request: UserCommandRequest,
-  simulateCallback: (command: string, cwd: string, fs: Record<string, any>) => Promise<{ output: string; fsUpdate: Record<string, any> | null }>
+  simulateCallback: (command: string, cwd: string, fs: Record<string, unknown>) => Promise<{ output: string; fsUpdate: Record<string, unknown> | null }>
 ): Promise<UserCommandResponse> {
   const startTime = Date.now();
   const { command, cwd, filesystem, userId, ipAddress } = request;
@@ -47,14 +46,15 @@ export async function executeCommandService(
       riskAnalysis,
       executionTimeMs,
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
     const executionTimeMs = Date.now() - startTime;
-    Logger.error("SYSTEM", `Command execution failed: ${err.message || String(err)}`);
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    Logger.error("SYSTEM", `Command execution failed: ${errorMessage}`);
     return {
       output: "",
-      error: err.message || String(err),
+      error: errorMessage,
       fsUpdate: null,
-      riskAnalysis: { command, riskLevel: "BLOCKED", reason: err.message || String(err) },
+      riskAnalysis: { command, riskLevel: "BLOCKED", reason: errorMessage },
       executionTimeMs,
     };
   }

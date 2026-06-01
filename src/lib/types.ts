@@ -1,5 +1,4 @@
 // src/lib/types.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 
 export type RiskLevel = "SAFE" | "WARNING" | "BLOCKED";
 
@@ -58,7 +57,7 @@ export interface VMTransitionTrace {
 export interface RuleEvaluationResult {
   passed: boolean;
   reason?: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
 }
 
 export interface JudgeEvaluationResult {
@@ -84,7 +83,7 @@ export interface FinalEvaluationResult {
 export interface UserCommandRequest {
   command: string;
   cwd: string;
-  filesystem: Record<string, any>;
+  filesystem: Record<string, unknown>;
   userId: string;
   ipAddress: string;
 }
@@ -92,7 +91,7 @@ export interface UserCommandRequest {
 export interface UserCommandResponse {
   output: string;
   error?: string;
-  fsUpdate: Record<string, any> | null;
+  fsUpdate: Record<string, unknown> | null;
   riskAnalysis: CommandRiskAnalysis;
   executionTimeMs: number;
 }

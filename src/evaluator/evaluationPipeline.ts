@@ -1,5 +1,4 @@
 // src/evaluator/evaluationPipeline.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { CommandRiskEngine } from "../security/commandRiskEngine";
 import { RuleEngine, EvaluationRule } from "./ruleEngine";
 import { KKMJudge } from "./kkmJudge";
@@ -13,7 +12,7 @@ export class EvaluationPipeline {
     missionId: string;
     command: string;
     output: string;
-    filesystem: Record<string, any>;
+    filesystem: Record<string, unknown>;
     rules: EvaluationRule[];
     expectedBehavior: string;
     ipAddress: string;
@@ -31,9 +30,9 @@ export class EvaluationPipeline {
     let ruleValidation: RuleEvaluationResult;
     try {
       ruleValidation = RuleEngine.evaluate(filesystem, rules);
-    } catch (err: any) {
+    } catch (err: unknown) {
       Logger.error("EVALUATION", "Deterministic Rule Engine failed during check", err);
-      ruleValidation = { passed: false, reason: `Rule engine error: ${err.message || String(err)}` };
+      ruleValidation = { passed: false, reason: `Rule engine error: ${err instanceof Error ? err.message : String(err)}` };
     }
 
     let judgeValidation: JudgeEvaluationResult;

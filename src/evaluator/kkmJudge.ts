@@ -1,5 +1,4 @@
 // src/evaluator/kkmJudge.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { callLlamaJson } from "../lib/llama";
 import { SchemaValidator } from "../security/schemaValidator";
 import { JudgeEvaluationResult } from "../lib/types";
@@ -38,7 +37,7 @@ Expected Target Behavior: "${expectedBehavior}"`;
 
     try {
       Logger.info("EVALUATION", `Invoking KKM Judge for command: "${command}"`);
-      const rawResult = await callLlamaJson<any>(systemPrompt, userPrompt);
+      const rawResult = await callLlamaJson<unknown>(systemPrompt, userPrompt);
       const validated = SchemaValidator.validateJudgeResult(rawResult);
 
       if (validated.score > 8.0) {
@@ -50,14 +49,15 @@ Expected Target Behavior: "${expectedBehavior}"`;
       }
 
       return validated;
-    } catch (err: any) {
+    } catch (err: unknown) {
       Logger.error("EVALUATION", "KKM Judge failed or returned malformed JSON. Using fallback metrics.", err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
       return {
         correct: false,
         safe: true,
         task_completed: false,
         score: 3.2,
-        feedback: `Semantic evaluation failed: ${err.message || String(err)}. Falling back to deterministic rules.`,
+        feedback: `Semantic evaluation failed: ${errorMessage}. Falling back to deterministic rules.`,
         mistakes: ["Malformed evaluator response received from model"],
         suggestions: ["Re-run command verification checks"],
       };
