@@ -44,16 +44,7 @@ export default function SignupPage() {
         setError(err.message);
       } else {
         if (data.session) {
-          console.log("[Signup] Session created. Synchronizing profile username in database.");
-          if (data.user) {
-            const { data: dbResult, error: dbErr } = await supabase
-              .from("profiles")
-              .update({ username })
-              .eq("id", data.user.id)
-              .select();
-            console.log("[Signup] Database profile update result:", { dbResult, error: dbErr });
-          }
-          console.log("[Signup] Redirecting to dashboard.");
+          console.log("[Signup] Session created. Redirecting directly to dashboard.");
           router.push("/dashboard");
           router.refresh();
         } else {
