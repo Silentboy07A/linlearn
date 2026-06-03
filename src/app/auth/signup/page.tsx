@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Terminal, Loader2 } from "lucide-react";
+import { Terminal, Loader2, Eye, EyeOff } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
 export default function SignupPage() {
@@ -14,6 +14,7 @@ export default function SignupPage() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const router = useRouter();
 
   // Pre-fill email if redirected from login page
@@ -24,29 +25,46 @@ export default function SignupPage() {
 
   const signup = async (e: React.FormEvent) => {
     e.preventDefault();
+    console.log("[Signup] Form submitted:", { username, email, passwordLength: password.length });
     setLoading(true);
     setError("");
     try {
       const supabase = createClient();
-      const { data, error: err } = await supabase.auth.signUp({
+      const payload = {
         email,
         password,
         options: { data: { username } },
-      });
+      };
+      console.log("[Signup] Sending API request payload to Supabase auth:", { email, username });
+      const { data, error: err } = await supabase.auth.signUp(payload);
+      console.log("[Signup] API response received:", { data, error: err });
+      
       if (err) {
+        console.error("[Signup] Authentication error:", err);
         setError(err.message);
-      } else if (data.user) {
-        // If email confirmation is required, Supabase returns a user but no session
+      } else {
         if (data.session) {
-          await supabase.from("profiles").update({ username }).eq("id", data.user.id);
+          console.log("[Signup] Session created. Synchronizing profile username in database.");
+          if (data.user) {
+            const { data: dbResult, error: dbErr } = await supabase
+              .from("profiles")
+              .update({ username })
+              .eq("id", data.user.id)
+              .select();
+            console.log("[Signup] Database profile update result:", { dbResult, error: dbErr });
+          }
+          console.log("[Signup] Redirecting to dashboard.");
           router.push("/dashboard");
+          router.refresh();
         } else {
-          // Email confirmation enabled — tell user to check inbox
+          console.log("[Signup] Verification email required. Transitioning to check inbox state.");
           setSuccess(true);
         }
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "An unexpected error occurred during signup.");
+      const errMsg = e instanceof Error ? e.message : "An unexpected error occurred during signup.";
+      console.error("[Signup] Unhandled exception occurred:", e);
+      setError(errMsg);
     } finally {
       setLoading(false);
     }
@@ -125,15 +143,25 @@ export default function SignupPage() {
                 placeholder="Email"
                 className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white placeholder-gray-500 outline-none transition focus:border-[#E95420]/60 focus:ring-1 focus:ring-[#E95420]/30"
               />
-              <input
-                type="password"
-                required
-                minLength={6}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Password (min 6 chars)"
-                className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white placeholder-gray-500 outline-none transition focus:border-[#E95420]/60 focus:ring-1 focus:ring-[#E95420]/30"
-              />
+              <div className="relative">
+                <input
+                  type={showPassword ? "text" : "password"}
+                  required
+                  minLength={6}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Password (min 6 chars)"
+                  className="w-full rounded-lg border border-white/10 bg-black/30 pl-4 pr-12 py-3 text-white placeholder-gray-500 outline-none transition focus:border-[#E95420]/60 focus:ring-1 focus:ring-[#E95420]/30"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors"
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+                </button>
+              </div>
               <button
                 type="submit"
                 disabled={loading}

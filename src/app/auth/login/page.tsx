@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Terminal, Loader2 } from "lucide-react";
+import { Terminal, Loader2, Eye, EyeOff } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
 export default function LoginPage() {
@@ -12,10 +12,12 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [confirmationSent, setConfirmationSent] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const router = useRouter();
 
   const login = async (e: React.FormEvent) => {
     e.preventDefault();
+    console.log("[Login] Form submitted:", { email, passwordLength: password.length });
     setLoading(true);
     setError("");
     setConfirmationSent(false);
@@ -24,27 +26,33 @@ export default function LoginPage() {
       const supabase = createClient();
 
       // Step 1: Try to sign in
+      console.log("[Login] Attempting sign-in with password for:", email);
       const { error: signInErr } = await supabase.auth.signInWithPassword({ email, password });
 
       if (signInErr) {
+        console.warn("[Login] Sign-in failed error:", signInErr);
         if (signInErr.message === "Invalid login credentials") {
           // Step 2: Account doesn't exist — auto-create it
-          const { data, error: signUpErr } = await supabase.auth.signUp({
+          console.log("[Login] Account not found or credentials invalid. Attempting auto-registration signup for:", email);
+          const signUpPayload = {
             email,
             password,
             options: { data: { username: email.split("@")[0] } },
-          });
+          };
+          const { data, error: signUpErr } = await supabase.auth.signUp(signUpPayload);
+          console.log("[Login] Auto-registration signup response received:", { data, error: signUpErr });
 
           if (signUpErr) {
+            console.error("[Login] Auto-registration signup error:", signUpErr);
             setError(signUpErr.message);
-          } else if (data.user) {
+          } else {
             if (data.session) {
-              // No email confirmation required — user is logged in
+              console.log("[Login] Auto-registration succeeded and session started. Redirecting to dashboard.");
               router.push("/dashboard");
               router.refresh();
               return;
             } else {
-              // Email confirmation required
+              console.log("[Login] Auto-registration succeeded. Email confirmation required.");
               setConfirmationSent(true);
             }
           }
@@ -53,11 +61,14 @@ export default function LoginPage() {
         }
       } else {
         // Sign-in succeeded
+        console.log("[Login] Sign-in succeeded. Redirecting to dashboard.");
         router.push("/dashboard");
         router.refresh();
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "An unexpected error occurred during sign in.");
+      const errMsg = e instanceof Error ? e.message : "An unexpected error occurred during sign in.";
+      console.error("[Login] Unhandled exception occurred:", e);
+      setError(errMsg);
     } finally {
       setLoading(false);
     }
@@ -115,15 +126,25 @@ export default function LoginPage() {
                 placeholder="Email"
                 className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#E95420]"
               />
-              <input
-                type="password"
-                required
-                minLength={6}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Password (min 6 chars)"
-                className="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#E95420]"
-              />
+              <div className="relative">
+                <input
+                  type={showPassword ? "text" : "password"}
+                  required
+                  minLength={6}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Password (min 6 chars)"
+                  className="w-full rounded-lg border border-white/10 bg-black/30 pl-4 pr-12 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#E95420]"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors"
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+                </button>
+              </div>
               <button
                 type="submit"
                 disabled={loading}
