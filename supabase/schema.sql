@@ -112,33 +112,50 @@ alter table public.interview_sessions enable row level security;
 alter table public.cheatsheets enable row level security;
 
 -- Profiles policies
+drop policy if exists "Users read own profile" on public.profiles;
+drop policy if exists "Users update own profile" on public.profiles;
+drop policy if exists "Users insert own profile" on public.profiles;
 create policy "Users read own profile" on public.profiles for select using (auth.uid() = id);
 create policy "Users update own profile" on public.profiles for update using (auth.uid() = id);
 create policy "Users insert own profile" on public.profiles for insert with check (auth.uid() = id);
 
 -- Progress policies
+drop policy if exists "Users read own progress" on public.progress;
+drop policy if exists "Users update own progress" on public.progress;
+drop policy if exists "Users insert own progress" on public.progress;
 create policy "Users read own progress" on public.progress for select using (auth.uid() = user_id);
 create policy "Users update own progress" on public.progress for update using (auth.uid() = user_id);
 create policy "Users insert own progress" on public.progress for insert with check (auth.uid() = user_id);
 
 -- Quiz results policies
+drop policy if exists "Users read own quiz_results" on public.quiz_results;
+drop policy if exists "Users insert own quiz_results" on public.quiz_results;
 create policy "Users read own quiz_results" on public.quiz_results for select using (auth.uid() = user_id);
 create policy "Users insert own quiz_results" on public.quiz_results for insert with check (auth.uid() = user_id);
 
 -- Command history policies
+drop policy if exists "Users read own command_history" on public.command_history;
+drop policy if exists "Users insert own command_history" on public.command_history;
+drop policy if exists "Users delete own command_history" on public.command_history;
 create policy "Users read own command_history" on public.command_history for select using (auth.uid() = user_id);
 create policy "Users insert own command_history" on public.command_history for insert with check (auth.uid() = user_id);
 create policy "Users delete own command_history" on public.command_history for delete using (auth.uid() = user_id);
 
 -- Scripts policies
+drop policy if exists "Users read own scripts" on public.scripts;
+drop policy if exists "Users insert own scripts" on public.scripts;
 create policy "Users read own scripts" on public.scripts for select using (auth.uid() = user_id);
 create policy "Users insert own scripts" on public.scripts for insert with check (auth.uid() = user_id);
 
 -- Interview sessions policies
+drop policy if exists "Users read own interview_sessions" on public.interview_sessions;
+drop policy if exists "Users insert own interview_sessions" on public.interview_sessions;
 create policy "Users read own interview_sessions" on public.interview_sessions for select using (auth.uid() = user_id);
 create policy "Users insert own interview_sessions" on public.interview_sessions for insert with check (auth.uid() = user_id);
 
 -- Cheatsheets policies
+drop policy if exists "Users read own cheatsheets" on public.cheatsheets;
+drop policy if exists "Users insert own cheatsheets" on public.cheatsheets;
 create policy "Users read own cheatsheets" on public.cheatsheets for select using (auth.uid() = user_id);
 create policy "Users insert own cheatsheets" on public.cheatsheets for insert with check (auth.uid() = user_id);
 
@@ -156,4 +173,5 @@ create table if not exists public.linux_commands (
 );
 
 alter table public.linux_commands enable row level security;
+drop policy if exists "Anyone can read linux_commands" on public.linux_commands;
 create policy "Anyone can read linux_commands" on public.linux_commands for select using (true);
