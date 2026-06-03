@@ -55,10 +55,9 @@ export async function middleware(request: NextRequest) {
   const isDashboard = path.startsWith("/dashboard");
 
   if (isDashboard && !user) {
-    // Temporarily bypass authentication for diagnostics
-    // const url = request.nextUrl.clone();
-    // url.pathname = "/auth/login";
-    // return NextResponse.redirect(url);
+    const url = request.nextUrl.clone();
+    url.pathname = "/auth/login";
+    return NextResponse.redirect(url);
   }
 
   if (isAuth && user && (path === "/auth/login" || path === "/auth/signup")) {

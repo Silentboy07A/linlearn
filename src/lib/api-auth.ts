@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase/server";
+import { NextResponse } from "next/server";
 
 export async function requireUser() {
   const supabase = createClient();
@@ -7,12 +8,19 @@ export async function requireUser() {
     error,
   } = await supabase.auth.getUser();
 
+  console.log("[requireUser] Checking user session:", {
+    hasUser: !!user,
+    userId: user?.id,
+    userEmail: user?.email,
+    error: error?.message || null
+  });
+
   if (error || !user) {
+    console.warn("[requireUser] Authentication failed or session is missing. Returning 401 Unauthorized.");
     return {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      user: { id: "da17a1bc-79f9-4674-8588-e2ebecf1c7d2", email: "mock@example.com", user_metadata: { username: "mock" } } as any,
-      supabase,
-      error: null
+      user: null,
+      supabase: null,
+      error: NextResponse.json({ error: "Unauthorized access" }, { status: 401 }),
     };
   }
 
@@ -25,13 +33,15 @@ export async function requireUser() {
       .maybeSingle();
 
     if (!profile) {
+      console.log("[requireUser] Database profile not found. Initializing profile for user:", user.id);
       const username = user.user_metadata?.username || user.email?.split("@")[0] || "hacker";
       const avatarUrl = user.user_metadata?.avatar_url || null;
-      await supabase.from("profiles").insert({
+      const { data: insertProfile, error: profileErr } = await supabase.from("profiles").insert({
         id: user.id,
         username,
         avatar_url: avatarUrl,
-      });
+      }).select().single();
+      console.log("[requireUser] Profile initialization database response:", { insertProfile, error: profileErr });
     }
 
     // Ensure progress exists in database
@@ -42,15 +52,17 @@ export async function requireUser() {
       .maybeSingle();
 
     if (!progress) {
-      await supabase.from("progress").insert({
+      console.log("[requireUser] Database progress tracking not found. Initializing progress for user:", user.id);
+      const { data: insertProgress, error: progressErr } = await supabase.from("progress").insert({
         user_id: user.id,
         xp: 0,
         streak: 0,
         level: "Beginner",
-      });
+      }).select().single();
+      console.log("[requireUser] Progress initialization database response:", { insertProgress, error: progressErr });
     }
   } catch (e) {
-    console.error("Failed to initialize user database profile or progress:", e);
+    console.error("[requireUser] Failed to initialize user database profile or progress:", e);
   }
 
   return { user, supabase, error: null };
