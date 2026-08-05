@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCommandDBOutput } from "@/lib/commandDB";
-import { callLlama } from "@/lib/llama";
+import { callGroq } from "@/lib/groq";
 import { validateTerminalCommand } from "@/lib/safety";
 import { rateLimit } from "@/lib/rate-limit";
 
@@ -44,7 +44,7 @@ If the command modifies the filesystem append updated state in <fs>...</fs> tags
   let aiFailed = false;
 
   try {
-    aiOutput = await callLlama(systemPrompt, command);
+    aiOutput = await callGroq(systemPrompt, command);
     if (!aiOutput) aiFailed = true;
   } catch {
     aiFailed = true;

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/api-auth";
-import { callLlamaJson } from "@/lib/llama";
+import { callGroqJson } from "@/lib/groq";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
 import { rateLimit } from "@/lib/rate-limit";
@@ -35,7 +35,7 @@ export async function POST(req: NextRequest) {
     }
 
 
-    const result = await callLlamaJson<ErrorExplainResponse>(SYSTEM, error);
+    const result = await callGroqJson<ErrorExplainResponse>(SYSTEM, error);
     const progress = await addXp(auth.supabase, auth.user!.id, XP_REWARDS.errorExplain);
 
     return NextResponse.json({ ...result, progress });

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/api-auth";
-import { callLlamaJson } from "@/lib/llama";
+import { callGroqJson } from "@/lib/groq";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
 import { rateLimit } from "@/lib/rate-limit";
@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
 
 
     if (action === "start") {
-      const result = await callLlamaJson<InterviewStartResponse>(
+      const result = await callGroqJson<InterviewStartResponse>(
         `You are a technical interviewer for ${topic} at ${difficulty} level.
 Return JSON: { "question": "string", "questionNumber": 1, "totalQuestions": 5 }`,
         `Start interview on topic: ${topic}`
@@ -34,7 +34,7 @@ Return JSON: { "question": "string", "questionNumber": 1, "totalQuestions": 5 }`
 
     if (action === "answer") {
       const { question, answer, questionNumber } = body;
-      const result = await callLlamaJson<InterviewAnswerResponse>(
+      const result = await callGroqJson<InterviewAnswerResponse>(
         `Grade this interview answer 0-10. Return JSON:
 { "score": number, "good": "string", "missing": "string", "modelAnswer": "string",
   "nextQuestion": "string or null if question ${questionNumber} was 5", "questionNumber": number }`,
@@ -50,7 +50,7 @@ Return JSON: { "question": "string", "questionNumber": 1, "totalQuestions": 5 }`
 
     if (action === "report") {
       const { answers, topic: t } = body;
-      const result = await callLlamaJson<InterviewReportResponse>(
+      const result = await callGroqJson<InterviewReportResponse>(
         `Generate final interview report. Return JSON:
 { "totalScore": number, "performance": "Needs Practice|Good|Excellent",
   "strengths": ["string"], "improvements": ["string"], "recommendations": ["string"] }`,

@@ -4,7 +4,7 @@ import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
 import { rateLimit } from "@/lib/rate-limit";
 import { verifyChallenge, verifyStateHash } from "@/lib/challenge";
-import { callLlamaJson } from "@/lib/llama";
+import { callGroqJson } from "@/lib/groq";
 import { getMissionById } from "@/missions/config";
 import { validateMissionRules } from "@/missions/validator";
 
@@ -105,7 +105,7 @@ Execution Result: Success state verified by OS verification checks.`;
 
     let grade: EvaluationResult;
     try {
-      grade = await callLlamaJson<EvaluationResult>(systemPrompt, userPrompt);
+      grade = await callGroqJson<EvaluationResult>(systemPrompt, userPrompt);
     } catch (e) {
       console.warn("KKM Judge fallback due to LLM invocation failure:", e);
       grade = {

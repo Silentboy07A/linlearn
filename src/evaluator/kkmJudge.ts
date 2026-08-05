@@ -1,5 +1,5 @@
 // src/evaluator/kkmJudge.ts
-import { callLlamaJson } from "../lib/llama";
+import { callGroqJson } from "../lib/groq";
 import { SchemaValidator } from "../security/schemaValidator";
 import { JudgeEvaluationResult } from "../lib/types";
 import { Logger } from "../lib/logger";
@@ -37,7 +37,7 @@ Expected Target Behavior: "${expectedBehavior}"`;
 
     try {
       Logger.info("EVALUATION", `Invoking KKM Judge for command: "${command}"`);
-      const rawResult = await callLlamaJson<unknown>(systemPrompt, userPrompt);
+      const rawResult = await callGroqJson<unknown>(systemPrompt, userPrompt);
       const validated = SchemaValidator.validateJudgeResult(rawResult);
 
       if (validated.score > 8.0) {

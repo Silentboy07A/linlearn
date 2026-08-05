@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/api-auth";
-import { callLlamaJson } from "@/lib/llama";
+import { callGroqJson } from "@/lib/groq";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
 import { rateLimit } from "@/lib/rate-limit";
@@ -34,7 +34,7 @@ export async function POST(req: NextRequest) {
 
     // ── AI first ──
     try {
-      result = await callLlamaJson<CheatSheetResponse>(
+      result = await callGroqJson<CheatSheetResponse>(
         SYSTEM,
         `Topic: ${topic}\nStyle: ${style || "Detailed"}`
       );

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/api-auth";
-import { callLlamaJson } from "@/lib/llama";
+import { callGroqJson } from "@/lib/groq";
 import { addXp } from "@/lib/supabase/progress";
 import { XP_REWARDS } from "@/lib/xp";
 import { rateLimit } from "@/lib/rate-limit";
@@ -121,7 +121,7 @@ export async function POST(req: NextRequest) {
 
     // Fallback to LLM if not in DB
     if (!result) {
-      result = await callLlamaJson<CommandResponse>(SYSTEM, safeQuery);
+      result = await callGroqJson<CommandResponse>(SYSTEM, safeQuery);
     }
 
     // Double check generated command safety

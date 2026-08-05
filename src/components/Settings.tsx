@@ -31,12 +31,12 @@ export function Settings({
   
   // Groq configuration local state
   const [draftGroqKey, setDraftGroqKey] = useState("");
-  const [draftGroqModel, setDraftGroqModel] = useState("llama-3.3-70b-versatile");
+  const [draftGroqModel, setDraftGroqModel] = useState("qwen/qwen3-32b");
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
 
   useEffect(() => {
     const savedKey = localStorage.getItem("groqApiKey") || "";
-    const savedModel = localStorage.getItem("groqModel") || "llama-3.3-70b-versatile";
+    const savedModel = localStorage.getItem("groqModel") || "qwen/qwen3-32b";
     setDraftGroqKey(savedKey);
     setDraftGroqModel(savedModel);
   }, []);
@@ -107,7 +107,7 @@ export function Settings({
               value={draftGroqModel}
               onChange={(event) => setDraftGroqModel(event.target.value)}
               className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white placeholder:text-gray-500 focus:border-[#E95420]/40 focus:outline-none text-sm font-mono"
-              placeholder="e.g. llama-3.3-70b-versatile"
+              placeholder="e.g. qwen/qwen3-32b"
             />
           </div>
         </div>

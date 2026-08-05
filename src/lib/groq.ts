@@ -1,18 +1,18 @@
 /**
- * llama.ts — AI client
+ * groq.ts — AI client
  *
  * Calls the Groq API (exposing an OpenAI-compatible endpoint):
  *   https://api.groq.com/openai/v1/chat/completions
  *
  * Environment variables:
  *   GROQ_API_KEY — your Groq API key (required)
- *   GROQ_MODEL   — override the model ID (optional, defaults to llama-3.3-70b-versatile)
+ *   GROQ_MODEL   — override the model ID (optional, defaults to qwen/qwen3-32b)
  */
 
 import { headers } from "next/headers";
 
 const DEFAULT_MODEL =
-  process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile";
+  process.env.GROQ_MODEL ?? "qwen/qwen3-32b";
 
 // ─── JSON helpers ─────────────────────────────────────────────────────────────
 
@@ -29,7 +29,7 @@ export function parseJsonFromText<T>(text: string): T | null {
 
 // ─── Core caller ──────────────────────────────────────────────────────────────
 
-export async function callLlama(
+export async function callGroq(
   systemPrompt: string,
   userPrompt: string
 ): Promise<string> {
@@ -98,11 +98,11 @@ export async function callLlama(
 
 // ─── JSON variant ─────────────────────────────────────────────────────────────
 
-export async function callLlamaJson<T>(
+export async function callGroqJson<T>(
   systemPrompt: string,
   userPrompt: string
 ): Promise<T> {
-  const raw = await callLlama(
+  const raw = await callGroq(
     `${systemPrompt}\n\nRespond with valid JSON only. No markdown fences.`,
     userPrompt
   );
