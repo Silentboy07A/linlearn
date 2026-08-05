@@ -3,7 +3,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
 
-const ratelimit = process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN 
+const ratelimit = process.env.DISABLE_REDIS !== "true" && process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN 
   ? new Ratelimit({
       redis: new Redis({
         url: process.env.KV_REST_API_URL,
@@ -16,12 +16,17 @@ const ratelimit = process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN
 export async function middleware(request: NextRequest) {
   if (ratelimit && request.nextUrl.pathname.startsWith("/api")) {
     const ip = request.ip ?? request.headers.get("x-forwarded-for") ?? "127.0.0.1";
-    const { success, limit, reset, remaining } = await ratelimit.limit(ip);
-    if (!success) {
-      return NextResponse.json(
-        { error: "Too Many Requests" },
-        { status: 429, headers: { "X-RateLimit-Limit": limit.toString(), "X-RateLimit-Remaining": remaining.toString(), "X-RateLimit-Reset": reset.toString() } }
-      );
+    try {
+      const { success, limit, reset, remaining } = await ratelimit.limit(ip);
+      if (!success) {
+        return NextResponse.json(
+          { error: "Too Many Requests" },
+          { status: 429, headers: { "X-RateLimit-Limit": limit.toString(), "X-RateLimit-Remaining": remaining.toString(), "X-RateLimit-Reset": reset.toString() } }
+        );
+      }
+    } catch (redisErr) {
+      console.warn("Rate-limiting bypassed due to Redis connection failure:", redisErr);
+      // Fail open: continue request processing if Redis is unavailable
     }
   }
 

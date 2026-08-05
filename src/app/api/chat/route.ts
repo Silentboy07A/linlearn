@@ -10,25 +10,31 @@ import { Redis } from "@upstash/redis";
 const DAILY_LIMIT = 50;
 
 async function checkDailyQuota(userId: string): Promise<boolean> {
+  if (process.env.DISABLE_REDIS === "true") return true;
   if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) return true;
   
-  const redis = new Redis({
-    url: process.env.KV_REST_API_URL,
-    token: process.env.KV_REST_API_TOKEN,
-  });
-  const key = `quota:chat:${userId}:${new Date().toISOString().split('T')[0]}`;
-  const current = await redis.get<number>(key) || 0;
-  
-  if (current >= DAILY_LIMIT) {
-    return false;
+  try {
+    const redis = new Redis({
+      url: process.env.KV_REST_API_URL,
+      token: process.env.KV_REST_API_TOKEN,
+    });
+    const key = `quota:chat:${userId}:${new Date().toISOString().split('T')[0]}`;
+    const current = await redis.get<number>(key) || 0;
+    
+    if (current >= DAILY_LIMIT) {
+      return false;
+    }
+    
+    await redis.incr(key);
+    // Set expiry to 24 hours (86400 seconds) if it's a new key
+    if (current === 0) {
+      await redis.expire(key, 86400);
+    }
+    return true;
+  } catch (e) {
+    console.warn("Quota check bypassed due to Redis connection failure:", e);
+    return true; // Fail open
   }
-  
-  await redis.incr(key);
-  // Set expiry to 24 hours (86400 seconds) if it's a new key
-  if (current === 0) {
-    await redis.expire(key, 86400);
-  }
-  return true;
 }
 
 const SYSTEM = `You are a professional Linux security audit agent and virtual training sandbox auditor.
