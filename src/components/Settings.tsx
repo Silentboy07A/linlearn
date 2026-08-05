@@ -31,12 +31,12 @@ export function Settings({
   
   // Groq configuration local state
   const [draftGroqKey, setDraftGroqKey] = useState("");
-  const [draftGroqModel, setDraftGroqModel] = useState("qwen/qwen3-32b");
+  const [draftGroqModel, setDraftGroqModel] = useState("openai/gpt-oss-20b");
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
 
   useEffect(() => {
     const savedKey = localStorage.getItem("groqApiKey") || "";
-    const savedModel = localStorage.getItem("groqModel") || "qwen/qwen3-32b";
+    const savedModel = localStorage.getItem("groqModel") || "openai/gpt-oss-20b";
     setDraftGroqKey(savedKey);
     setDraftGroqModel(savedModel);
   }, []);
@@ -107,7 +107,7 @@ export function Settings({
               value={draftGroqModel}
               onChange={(event) => setDraftGroqModel(event.target.value)}
               className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white placeholder:text-gray-500 focus:border-[#E95420]/40 focus:outline-none text-sm font-mono"
-              placeholder="e.g. qwen/qwen3-32b"
+              placeholder="e.g. openai/gpt-oss-20b"
             />
           </div>
         </div>

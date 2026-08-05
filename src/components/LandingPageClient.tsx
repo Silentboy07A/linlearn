@@ -80,7 +80,7 @@ const FEATURES = [
     icon: Sparkles,
     title: "AI Interactive Tutor",
     desc: "Describe DevOps procedures in plain English. Generates valid Linux commands, maps paths, and explains flags step by step.",
-    badge: "Qwen 3 AI",
+    badge: "GPT OSS AI",
     color: "brand" as const,
   },
   {
@@ -394,7 +394,7 @@ export function LandingPageClient() {
             >
               {[
                 { val: "100% Native", label: "No server latency" },
-                { val: "Qwen 3 AI", label: "Interactive tutoring" },
+                { val: "GPT OSS AI", label: "Interactive tutoring" },
                 { val: "PTY Signals", label: "Cryptographic validation" },
                 { val: "Auto-save", label: "IndexedDB persistence" },
               ].map(({ val, label }) => (

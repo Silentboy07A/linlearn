@@ -12,7 +12,7 @@
 import { headers } from "next/headers";
 
 const DEFAULT_MODEL =
-  process.env.GROQ_MODEL ?? "qwen/qwen3-32b";
+  process.env.GROQ_MODEL ?? "openai/gpt-oss-20b";
 
 // ─── JSON helpers ─────────────────────────────────────────────────────────────
 
