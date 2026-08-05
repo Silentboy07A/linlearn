@@ -175,7 +175,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ reply, progress });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Chat failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("API Error in /api/chat:", e);
+    return NextResponse.json({ error: message, stack: e instanceof Error ? e.stack : undefined }, { status: 500 });
   }
 }
 

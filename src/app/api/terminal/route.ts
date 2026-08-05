@@ -42,17 +42,20 @@ If the command modifies the filesystem append updated state in <fs>...</fs> tags
   // Fallback to LLM if not in DB
   let aiOutput = "";
   let aiFailed = false;
+  let aiErrorMsg = "";
 
   try {
     aiOutput = await callGroq(systemPrompt, command);
     if (!aiOutput) aiFailed = true;
-  } catch {
+  } catch (e) {
     aiFailed = true;
+    aiErrorMsg = e instanceof Error ? e.message : String(e);
+    console.error("API Error in /api/terminal:", e);
   }
 
   if (aiFailed) {
     return NextResponse.json({
-      output: `bash: ${command}: command not found`,
+      output: `Error: Terminal simulation failed. ${aiErrorMsg || "Command not found."}`,
       fsUpdate: null,
     });
   }

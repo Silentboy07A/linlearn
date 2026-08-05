@@ -41,6 +41,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ...result, progress });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Explanation failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("API Error in /api/error-explain:", e);
+    return NextResponse.json({ error: message, stack: e instanceof Error ? e.stack : undefined }, { status: 500 });
   }
 }

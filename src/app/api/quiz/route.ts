@@ -96,6 +96,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Quiz failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("API Error in /api/quiz:", e);
+    return NextResponse.json({ error: message, stack: e instanceof Error ? e.stack : undefined }, { status: 500 });
   }
 }

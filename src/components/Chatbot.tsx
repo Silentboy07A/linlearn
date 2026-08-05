@@ -764,10 +764,10 @@ export function Chatbot({ onSuccess }: { onSuccess?: () => void }) {
       setExplanationPanel(parsed);
 
       onSuccess?.();
-    } catch {
+    } catch (err) {
       const errMsg: ChatMessage = {
         role: "assistant",
-        content: "Sorry, I couldn't respond. Please check your API key or try again.",
+        content: err instanceof Error ? err.message : "Sorry, I couldn't respond. Please check your API key or try again.",
       };
       updateSession(activeSessionId, (s) => ({
         ...s,

@@ -71,6 +71,7 @@ Return JSON: { "question": "string", "questionNumber": 1, "totalQuestions": 5 }`
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Interview failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("API Error in /api/interview:", e);
+    return NextResponse.json({ error: message, stack: e instanceof Error ? e.stack : undefined }, { status: 500 });
   }
 }
